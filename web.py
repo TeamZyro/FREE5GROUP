@@ -47,6 +47,10 @@ def group_page():
 def robots():
     return send_from_directory(os.getcwd(), 'robots.txt')
 
+@app.route('/googlec56e56af2571922d.html')
+def google_verify():
+    return send_from_directory(os.getcwd(), 'googlec56e56af2571922d.html')
+
 @app.route('/api/accounts', methods=['GET'])
 def get_accounts():
     if not os.path.exists('bot.txt'):
