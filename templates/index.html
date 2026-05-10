@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MV Creator PRO - Free Fire</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Phosphor Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        darkBase: '#0b0f19',
+                        darkCard: 'rgba(21, 28, 44, 0.7)',
+                        primary: '#3b82f6',
+                        accent: '#8b5cf6',
+                        success: '#10b981',
+                        danger: '#ef4444',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: #0b0f19;
+            background-image:
+                radial-gradient(circle at 15% 50%, rgba(59, 130, 246, 0.1), transparent 25%),
+                radial-gradient(circle at 85% 30%, rgba(139, 92, 246, 0.1), transparent 25%);
+            background-attachment: fixed;
+            color: #e2e8f0;
+        }
+
+        .glass-card {
+            background: rgba(21, 28, 44, 0.6);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+            border-radius: 1.25rem;
+        }
+
+        .btn-glow-primary:hover {
+            box-shadow: 0 0 20px rgba(59, 130, 246, 0.4);
+        }
+
+        .btn-glow-accent:hover {
+            box-shadow: 0 0 20px rgba(139, 92, 246, 0.4);
+        }
+
+        @keyframes pulse-subtle {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        .animate-pulse-subtle {
+            animation: pulse-subtle 2s infinite ease-in-out;
+        }
+    </style>
+</head>
+
+<body class="min-h-screen antialiased overflow-x-hidden">
+
+    <!-- Header Navigation -->
+    <nav class="sticky top-0 z-50 px-6 py-4">
+        <div class="max-w-6xl mx-auto flex items-center justify-between glass-card px-6 py-3 border-white/5">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-accent flex items-center justify-center shadow-lg shadow-primary/20">
+                    <i class="ph-bold ph-users-four text-white text-xl"></i>
+                </div>
+                <div>
+                    <span class="text-lg font-bold tracking-tight text-white">MV Creator <span class="text-accent">PRO</span></span>
+                    <div id="botGlobalStatus" class="flex items-center gap-1.5 mt-0.5">
+                        <div class="w-2 h-2 rounded-full bg-success animate-pulse"></div>
+                        <span class="text-[10px] text-success font-bold uppercase tracking-widest">System Online</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="flex items-center gap-4">
+                <a href="/group" class="text-xs font-bold text-gray-400 hover:text-white transition-all uppercase tracking-widest flex items-center gap-2 px-4 py-2 rounded-lg hover:bg-white/5">
+                    <i class="ph ph-plus-circle"></i>
+                    Generate Accounts
+                </a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-4xl mx-auto px-6 py-8 flex flex-col gap-8">
+
+        <!-- Bot Status Overview -->
+        <section class="glass-card p-6 border-white/10">
+            <div class="flex items-center justify-between mb-6">
+                <h2 class="text-sm font-bold text-gray-500 uppercase tracking-widest flex items-center gap-2">
+                    <i class="ph ph-broadcast text-primary"></i>
+                    Active Workers
+                </h2>
+                <button onclick="fetchBotStatuses()" class="text-xs text-primary hover:underline">Refresh Status</button>
+            </div>
+            <div id="botStatusList" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <!-- Bot statuses will be injected here -->
+            </div>
+        </section>
+
+        <!-- Main Exploit Panel -->
+        <section class="glass-card p-8 border-white/10 bg-gradient-to-br from-darkCard to-darkBase/40">
+            <div class="flex flex-col gap-8">
+                        <div class="text-center">
+                            <h1 class="text-3xl font-extrabold text-white mb-2">MV Ghost Creator</h1>
+                            <p class="text-gray-400 text-sm">Enter the target UID to create a 5 or 6 player squad exploit.</p>
+                        </div>
+
+                <div class="flex flex-col gap-6 max-w-lg mx-auto w-full">
+                    <div class="relative group">
+                        <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                            <i class="ph ph-user-focus text-gray-500 text-xl group-focus-within:text-primary transition-colors"></i>
+                        </div>
+                        <input type="text" id="exploitUidInput" placeholder="Enter Target Player UID" 
+                            class="w-full bg-darkBase/50 border-2 border-white/5 rounded-2xl pl-12 pr-4 py-5 text-lg font-bold text-white placeholder:text-gray-600 outline-none focus:border-primary/50 focus:bg-darkBase/80 transition-all shadow-inner">
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4">
+                        <button onclick="triggerExploit(5)" id="btn5"
+                            class="group relative overflow-hidden bg-gradient-to-r from-primary/80 to-primary text-white py-4 rounded-2xl font-bold flex flex-col items-center gap-1 transition-all hover:scale-[1.02] active:scale-[0.98] btn-glow-primary">
+                            <span class="text-xs opacity-70 font-medium">Standard Exploit</span>
+                            <span class="text-xl flex items-center gap-2">
+                                <i class="ph-bold ph-users-three"></i> 5 Players
+                            </span>
+                        </button>
+
+                        <button onclick="triggerExploit(6)" id="btn6"
+                            class="group relative overflow-hidden bg-gradient-to-r from-accent/80 to-accent text-white py-4 rounded-2xl font-bold flex flex-col items-center gap-1 transition-all hover:scale-[1.02] active:scale-[0.98] btn-glow-accent">
+                            <span class="text-xs opacity-70 font-medium">Mega Exploit</span>
+                            <span class="text-xl flex items-center gap-2">
+                                <i class="ph-bold ph-users-four"></i> 6 Players
+                            </span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="fixed bottom-8 left-1/2 transform -translate-x-1/2 translate-y-20 opacity-0 transition-all duration-500 z-[100]">
+        <div class="glass-card px-8 py-4 flex items-center gap-4 border-white/20 shadow-2xl">
+            <div id="toastIconContainer" class="w-10 h-10 rounded-full flex items-center justify-center">
+                <i id="toastIcon" class="ph-bold ph-info text-xl"></i>
+            </div>
+            <div>
+                <h4 id="toastTitle" class="text-sm font-bold text-white">Notification</h4>
+                <p id="toastMessage" class="text-xs text-gray-400">Message details here.</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function showToast(title, message, type = 'info') {
+            const toastEl = document.getElementById('toast');
+            const iconContainer = document.getElementById('toastIconContainer');
+            const icon = document.getElementById('toastIcon');
+            
+            document.getElementById('toastTitle').textContent = title;
+            document.getElementById('toastMessage').textContent = message;
+
+            if (type === 'success') {
+                iconContainer.className = "w-10 h-10 rounded-full bg-success/20 flex items-center justify-center text-success";
+                icon.className = "ph-bold ph-check-circle text-xl";
+            } else if (type === 'error') {
+                iconContainer.className = "w-10 h-10 rounded-full bg-danger/20 flex items-center justify-center text-danger";
+                icon.className = "ph-bold ph-warning-circle text-xl";
+            } else {
+                iconContainer.className = "w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary";
+                icon.className = "ph-bold ph-info text-xl";
+            }
+
+            toastEl.classList.remove('translate-y-20', 'opacity-0');
+            setTimeout(() => toastEl.classList.add('translate-y-20', 'opacity-0'), 4000);
+        }
+
+        async function triggerExploit(slot) {
+            const uid = document.getElementById('exploitUidInput').value.trim();
+            if (!uid) {
+                showToast('Warning', 'Please enter a target UID', 'warning');
+                return;
+            }
+
+            const btn = document.getElementById(`btn${slot}`);
+            const originalHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="ph ph-circle-notch animate-spin text-2xl"></i>';
+
+            try {
+                const res = await fetch('/api/group_exploit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uid: uid, slot: slot })
+                });
+
+                const data = await res.json();
+                if (data.status === 'success') {
+                    showToast(`${slot}-Player Success`, `Exploit sequence triggered for ${uid}`, 'success');
+                } else {
+                    showToast('Exploit Failed', data.message, 'error');
+                }
+            } catch (err) {
+                showToast('Error', 'Communication failure', 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
+        }
+
+        async function runBotCmd(type, inputId) {
+            const payload = document.getElementById(inputId).value.trim();
+            if (!payload) return;
+
+            try {
+                const res = await fetch('/api/send_bot_command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ type: type, payload: payload })
+                });
+
+                const data = await res.json();
+                if (data.status === 'success') {
+                    showToast('Success', data.message, 'success');
+                    document.getElementById(inputId).value = '';
+                } else {
+                    showToast('Error', data.message, 'error');
+                }
+            } catch (err) {
+                showToast('Error', 'Failed to send command', 'error');
+            }
+        }
+
+        async function fetchBotStatuses() {
+            try {
+                const res = await fetch('/api/bots_status');
+                const bots = await res.json();
+                const container = document.getElementById('botStatusList');
+                container.innerHTML = '';
+
+                if (bots.length === 0) {
+                    container.innerHTML = '<p class="text-xs text-gray-500 italic">No bots currently running.</p>';
+                    return;
+                }
+
+                bots.forEach(bot => {
+                    const el = document.createElement('div');
+                    el.className = 'flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5';
+                    el.innerHTML = `
+                        <div class="flex items-center gap-3">
+                            <div class="w-2 h-2 rounded-full ${bot.status === 'ONLINE' ? 'bg-success animate-pulse' : 'bg-gray-600'}"></div>
+                            <div>
+                                <p class="text-xs font-bold text-white">${bot.uid}</p>
+                                <p class="text-[10px] text-gray-500">${bot.status}</p>
+                            </div>
+                        </div>
+                        <div class="text-[10px] font-mono text-gray-400 bg-black/30 px-2 py-1 rounded">PID: ${bot.pid}</div>
+                    `;
+                    container.appendChild(el);
+                });
+            } catch (err) {
+                console.error('Status fetch failed', err);
+            }
+        }
+
+        // Auto refresh status
+        setInterval(fetchBotStatuses, 5000);
+        fetchBotStatuses();
+    </script>
+</body>
+
+</html>
