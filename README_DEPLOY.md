@@ -9,13 +9,14 @@ Since this bot requires **persistent TCP connections** and **background processe
 5. Access via `http://your-vps-ip:5000`
 
 ## Option 2: Vercel (Web Interface Only)
-Vercel is serverless and **cannot run the bots**. Use this ONLY for the UI.
-1. Connect your GitHub repo to Vercel.
-2. Vercel will automatically detect `vercel.json` and `web.py`.
-3. Note: Bot startup and file saving will NOT work on Vercel.
+Serverless. UI will work, but bots and file saving won't.
+- Files: `vercel.json`, `web.py`
 
-## Option 3: Render / Railway
-Good for persistent Flask apps.
-1. Create a "Web Service".
-2. Set Build Command: `pip install -r requirements.txt`
-3. Set Start Command: `gunicorn web:app`
+## Option 3: Heroku
+Persistent but with **Ephemeral Storage**.
+1. Files: `Procfile`, `runtime.txt`, `requirements.txt`.
+2. Port: Automatically handled by `os.environ.get('PORT')`.
+3. Storage: `bot.txt` will reset on every restart.
+
+## Option 4: Render / Railway / PythonAnywhere
+Good alternatives for persistent Python apps.

@@ -441,4 +441,7 @@ if __name__ == '__main__':
     os.makedirs('templates', exist_ok=True)
     # Start auto-launcher thread
     threading.Thread(target=auto_start_bots, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+    
+    # Use dynamic port for Heroku
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
