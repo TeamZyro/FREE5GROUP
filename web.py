@@ -43,6 +43,10 @@ def index():
 def group_page():
     return render_template('group.html')
 
+@app.route('/robots.txt')
+def robots():
+    return send_from_directory(os.getcwd(), 'robots.txt')
+
 @app.route('/api/accounts', methods=['GET'])
 def get_accounts():
     if not os.path.exists('bot.txt'):
@@ -437,11 +441,21 @@ def auto_start_bots():
     res = logic_start_bots()
     print(f"[SYSTEM] Bot startup result: {res}")
 
-if __name__ == '__main__':
-    os.makedirs('templates', exist_ok=True)
-    # Start auto-launcher thread
+# Startup initialization for production (Gunicorn)
+if os.environ.get('PORT'):
+    # In production, ensure we only start bots once
+    print("[HEROKU] Production environment detected. Initializing bots...")
     threading.Thread(target=auto_start_bots, daemon=True).start()
+
+if __name__ == '__main__':
+    # Force templates dir exists
+    os.makedirs('templates', exist_ok=True)
     
-    # Use dynamic port for Heroku
+    # Start auto-launcher thread for local dev (if not on Heroku)
+    if not os.environ.get('PORT'):
+        threading.Thread(target=auto_start_bots, daemon=True).start()
+    
+    # Use dynamic port for Heroku or 5000 for local
     port = int(os.environ.get('PORT', 5000))
+    print(f"[SYSTEM] Web Server starting on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)

@@ -9411,7 +9411,9 @@ async def MaiiiinE():
     UrL = MajoRLoGinauTh.url
     
     # Clear screen and show status
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # Clear screen only if not on Heroku
+    if not os.environ.get('PORT'):
+        os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 50)
     print(" NAJMI-M24 BOT - INITIALIZING")
     print("=" * 50)
@@ -9472,7 +9474,9 @@ async def MaiiiinE():
  
     
     # Show loading animation
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # Clear screen only if not on Heroku
+    if not os.environ.get('PORT'):
+        os.system('cls' if os.name == 'nt' else 'clear')
     print(" NAJMI-M24 BOT - STARTING")
     print("=" * 50)
     
@@ -9481,7 +9485,9 @@ async def MaiiiinE():
         print(f" Loading{dots}")
         time.sleep(0.3)
     
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # Clear screen only if not on Heroku
+    if not os.environ.get('PORT'):
+        os.system('cls' if os.name == 'nt' else 'clear')
     print(" NAJMI-M24 BOT - CONNECTING")
     print("=" * 50)
     print("")
@@ -9519,7 +9525,9 @@ async def MaiiiinE():
     task_ipc = asyncio.create_task(ipc_server())    
     
     # Final status display
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # Clear screen only if not on Heroku
+    if not os.environ.get('PORT'):
+        os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 50)
     print(" NAJMI-M24 BOT - ONLINE")
     print("=" * 50)
