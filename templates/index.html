@@ -11,6 +11,7 @@
     <meta property="og:title" content="MV Creator PRO - FF Ghost Group Creator">
     <meta property="og:description" content="Create 5-player and 6-player ghost groups in Free Fire instantly.">
     <meta property="og:type" content="website">
+    <meta name="google-site-verification" content="1_Ftv0i5TAC6EeT1RiG2EwxBmubo6A6w6IremkCvbfE" />
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Phosphor Icons -->
@@ -91,7 +92,24 @@
             </div>
             
             <div class="flex items-center gap-4">
-                <!-- Button Removed -->
+                <div class="relative group">
+                    <button class="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 hover:bg-white/10 transition-colors border border-white/5">
+                        <i class="ph-bold ph-dots-three-vertical text-white text-xl"></i>
+                    </button>
+                    <!-- Dropdown Menu -->
+                    <div class="absolute right-0 top-full mt-2 w-56 glass-card border-white/10 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-[100] overflow-hidden">
+                        <div class="flex flex-col py-1">
+                            <a href="/" class="flex items-center gap-3 px-4 py-3 hover:bg-white/5 text-gray-300 hover:text-white transition-colors border-b border-white/5">
+                                <i class="ph ph-users-four text-primary"></i>
+                                <span class="text-sm font-medium">5 & 6 Player Group</span>
+                            </a>
+                            <a href="/bio" class="flex items-center gap-3 px-4 py-3 hover:bg-white/5 text-gray-300 hover:text-white transition-colors">
+                                <i class="ph ph-note-pencil text-accent"></i>
+                                <span class="text-sm font-medium">Long Bio Injector</span>
+                            </a>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </nav>

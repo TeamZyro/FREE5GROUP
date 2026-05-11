@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Long Bio Injector - MV Creator PRO</title>
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=JetBrains+Mono:wght@400;700&family=Bebas+Neue&display=swap" rel="stylesheet">
+<!-- Phosphor Icons -->
+<script src="https://unpkg.com/@phosphor-icons/web"></script>
+<style>
+:root{
+  --bg:#050509;--bg2:#0b0b14;--bg3:#10101c;--bg4:#161624;
+  --bd:rgba(110,60,255,.14);--bd2:rgba(110,60,255,.3);--bd3:rgba(110,60,255,.5);
+  --acc:#7c3fff;--acc2:#ff3f8e;--acc3:#3fffc8;
+  --glow:rgba(124,63,255,.4);--glow2:rgba(255,63,142,.3);
+  --txt:#f0eeff;--txt2:#a09ac0;--txt3:#5a547a;
+  --suc:#3fffc8;--err:#ff4466;
+  --primary: #3b82f6;
+}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--txt);font-family:'Rajdhani',sans-serif;min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;z-index:0;
+  background-image:linear-gradient(rgba(124,63,255,.04)1px,transparent 1px),
+    linear-gradient(90deg,rgba(124,63,255,.04)1px,transparent 1px);
+  background-size:28px 28px;pointer-events:none}
+
+.topbar{position:sticky;top:0;z-index:300;background:rgba(5,5,9,.94);
+  backdrop-filter:blur(18px);border-bottom:1px solid var(--bd);
+  padding:9px 14px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.brand{display:flex;align-items:center;gap:9px;flex:1;min-width:0}
+.brand-icon{width:36px;height:36px;border-radius:9px;flex-shrink:0;
+  background:linear-gradient(135deg,var(--acc),var(--acc2));
+  display:flex;align-items:center;justify-content:center;
+  box-shadow:0 0 14px var(--glow)}
+.brand-name{font-family:'Bebas Neue',sans-serif;font-size:1.25rem;letter-spacing:2px;
+  background:linear-gradient(90deg,var(--acc),var(--acc2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* Menu Style */
+.topbar-btns{display:flex;gap:6px;flex-shrink:0;position:relative;}
+.menu-btn{width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:9px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.05);color:white;cursor:pointer;transition:0.2s;}
+.menu-btn:hover{background:rgba(255,255,255,0.1);}
+.dropdown{position:absolute;right:0;top:100%;margin-top:8px;width:220px;background:var(--bg3);border:1px solid var(--bd2);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,0.5);opacity:0;visibility:hidden;transition:0.2s;z-index:500;overflow:hidden;}
+.topbar-btns:hover .dropdown{opacity:1;visibility:visible;}
+.menu-item{display:flex;align-items:center;gap:10px;padding:12px 16px;color:var(--txt2);text-decoration:none;font-size:0.85rem;font-weight:600;transition:0.2s;border-bottom:1px solid var(--bd);}
+.menu-item:last-child{border-bottom:none;}
+.menu-item:hover{background:rgba(255,255,255,0.05);color:white;}
+.menu-item i{font-size:1.1rem;}
+
+.bnav{position:fixed;bottom:0;left:0;right:0;z-index:300;
+  background:rgba(5,5,9,.96);backdrop-filter:blur(18px);
+  border-top:1px solid var(--bd);display:flex;
+  padding-bottom:env(safe-area-inset-bottom)}
+.bnav-item{flex:1;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;padding:7px 4px;gap:3px;color:var(--txt3);
+  font-size:.9rem;border:none;background:none;cursor:pointer;
+  font-family:'Rajdhani',sans-serif;transition:.2s}
+.bnav-item .nav-lbl{font-size:.52rem;font-weight:700;letter-spacing:1.2px;text-transform:uppercase}
+.bnav-item.active{color:var(--acc)}
+.bnav-item.active .nav-pip{background:rgba(124,63,255,.15);padding:4px 14px;border-radius:8px}
+
+.main{max-width:480px;margin:0 auto;
+  padding:14px 13px calc(68px + env(safe-area-inset-bottom));
+  position:relative;z-index:1}
+
+.card{background:var(--bg2);border:1px solid var(--bd);border-radius:16px;
+  padding:15px;margin-bottom:13px;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;
+  background:linear-gradient(90deg,transparent,var(--acc),transparent);opacity:.35}
+
+.sec-label{display:flex;align-items:center;gap:7px;font-size:.63rem;font-weight:700;
+  letter-spacing:1.5px;text-transform:uppercase;color:var(--txt3);margin-bottom:11px}
+.sec-label svg{color:var(--acc);flex-shrink:0}
+.badge{margin-left:auto;font-size:.55rem;padding:2px 8px;
+  background:rgba(124,63,255,.14);border:1px solid var(--bd2);
+  border-radius:20px;color:var(--acc);white-space:nowrap}
+.badge-ok{background:rgba(63,255,200,.08)!important;border-color:rgba(63,255,200,.25)!important;color:var(--suc)!important}
+
+.page{display:none}
+.page.active{display:block;animation:fadeUp .22s ease}
+@keyframes fadeUp{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
+
+.inp{width:100%;padding:11px 13px;background:rgba(0,0,0,.42);border:1px solid var(--bd);
+  border-radius:10px;color:var(--txt);font-family:'JetBrains Mono',monospace;font-size:.82rem;transition:.2s}
+.inp:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 2px rgba(124,63,255,.12)}
+.inp::placeholder{color:var(--txt3)}
+.textarea-bio{width:100%;padding:11px 13px;background:rgba(0,0,0,.48);border:1px solid var(--bd);
+  border-radius:10px;color:var(--txt);font-family:'JetBrains Mono',monospace;
+  font-size:.8rem;line-height:1.6;resize:vertical;min-height:100px;transition:.2s}
+.textarea-bio:focus{outline:none;border-color:var(--acc);box-shadow:0 0 0 2px rgba(124,63,255,.12)}
+.char-bar{display:flex;justify-content:flex-end;margin-top:4px;
+  font-size:.62rem;color:var(--txt3);font-family:'JetBrains Mono',monospace}
+
+.token-row{display:flex;gap:7px;margin-bottom:10px}
+.token-row .inp{flex:1}
+.paste-btn{padding:11px 13px;border-radius:10px;background:rgba(124,63,255,.1);
+  border:1px solid var(--bd2);color:var(--acc);cursor:pointer;transition:.2s;
+  flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.paste-btn:hover{background:rgba(124,63,255,.2)}
+
+.info-box{background:rgba(0,0,0,.35);border:1px solid var(--bd);border-radius:10px;padding:12px;margin-top:10px}
+.info-row{display:flex;justify-content:space-between;align-items:center;
+  padding:5px 0;border-bottom:1px solid var(--bd)}
+.info-row:last-child{border-bottom:none}
+.info-key{color:var(--txt3);font-size:.72rem}
+.info-val{color:var(--suc);font-weight:700;font-size:.8rem;font-family:'JetBrains Mono',monospace}
+
+.btn{display:flex;align-items:center;justify-content:center;gap:7px;width:100%;
+  padding:12px;border:none;border-radius:11px;font-family:'Rajdhani',sans-serif;
+  font-size:.92rem;font-weight:700;letter-spacing:.7px;cursor:pointer;transition:.25s;
+  text-transform:uppercase}
+.btn:active{transform:scale(.98)}
+.btn-primary{background:linear-gradient(135deg,var(--acc),#c83fff);color:#fff;
+  box-shadow:0 0 18px rgba(124,63,255,.35)}
+.btn-primary:hover{box-shadow:0 0 28px rgba(124,63,255,.5);transform:translateY(-1px)}
+.btn-secondary{background:rgba(0,0,0,.38);color:var(--txt2);border:1px solid var(--bd2)}
+.btn-secondary:hover{border-color:var(--acc);color:var(--acc)}
+.btn-success{background:linear-gradient(135deg,#00c97a,#00e5a0);color:#000;font-weight:800;
+  box-shadow:0 0 18px rgba(0,201,122,.28)}
+
+.fmt-row{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px}
+.fmt-btn{padding:6px 12px;border-radius:7px;background:var(--bg3);border:1px solid var(--bd);
+  color:var(--txt2);font-family:'JetBrains Mono',monospace;font-size:.82rem;font-weight:700;
+  cursor:pointer;transition:.15s}
+.fmt-btn:hover{border-color:var(--acc);color:var(--acc);background:rgba(124,63,255,.1)}
+
+.color-grid{display:flex;flex-wrap:wrap;gap:7px}
+.color-dot{width:28px;height:28px;border-radius:7px;border:1.5px solid rgba(255,255,255,.1);
+  cursor:pointer;transition:.15s;flex-shrink:0}
+.color-dot:hover{transform:scale(1.2);border-color:rgba(255,255,255,.5)}
+
+.grad-list{display:flex;flex-wrap:wrap;gap:6px}
+.grad-chip{padding:5px 11px;border-radius:7px;background:var(--bg3);border:1px solid var(--bd);
+  font-family:'Rajdhani',sans-serif;font-size:.74rem;font-weight:600;color:var(--txt2);
+  cursor:pointer;transition:.15s}
+.grad-chip:hover{border-color:var(--acc);color:var(--acc)}
+
+.vbadge-row{display:flex;flex-wrap:wrap;gap:6px}
+.vb-chip{display:flex;align-items:center;gap:4px;padding:5px 10px;border-radius:7px;
+  background:var(--bg3);border:1px solid var(--bd);cursor:pointer;transition:.15s}
+.vb-chip:hover{border-color:var(--acc)}
+.vb-chip .vlbl{font-size:.64rem;color:var(--txt3);font-family:'Rajdhani',sans-serif}
+
+.bio-preview{background:rgba(0,0,0,.5);border:1px solid rgba(124,63,255,.2);border-radius:10px;
+  padding:13px;min-height:70px;max-height:150px;overflow-y:auto;
+  font-family:'JetBrains Mono',monospace;font-size:.82rem;line-height:1.7;
+  white-space:pre-wrap;word-break:break-word}
+.bio-empty{color:var(--txt3);font-style:italic;font-size:.74rem;text-align:center}
+
+.tpl-list{display:flex;flex-direction:column;gap:10px}
+.tpl-card{background:var(--bg3);border:1px solid var(--bd);border-radius:12px;
+  padding:12px;cursor:pointer;transition:.2s;position:relative;overflow:hidden}
+.tpl-card::before{content:'';position:absolute;top:0;left:0;bottom:0;width:3px;
+  background:linear-gradient(180deg,var(--acc),var(--acc2));border-radius:3px 0 0 3px}
+.tpl-card:hover{border-color:var(--acc);transform:translateY(-1px)}
+.tpl-name{font-size:.68rem;font-weight:700;letter-spacing:1px;text-transform:uppercase;
+  color:var(--acc);margin-bottom:7px;padding-left:9px}
+.tpl-preview{font-size:.8rem;line-height:1.65;padding-left:9px;
+  white-space:pre-wrap;word-break:break-word;margin-bottom:5px;max-height:80px;overflow-y:auto}
+.tpl-tag{display:inline-block;margin-left:9px;font-size:.55rem;font-weight:700;
+  letter-spacing:1px;text-transform:uppercase;color:var(--txt3);
+  background:rgba(0,0,0,.4);padding:2px 7px;border-radius:20px;border:1px solid var(--bd)}
+
+#toast{position:fixed;top:-55px;left:50%;transform:translateX(-50%);
+  background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff;
+  padding:9px 22px;border-radius:30px;font-family:'Rajdhani',sans-serif;
+  font-weight:700;font-size:.86rem;z-index:9999;
+  transition:top .38s cubic-bezier(.34,1.56,.64,1);white-space:nowrap;
+  box-shadow:0 8px 22px rgba(124,63,255,.4)}
+
+.modal-bg{position:fixed;inset:0;z-index:800;background:rgba(0,0,0,.88);
+  backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;
+  padding:16px;opacity:0;visibility:hidden;transition:.28s}
+.modal-bg.show{opacity:1;visibility:visible}
+.modal-box{background:var(--bg3);border:1px solid var(--bd2);border-radius:20px;
+  padding:22px;max-width:370px;width:100%;box-shadow:0 24px 60px rgba(0,0,0,.8);
+  transform:translateY(16px);transition:.32s}
+.modal-bg.show .modal-box{transform:translateY(0)}
+.modal-title{font-family:'Bebas Neue',sans-serif;font-size:1.5rem;letter-spacing:2px;
+  text-align:center;margin-bottom:4px;
+  background:linear-gradient(90deg,var(--acc3),var(--acc));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.modal-sub{color:var(--txt3);font-size:.78rem;text-align:center;margin-bottom:14px}
+
+.mb10{margin-bottom:10px}
+.mt10{margin-top:10px}
+</style>
+</head>
+<body>
+<div id="toast"></div>
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="brand">
+    <div class="brand-icon">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+    </div>
+    <div class="brand-name" id="siteName">MV Creator PRO</div>
+  </div>
+  <div class="topbar-btns">
+    <button class="menu-btn">
+      <i class="ph-bold ph-dots-three-vertical"></i>
+    </button>
+    <div class="dropdown">
+      <a href="/" class="menu-item">
+        <i class="ph ph-users-four" style="color:var(--primary)"></i>
+        <span>5 & 6 Player Group</span>
+      </a>
+      <a href="/bio" class="menu-item">
+        <i class="ph ph-note-pencil" style="color:var(--acc)"></i>
+        <span>Long Bio Injector</span>
+      </a>
+    </div>
+  </div>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+
+  <!-- PAGE: HOME (APPLY) -->
+  <div id="page-home" class="page active">
+    <div class="card">
+      <div class="sec-label">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+        EAT / Access Token
+        <span class="badge" id="tokenBadge">Not Set</span>
+      </div>
+      <button class="btn btn-primary mb10" onclick="window.open('https://ticket.kiosgamer.co.id/', '_blank')">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        Get EAT Token
+      </button>
+      <div class="token-row">
+        <input type="text" id="tokenInput" class="inp" placeholder="Paste EAT or Access Token here…" oninput="onTokenInput()">
+        <button class="paste-btn" onclick="pasteToken()" title="Paste">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
+        </button>
+      </div>
+      <div id="fetchingInfo" style="display:none;text-align:center;padding:8px;color:var(--txt3);font-size:.75rem;">
+        <span class="spin">&#8635;</span> Fetching player info…
+      </div>
+      <div id="playerInfo" class="info-box" style="display:none;">
+        <div class="info-row"><span class="info-key">UID</span><span class="info-val" id="pUID">—</span></div>
+        <div class="info-row"><span class="info-key">Region</span><span class="info-val" id="pRegion">—</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="sec-label">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="17" y1="10" x2="3" y2="10"/><line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="14" x2="3" y2="14"/><line x1="17" y1="18" x2="3" y2="18"/></svg>
+        Bio Text
+        <span class="badge">Max 300</span>
+      </div>
+      <textarea id="homeBioText" class="textarea-bio" spellcheck="false" maxlength="300" placeholder="Type bio here…" oninput="updateHomePrev()"></textarea>
+      <div class="char-bar"><span id="homeCharCount">0 / 300</span></div>
+    </div>
+    <div class="card">
+      <div class="sec-label">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+        Preview
+      </div>
+      <div class="bio-preview" id="homeBioPreview">
+        <div class="bio-empty">Type bio above to preview…</div>
+      </div>
+    </div>
+    <button class="btn btn-primary mb10" id="applyBtn" onclick="applyBio()">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      Apply Bio to Free Fire
+    </button>
+    <button class="btn btn-secondary" onclick="copyBioText()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      Copy Bio Text
+    </button>
+  </div>
+
+  <!-- PAGE: EDITOR -->
+  <div id="page-editor" class="page">
+    <div class="card">
+      <div class="sec-label">Format Tags</div>
+      <div class="fmt-row">
+        <button class="fmt-btn" onclick="ins('[b]')"><b>B</b></button>
+        <button class="fmt-btn" onclick="ins('[/b]')"><b>/B</b></button>
+        <button class="fmt-btn" onclick="ins('[i]')"><i>I</i></button>
+        <button class="fmt-btn" onclick="ins('[/i]')"><i>/I</i></button>
+        <button class="fmt-btn" onclick="ins('[u]')"><u>U</u></button>
+        <button class="fmt-btn" onclick="ins('[/u]')"><u>/U</u></button>
+        <button class="fmt-btn" onclick="ins('[c]')">C</button>
+        <button class="fmt-btn" onclick="ins('[/c]')">C/</button>
+      </div>
+      <textarea id="bioText" class="textarea-bio" spellcheck="false" maxlength="300" placeholder="[b][c][FF0000]Your [ffff00]Colorful Bio…" oninput="updateEditorPrev()"></textarea>
+      <div class="char-bar"><span id="editorCharCount">0 / 300</span></div>
+    </div>
+    <div class="card">
+      <div class="sec-label">V Badge — tap to insert</div>
+      <div class="vbadge-row" id="vBadgeRow"></div>
+    </div>
+    <div class="card">
+      <div class="sec-label">Colors — tap to insert</div>
+      <div class="color-grid" id="colorGrid"></div>
+      <div style="display:flex;gap:8px;margin-top:10px;">
+        <input type="color" id="customColor" value="#ff00ff" style="width:36px;height:36px;border:none;background:none;cursor:pointer;border-radius:7px;">
+        <button class="fmt-btn" style="flex:1;" onclick="insertCustomColor()">+ Custom Color</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="sec-label">Gradient Presets</div>
+      <div class="grad-list" id="gradList"></div>
+    </div>
+    <div class="card">
+      <div class="sec-label">Live Preview</div>
+      <div class="bio-preview" id="editorBioPreview">
+        <div class="bio-empty">Type above to preview…</div>
+      </div>
+    </div>
+    <button class="btn btn-primary mb10" onclick="sendToHome()">Use This Bio — Go to Apply</button>
+    <button class="btn btn-secondary" onclick="clearEditor()">Clear Editor</button>
+  </div>
+
+  <!-- PAGE: TEMPLATES -->
+  <div id="page-templates" class="page">
+    <div class="card"><div class="sec-label">Bio Templates</div></div>
+    <div class="tpl-list" id="templateList"></div>
+  </div>
+
+</div>
+
+<!-- BOTTOM NAV -->
+<nav class="bnav">
+  <button class="bnav-item active" onclick="switchPage('home')">
+    <div class="nav-pip"><i class="ph ph-house"></i></div>
+    <span class="nav-lbl">Apply</span>
+  </button>
+  <button class="bnav-item" onclick="switchPage('editor')">
+    <div class="nav-pip"><i class="ph ph-note-pencil"></i></div>
+    <span class="nav-lbl">Editor</span>
+  </button>
+  <button class="bnav-item" onclick="switchPage('templates')">
+    <div class="nav-pip"><i class="ph ph-layout"></i></div>
+    <span class="nav-lbl">Templates</span>
+  </button>
+</nav>
+
+<!-- MODALS -->
+<div class="modal-bg" id="successModal">
+  <div class="modal-box">
+    <div class="modal-title">SUCCESS!</div>
+    <div class="modal-sub">Bio updated in Free Fire ✓</div>
+    <div class="info-box" style="margin-bottom:12px;">
+      <div class="info-row"><span class="info-key">UID</span><span class="info-val" id="mo-uid">—</span></div>
+      <div class="info-row"><span class="info-key">Region</span><span class="info-val" id="mo-region">—</span></div>
+    </div>
+    <div class="bio-preview" id="mo-bio" style="margin-bottom:16px;min-height:50px;"></div>
+    <button class="btn btn-success" onclick="closeModal('successModal')">Awesome!</button>
+  </div>
+</div>
+
+<script>
+const CFG = {{ config | tojson }};
+const V_BADGES = [
+  {hex:"ffd319",name:"Golden"},{hex:"ff0000",name:"Red"},{hex:"ff00ae",name:"Pink"},
+  {hex:"b400ff",name:"Violet"},{hex:"0600ff",name:"Blue"},{hex:"00ff00",name:"Green"},
+  {hex:"FFFF00",name:"Yellow"},{hex:"00ccff",name:"LtBlue"},{hex:"bfff6d",name:"Parrot"},
+  {hex:"FF8800",name:"Orange"},{hex:"FFD700",name:"Gold"},{hex:"800080",name:"Purple"},
+  {hex:"00FFFF",name:"Cyan"},{hex:"FFFFFF",name:"White"}
+];
+const COLORS = ["FF0000","FF4500","FF8C00","FFD700","FFFF00","BFFF00","00FF00","00FFFF","00BBFF","0000FF","8B00FF","FF00FF","FF1493","FF69B4","FFFFFF","C0C0C0","000000"];
+const GRADIENTS = [
+  {name:"Fire", code:"[FF0000]YOUR [FFFF00]NAME"},
+  {name:"Ocean", code:"[0000FF]YOUR [00FFFF]NAME"},
+  {name:"Royal", code:"[FFD700]YOUR [FFFFFF]NAME"},
+  {name:"Neon", code:"[FF00FF]YOUR [00FFFF]NAME"},
+  {name:"Blood", code:"[800000]YOUR [FF0000]NAME"},
+  {name:"Tiranga", code:"[FF9933]YOU [FFFFFF]R [138808]ME"}
+];
+
+(function(){
+  document.getElementById('siteName').textContent = CFG.site_name || "MV Creator PRO";
+  const vRow = document.getElementById('vBadgeRow');
+  V_BADGES.forEach(v => {
+    let c = document.createElement('div');
+    c.className = 'vb-chip';
+    c.innerHTML = `<span style="color:#${v.hex};font-size:1.1rem;font-weight:bold;">Ⓥ</span><span class="vlbl">${v.name}</span>`;
+    c.onclick = () => ins(`[b][c][${v.hex}]Ⓥ[/c][/b]`);
+    vRow.appendChild(c);
+  });
+  const cGrid = document.getElementById('colorGrid');
+  COLORS.forEach(hex => {
+    let chip = document.createElement('div'); chip.className = 'color-dot';
+    chip.style.background = '#' + hex; chip.onclick = () => ins(`[c][${hex}]`);
+    cGrid.appendChild(chip);
+  });
+  const gList = document.getElementById('gradList');
+  GRADIENTS.forEach(g => {
+    let chip = document.createElement('div'); chip.className = 'grad-chip';
+    chip.textContent = g.name; chip.onclick = () => ins(g.code);
+    gList.appendChild(chip);
+  });
+  const tList = document.getElementById('templateList');
+  if(CFG.templates) {
+    CFG.templates.forEach(t => {
+      let card = document.createElement('div'); card.className = 'tpl-card';
+      card.innerHTML = `<div class="tpl-name">${t.name}</div><div class="tpl-preview">${parseBio(t.bio)}</div><div class="tpl-tag">Tap to use</div>`;
+      card.onclick = () => useTemplate(t.bio); tList.appendChild(card);
+    });
+  }
+})();
+
+let currentJwtToken = null, currentAccountInfo = null, currentRegion = "ind";
+function switchPage(p){
+  document.querySelectorAll('.page').forEach(el => el.classList.remove('active'));
+  document.getElementById('page-'+p).classList.add('active');
+  document.querySelectorAll('.bnav-item').forEach(el => el.classList.remove('active'));
+  const idx = p === 'home' ? 0 : (p === 'editor' ? 1 : 2);
+  document.querySelectorAll('.bnav-item')[idx].classList.add('active');
+}
+function onTokenInput(){
+  let v = document.getElementById('tokenInput').value.trim();
+  if(v.length > 10){
+    document.getElementById('tokenBadge').textContent = 'Set'; document.getElementById('tokenBadge').className = 'badge badge-ok';
+    clearTimeout(window._fetchTimer); window._fetchTimer = setTimeout(()=>fetchPlayer(v), 900);
+  } else {
+    document.getElementById('tokenBadge').textContent = 'Not Set'; document.getElementById('tokenBadge').className = 'badge';
+    document.getElementById('playerInfo').style.display = 'none';
+  }
+}
+async function fetchPlayer(token){
+  document.getElementById('fetchingInfo').style.display = 'block';
+  document.getElementById('playerInfo').style.display = 'none';
+  try{
+    let res = await fetch('/api/verify-token', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({eat_token: token}) });
+    let d = await res.json();
+    document.getElementById('fetchingInfo').style.display = 'none';
+    if(d.success){
+      currentJwtToken = d.jwt_token; currentAccountInfo = d.account; currentRegion = d.account.region.toLowerCase();
+      document.getElementById('pUID').textContent = d.account.uid; document.getElementById('pRegion').textContent = d.account.region;
+      document.getElementById('playerInfo').style.display = 'block';
+    } else { toast(d.error); }
+  } catch(e){ toast('Fetch error'); }
+}
+async function pasteToken(){ try{ let t = await navigator.clipboard.readText(); document.getElementById('tokenInput').value = t; onTokenInput(); } catch(e){ toast('Paste error'); } }
+function updateHomePrev(){ let v = document.getElementById('homeBioText').value; document.getElementById('homeCharCount').textContent = v.length + ' / 300'; document.getElementById('homeBioPreview').innerHTML = v.trim() ? parseBio(v) : '<div class="bio-empty">Type bio above to preview…</div>'; }
+function copyBioText(){ let v = document.getElementById('homeBioText').value; if(!v){ toast('No bio'); return; } navigator.clipboard.writeText(v).then(()=>toast('Copied!')); }
+async function applyBio(){
+  let token = document.getElementById('tokenInput').value.trim(), bio = document.getElementById('homeBioText').value.trim();
+  if(!token || !bio){ toast('Missing data'); return; }
+  let btn = document.getElementById('applyBtn'); btn.disabled = true; btn.innerHTML = 'Applying...';
+  try{
+    let res = await fetch('/api/update-bio', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({jwt_token: currentJwtToken, bio: bio, region: currentRegion}) });
+    let d = await res.json();
+    if(d.success){
+      document.getElementById('mo-uid').textContent = currentAccountInfo.uid; document.getElementById('mo-region').textContent = currentRegion.toUpperCase();
+      document.getElementById('mo-bio').innerHTML = parseBio(bio); openModal('successModal');
+    } else { toast(d.error); }
+  } catch(e){ toast('Error applying'); } finally { btn.disabled = false; btn.innerHTML = 'Apply Bio to Free Fire'; }
+}
+function ins(tag){ let ta = document.getElementById('bioText'), s = ta.selectionStart, e = ta.selectionEnd, v = ta.value; ta.value = v.slice(0,s) + tag + v.slice(e); updateEditorPrev(); }
+function insertCustomColor(){ ins(`[c][${document.getElementById('customColor').value.replace('#','').toUpperCase()}]`); }
+function clearEditor(){ document.getElementById('bioText').value = ''; updateEditorPrev(); }
+function updateEditorPrev(){ let v = document.getElementById('bioText').value; document.getElementById('editorCharCount').textContent = v.length + ' / 300'; document.getElementById('editorBioPreview').innerHTML = v.trim() ? parseBio(v) : '<div class="bio-empty">Type above to preview…</div>'; }
+function sendToHome(){ document.getElementById('homeBioText').value = document.getElementById('bioText').value; updateHomePrev(); switchPage('home'); }
+function useTemplate(raw){ document.getElementById('homeBioText').value = raw; updateHomePrev(); switchPage('home'); }
+function parseBio(raw){
+  let s = raw.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  s = s.replace(/\[c\]\[([a-fA-F0-9]{6})\]/gi,'[$1]').replace(/\[\/c\]/gi,'').replace(/\[c\]/gi,'');
+  s = s.replace(/\[b\]/gi,'<b>').replace(/\[\/b\]/gi,'</b>').replace(/\[i\]/gi,'<i>').replace(/\[\/i\]/gi,'</i>').replace(/\[u\]/gi,'<u>').replace(/\[\/u\]/gi,'</u>');
+  let parts = s.split(/(\[[a-fA-F0-9]{6}\])/gi), html = '', open = false;
+  parts.forEach(p => {
+    let m = p.match(/^\[([a-fA-F0-9]{6})\]$/i);
+    if(m){ if(open) html+='</span>'; open=true; html+=`<span style="color:#${m[1].toUpperCase()}">`; }
+    else html += p.replace(/\n/g,'<br>');
+  });
+  if(open) html+='</span>'; return html;
+}
+function openModal(id){ document.getElementById(id).classList.add('show'); }
+function closeModal(id){ document.getElementById(id).classList.remove('show'); }
+function toast(msg){ let t = document.getElementById('toast'); t.textContent = msg; t.style.top = '54px'; setTimeout(() => { t.style.top = '-55px'; }, 2800); }
+</script>
+</body>
+</html>
