@@ -164,9 +164,15 @@ def google_verify():
 @app.route('/api/accounts', methods=['GET'])
 def get_accounts():
     if not os.path.exists('bot.txt'):
-        return jsonify({})
+        return jsonify([])
     with open('bot.txt', 'r') as f:
-        data = json.load(f)
+        try:
+            data = json.load(f)
+            # If it's the old dict format, convert to list for consistency
+            if isinstance(data, dict):
+                data = [{"uid": k, "password": v} for k, v in data.items()]
+        except:
+            data = []
     return jsonify(data)
 
 def log_reader(process, uid):
@@ -222,58 +228,92 @@ def log_reader(process, uid):
 @app.route('/api/bots_status', methods=['GET'])
 def bots_status():
     if not os.path.exists('bot.txt'):
-        return jsonify([])
+        return jsonify({"summary": {"total": 0, "online": 0, "offline": 0}, "bots": []})
+    
     with open('bot.txt', 'r') as f:
         try:
-            stored_bots = json.load(f)
+            stored_data = json.load(f)
+            if isinstance(stored_data, dict):
+                stored_bots = [{"uid": k, "password": v} for k, v in stored_data.items()]
+            else:
+                stored_bots = stored_data
         except:
-            stored_bots = {}
+            stored_bots = []
             
-    statuses = []
-    for uid, _ in stored_bots.items():
+    bot_list = []
+    online_count = 0
+    offline_count = 0
+    
+    for bot_obj in stored_bots:
+        uid = str(bot_obj.get('uid'))
         if uid in active_clients:
-            # Check if process is still running
             proc = active_clients[uid]
             if proc.poll() is None:
                 # Running
-                status_info = bot_statuses.get(uid, {"status": "Connecting...", "name": "Unknown", "team": "Single"})
-                statuses.append({
+                status_info = bot_statuses.get(uid, {"status": "Connecting...", "name": "Unknown"})
+                is_online = status_info.get("status") == "Online"
+                if is_online: online_count += 1
+                else: offline_count += 1
+                
+                bot_list.append({
                     "uid": uid,
                     "name": status_info.get("name", "Unknown"),
                     "status": status_info.get("status", "Unknown"),
-                    "team": status_info.get("team", "Single"),
                     "pid": proc.pid
                 })
             else:
                 # Dead
-                statuses.append({
+                offline_count += 1
+                bot_list.append({
                     "uid": uid,
-                    "name": bot_statuses.get(uid, {}).get("name", "Offline"),
-                    "status": "Offline / Crashed",
-                    "team": "-"
+                    "name": "Crashed",
+                    "status": "Offline",
+                    "pid": None
                 })
         else:
-            statuses.append({
+            offline_count += 1
+            bot_list.append({
                 "uid": uid,
                 "name": "Offline",
                 "status": "Offline",
-                "team": "-"
+                "pid": None
             })
-    return jsonify(statuses)
+            
+    return jsonify({
+        "summary": {
+            "total": len(stored_bots),
+            "online": online_count,
+            "offline": offline_count
+        },
+        "bots": bot_list
+    })
 
 @app.route('/api/accounts', methods=['POST'])
 def add_account():
     req = request.json
     uid = req.get('uid')
     pwd = req.get('password')
-    data = {}
+    data = []
     if os.path.exists('bot.txt'):
         with open('bot.txt', 'r') as f:
             try:
                 data = json.load(f)
+                if isinstance(data, dict):
+                    data = [{"uid": k, "password": v} for k, v in data.items()]
             except:
                 pass
-    data[uid] = pwd
+    
+    # Check if already exists
+    exists = False
+    for item in data:
+        if str(item['uid']) == str(uid):
+            item['password'] = pwd
+            exists = True
+            break
+    
+    if not exists:
+        data.append({"uid": uid, "password": pwd})
+        
     with open('bot.txt', 'w') as f:
         json.dump(data, f, indent=4)
     return jsonify({"status": "success", "message": "Account added."})
@@ -282,10 +322,19 @@ def logic_start_bots():
     if not os.path.exists('bot.txt'):
         return 0, "No accounts found."
     with open('bot.txt', 'r') as f:
-        data = json.load(f)
+        try:
+            stored_data = json.load(f)
+            if isinstance(stored_data, dict):
+                data_list = [{"uid": k, "password": v} for k, v in stored_data.items()]
+            else:
+                data_list = stored_data
+        except:
+            return 0, "Error loading bot.txt"
     
     started = 0
-    for uid, pwd in data.items():
+    for bot_obj in data_list:
+        uid = str(bot_obj.get('uid'))
+        pwd = bot_obj.get('password')
         if uid not in active_clients or active_clients[uid].poll() is not None:
             try:
                 # Spawn a completely independent process for each bot
@@ -523,7 +572,15 @@ def save_group():
             uid = str(acc.get('uid'))
             pwd = acc.get('password')
             if uid and pwd:
-                data[uid] = pwd
+                # Update if exists, else append
+                found = False
+                for existing in data:
+                    if str(existing.get('uid')) == uid:
+                        existing['password'] = pwd
+                        found = True
+                        break
+                if not found:
+                    data.append({"uid": uid, "password": pwd})
                 
         with open('bot.txt', 'w') as f:
             json.dump(data, f, indent=4)
@@ -561,13 +618,47 @@ if os.environ.get('PORT'):
     print("[HEROKU] Production environment detected. Initializing bots...")
     threading.Thread(target=auto_start_bots, daemon=True).start()
 
+def bot_monitor_loop():
+    """Background thread to auto-restart crashed bots"""
+    while True:
+        try:
+            if os.path.exists('bot.txt'):
+                with open('bot.txt', 'r') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        data_list = [{"uid": k, "password": v} for k, v in data.items()]
+                    else:
+                        data_list = data
+                
+                for bot_obj in data_list:
+                    uid = str(bot_obj.get('uid'))
+                    pwd = bot_obj.get('password')
+                    
+                    # If bot is not in active_clients or has stopped
+                    if uid not in active_clients or active_clients[uid].poll() is not None:
+                        logging.info(f"[MONITOR] Restarting bot {uid}...")
+                        
+                        cmd = [sys.executable, "main.py", str(uid), str(pwd)]
+                        env = os.environ.copy()
+                        env["PYTHONUNBUFFERED"] = "1"
+                        
+                        proc = subprocess.Popen(
+                            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, env=env
+                        )
+                        active_clients[uid] = proc
+                        threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
+                        time.sleep(1) # Stagger restarts
+        except Exception as e:
+            logging.error(f"[MONITOR] Loop error: {e}")
+        time.sleep(30) # Check every 30 seconds
+
 if __name__ == '__main__':
     # Force templates dir exists
     os.makedirs('templates', exist_ok=True)
     
-    # Start auto-launcher thread for local dev (if not on Heroku)
-    if not os.environ.get('PORT'):
-        threading.Thread(target=auto_start_bots, daemon=True).start()
+    # Start bot monitor thread (handles both initial start and auto-restart)
+    threading.Thread(target=bot_monitor_loop, daemon=True).start()
     
     # Use dynamic port for Heroku or 5000 for local
     port = int(os.environ.get('PORT', 5000))

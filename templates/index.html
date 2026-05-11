@@ -148,8 +148,19 @@
                 </h2>
                 <button onclick="fetchBotStatuses()" class="text-xs text-primary hover:underline">Refresh Status</button>
             </div>
-            <div id="botStatusList" class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <!-- Bot statuses will be injected here -->
+            <div id="botSummaryContainer" class="grid grid-cols-3 gap-4 text-center">
+                <div class="bg-white/5 border border-white/5 p-4 rounded-2xl">
+                    <p class="text-[10px] text-gray-500 uppercase font-bold tracking-tighter mb-1">Total Bots</p>
+                    <p id="statTotal" class="text-2xl font-black text-white">0</p>
+                </div>
+                <div class="bg-success/5 border border-success/10 p-4 rounded-2xl">
+                    <p class="text-[10px] text-success/60 uppercase font-bold tracking-tighter mb-1">Online</p>
+                    <p id="statOnline" class="text-2xl font-black text-success">0</p>
+                </div>
+                <div class="bg-danger/5 border border-danger/10 p-4 rounded-2xl">
+                    <p class="text-[10px] text-danger/60 uppercase font-bold tracking-tighter mb-1">Offline</p>
+                    <p id="statOffline" class="text-2xl font-black text-danger">0</p>
+                </div>
             </div>
         </section>
 
@@ -289,30 +300,26 @@
         async function fetchBotStatuses() {
             try {
                 const res = await fetch('/api/bots_status');
-                const bots = await res.json();
-                const container = document.getElementById('botStatusList');
-                container.innerHTML = '';
-
-                if (bots.length === 0) {
-                    container.innerHTML = '<p class="text-xs text-gray-500 italic">No bots currently running.</p>';
-                    return;
+                const data = await res.json();
+                
+                if (data.summary) {
+                    document.getElementById('statTotal').textContent = data.summary.total;
+                    document.getElementById('statOnline').textContent = data.summary.online;
+                    document.getElementById('statOffline').textContent = data.summary.offline;
+                    
+                    // Update global status indicator
+                    const globalDot = document.querySelector('#botGlobalStatus .w-2');
+                    const globalText = document.querySelector('#botGlobalStatus span');
+                    if (data.summary.online > 0) {
+                        globalDot.className = "w-2 h-2 rounded-full bg-success animate-pulse";
+                        globalText.className = "text-[10px] text-success font-bold uppercase tracking-widest";
+                        globalText.textContent = "System Online";
+                    } else {
+                        globalDot.className = "w-2 h-2 rounded-full bg-danger";
+                        globalText.className = "text-[10px] text-danger font-bold uppercase tracking-widest";
+                        globalText.textContent = "All Offline";
+                    }
                 }
-
-                bots.forEach(bot => {
-                    const el = document.createElement('div');
-                    el.className = 'flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5';
-                    el.innerHTML = `
-                        <div class="flex items-center gap-3">
-                            <div class="w-2 h-2 rounded-full ${bot.status === 'ONLINE' ? 'bg-success animate-pulse' : 'bg-gray-600'}"></div>
-                            <div>
-                                <p class="text-xs font-bold text-white">${bot.uid}</p>
-                                <p class="text-[10px] text-gray-500">${bot.status}</p>
-                            </div>
-                        </div>
-                        <div class="text-[10px] font-mono text-gray-400 bg-black/30 px-2 py-1 rounded">PID: ${bot.pid}</div>
-                    `;
-                    container.appendChild(el);
-                });
             } catch (err) {
                 console.error('Status fetch failed', err);
             }
