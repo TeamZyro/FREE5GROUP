@@ -32,6 +32,10 @@ bot_statuses = {}  # Store bot status (Online, Offline, Connecting) here for the
 active_clients = {}
 client_logs = []
 
+# HEROKU OPTIMIZATION: Limit total bots to stay within memory limits (e.g., 512MB/1GB)
+# 100+ bots will cause R15 Memory errors. We recommend 10-15 bots max for stability.
+MAX_BOT_LIMIT = 10
+
 class WebLogHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -630,7 +634,14 @@ def bot_monitor_loop():
                     else:
                         data_list = data
                 
+                # Count currently active bots
+                running_bots = [u for u, p in active_clients.items() if p.poll() is None]
+                
                 for bot_obj in data_list:
+                    # Stop if we hit the limit
+                    if len(running_bots) >= MAX_BOT_LIMIT:
+                        break
+                        
                     uid = str(bot_obj.get('uid'))
                     pwd = bot_obj.get('password')
                     
@@ -648,7 +659,9 @@ def bot_monitor_loop():
                         )
                         active_clients[uid] = proc
                         threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
-                        time.sleep(1) # Stagger restarts
+                        
+                        running_bots.append(uid)
+                        time.sleep(2) # Stagger restarts to avoid CPU spikes
         except Exception as e:
             logging.error(f"[MONITOR] Loop error: {e}")
         time.sleep(30) # Check every 30 seconds
