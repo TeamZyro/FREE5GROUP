@@ -33,8 +33,8 @@ active_clients = {}
 client_logs = []
 
 # HEROKU OPTIMIZATION: Limit total bots to stay within memory limits (e.g., 512MB/1GB)
-# 100+ bots will cause R15 Memory errors. We recommend 10-15 bots max for stability.
-MAX_BOT_LIMIT = 10
+# 100+ bots will cause R15 Memory errors. We recommend 10 bots max for stability.
+MAX_BOT_LIMIT = 10 
 
 class WebLogHandler(logging.Handler):
     def emit(self, record):
@@ -336,38 +336,37 @@ def logic_start_bots():
             return 0, "Error loading bot.txt"
     
     started = 0
+    running_count = len([u for u, p in active_clients.items() if p.poll() is None])
+    
     for bot_obj in data_list:
+        if running_count >= MAX_BOT_LIMIT:
+            # Kill oldest bot if limit reached (simple heuristic: first one in the list/active_clients)
+            oldest_uid = next(iter(active_clients))
+            active_clients[oldest_uid].terminate()
+            running_count -= 1
+            
         uid = str(bot_obj.get('uid'))
         pwd = bot_obj.get('password')
         if uid not in active_clients or active_clients[uid].poll() is not None:
             try:
-                # Spawn a completely independent process for each bot
-                # Using sys.executable to ensure the same python environment
                 cmd = [sys.executable, "main.py", str(uid), str(pwd)]
-                
-                # Force Python to not buffer stdout so logs appear instantly
                 env = os.environ.copy()
                 env["PYTHONUNBUFFERED"] = "1"
-                
-                # Start process and pipe stdout/stderr
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT, # Merge stderr into stdout
+                    stderr=subprocess.STDOUT,
                     text=True,
-                    bufsize=1, # Line buffered
+                    bufsize=1,
                     env=env
                 )
-                
                 active_clients[uid] = proc
-                
-                # Start a thread to read the logs without blocking the web server
                 log_thread = threading.Thread(target=log_reader, args=(proc, uid))
                 log_thread.daemon = True
                 log_thread.start()
-                
                 started += 1
-                time.sleep(1) # Start staggering
+                running_count += 1
+                time.sleep(1)
             except Exception as e:
                 logging.error(f"Failed to start bot {uid}: {e}")
     return started, "Success"
@@ -392,10 +391,17 @@ def start_specific_bots():
         data = json.load(f)
     
     started = 0
+    running_count = len([u for u, p in active_clients.items() if p.poll() is None])
+
     for uid in uids:
+        if running_count >= MAX_BOT_LIMIT:
+            oldest_uid = next(iter(active_clients))
+            active_clients[oldest_uid].terminate()
+            running_count -= 1
+            
         uid = str(uid)
+        pwd = data.get(uid)
         if uid in data:
-            pwd = data[uid]
             if uid not in active_clients or active_clients[uid].poll() is not None:
                 try:
                     cmd = [sys.executable, "main.py", str(uid), str(pwd)]
@@ -637,6 +643,24 @@ def bot_monitor_loop():
                 # Count currently active bots
                 running_bots = [u for u, p in active_clients.items() if p.poll() is None]
                 
+                # KILL EXCESS BOTS: If somehow we have more than 10, kill the oldest ones
+                if len(running_bots) > MAX_BOT_LIMIT:
+                    excess = len(running_bots) - MAX_BOT_LIMIT
+                    logging.info(f"[MONITOR] Killing {excess} excess bots to stay within limit...")
+                    for i in range(excess):
+                        u_to_kill = running_bots[i]
+                        proc = active_clients.get(u_to_kill)
+                        if proc:
+                            try:
+                                if os.name == 'nt':
+                                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
+                                else:
+                                    proc.terminate()
+                                logging.info(f"[MONITOR] Killed excess bot {u_to_kill}")
+                            except:
+                                pass
+                    running_bots = running_bots[excess:] # Update list
+
                 for bot_obj in data_list:
                     # Stop if we hit the limit
                     if len(running_bots) >= MAX_BOT_LIMIT:

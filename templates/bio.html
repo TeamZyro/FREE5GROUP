@@ -59,7 +59,7 @@
         }
 
         .glass-card {
-            background: rgba(21, 28, 44, 0.6);
+            background: rgba(21, 28, 44, 0.9);
             backdrop-filter: blur(12px);
             border: 1px solid rgba(255, 255, 255, 0.08);
             box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
@@ -75,7 +75,7 @@
         .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
         
         .bio-preview-box {
-            background: rgba(11, 15, 25, 0.6);
+            background: #0b0f19;
             border: 1px solid rgba(255, 255, 255, 0.05);
             border-radius: 1rem;
             min-height: 80px;
@@ -170,7 +170,7 @@
                     <div class="flex gap-2">
                         <div class="relative flex-1">
                             <input type="text" id="eatTokenInput" oninput="onTokenUpdate()" placeholder="Paste EAT Token here..." 
-                                class="w-full bg-darkBase/50 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:border-primary/50 outline-none transition-all">
+                                class="w-full bg-[#0b0f19] border border-white/20 focus:border-primary focus:ring-1 focus:ring-primary rounded-xl px-4 py-3 text-sm text-white placeholder:text-gray-500 outline-none transition-all">
                         </div>
                         <button onclick="pasteEatToken()" class="w-12 h-12 flex items-center justify-center rounded-xl bg-white/5 border border-white/5 hover:bg-white/10 text-primary transition-all">
                             <i class="ph-bold ph-clipboard-text text-xl"></i>
@@ -183,11 +183,11 @@
                 
                 <div id="pInfoBox" class="hidden mt-6 pt-6 border-t border-white/5 animate-fadeIn">
                     <div class="grid grid-cols-2 gap-4">
-                        <div class="bg-darkBase/50 p-3 rounded-xl border border-white/5">
+                        <div class="bg-[#0b0f19] p-3 rounded-xl border border-white/10">
                             <p class="text-[10px] text-gray-500 uppercase font-bold">Player UID</p>
                             <p id="dispUID" class="text-sm font-bold text-white mt-1">---</p>
                         </div>
-                        <div class="bg-darkBase/50 p-3 rounded-xl border border-white/5">
+                        <div class="bg-[#0b0f19] p-3 rounded-xl border border-white/10">
                             <p class="text-[10px] text-gray-500 uppercase font-bold">Region</p>
                             <p id="dispRegion" class="text-sm font-bold text-success mt-1">---</p>
                         </div>
@@ -202,11 +202,11 @@
                     </h2>
                     <span id="charCountApply" class="text-[10px] text-gray-500">0 / 300</span>
                 </div>
-                <textarea id="applyBioArea" oninput="updateApplyPreview()" class="w-full bg-darkBase/50 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:border-accent/50 outline-none transition-all h-28 custom-scrollbar resize-none" placeholder="Type or paste your bio code here..."></textarea>
+                <textarea id="applyBioArea" oninput="updateApplyPreview()" class="w-full bg-[#0b0f19] border border-white/20 focus:border-accent focus:ring-1 focus:ring-accent rounded-xl px-4 py-3 text-sm text-white placeholder:text-gray-500 outline-none transition-all h-28 custom-scrollbar resize-none" placeholder="Type or paste your bio code here..."></textarea>
                 
                 <div class="mt-6">
                     <p class="text-[10px] text-gray-500 uppercase font-bold mb-2 ml-1">Live Preview</p>
-                    <div id="applyPreview" class="bio-preview-box p-4 text-sm leading-relaxed custom-scrollbar overflow-y-auto">
+                    <div id="applyPreview" class="bio-preview-box bg-[#0b0f19] p-4 text-sm leading-relaxed custom-scrollbar overflow-y-auto border border-white/10">
                         <p class="text-gray-600 italic">Enter bio text to see preview...</p>
                     </div>
                 </div>
@@ -242,7 +242,7 @@
                 </div>
 
                 <div class="grid grid-cols-1 gap-4">
-                    <textarea id="editorArea" oninput="updateEditorPreview()" class="w-full bg-darkBase/50 border border-white/10 rounded-xl px-4 py-3 text-sm text-white focus:border-accent/50 outline-none transition-all h-32 custom-scrollbar resize-none" placeholder="Craft your colorful bio here..."></textarea>
+                    <textarea id="editorArea" oninput="updateEditorPreview()" class="w-full bg-[#0b0f19] border border-white/20 focus:border-accent focus:ring-1 focus:ring-accent rounded-xl px-4 py-3 text-sm text-white placeholder:text-gray-500 outline-none transition-all h-32 custom-scrollbar resize-none" placeholder="Craft your colorful bio here..."></textarea>
                     
                     <div>
                         <p class="text-[10px] text-gray-500 uppercase font-bold mb-2 ml-1">V Badge Collection</p>
