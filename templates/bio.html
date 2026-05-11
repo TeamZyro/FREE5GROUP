@@ -327,76 +327,6 @@
             {name:"Blood", code:"[b][c][800000]DARK [FF0000]SOUL"}
         ];
 
-        // Initialization
-        function init() {
-            // Colors
-            const colorBox = document.getElementById('colorShortcuts');
-            COLORS.forEach(hex => {
-                const btn = document.createElement('button');
-                btn.className = 'w-6 h-6 rounded-md border border-white/10';
-                btn.style.backgroundColor = '#' + hex;
-                btn.onclick = () => insertTag(`[c][${hex}]`);
-                colorBox.appendChild(btn);
-            });
-
-            // V Badges
-            const vGrid = document.getElementById('vBadgeGrid');
-            V_BADGES.forEach(v => {
-                const btn = document.createElement('button');
-                btn.className = 'px-3 py-2 rounded-xl bg-white/5 border border-white/5 text-sm flex items-center gap-2 hover:bg-white/10 transition-all';
-                btn.innerHTML = `<span style="color:#${v.hex}">Ⓥ</span> <span class="text-[10px] text-gray-400">${v.name}</span>`;
-                btn.onclick = () => insertTag(`[b][c][${v.hex}]Ⓥ[/c][/b]`);
-                vGrid.appendChild(btn);
-            });
-
-            // Presets
-            const pGrid = document.getElementById('presetGrid');
-            PRESETS.forEach(p => {
-                const btn = document.createElement('button');
-                btn.className = 'px-3 py-2 rounded-xl bg-white/5 border border-white/5 text-[10px] font-bold text-gray-300 hover:text-white transition-all';
-                btn.textContent = p.name;
-                btn.onclick = () => insertTag(p.code);
-                pGrid.appendChild(btn);
-            });
-
-            // Templates
-            const tGrid = document.getElementById('templateGridMain');
-            if(CFG.templates) {
-                CFG.templates.forEach(t => {
-                    const el = document.createElement('div');
-                    el.className = 'bg-white/5 border border-white/5 p-4 rounded-2xl hover:border-primary/30 transition-all cursor-pointer group';
-                    el.innerHTML = `
-                        <div class="flex items-center justify-between mb-3">
-                            <span class="text-[10px] font-bold text-primary uppercase tracking-tighter">${t.name}</span>
-                            <i class="ph ph-copy text-gray-600 group-hover:text-primary transition-colors"></i>
-                        </div>
-                        <div class="text-xs leading-relaxed text-gray-300 pointer-events-none">${parseBioCode(t.bio)}</div>
-                    `;
-                    el.onclick = () => {
-                        document.getElementById('applyBioArea').value = t.bio;
-                        updateApplyPreview();
-                        switchBioPage('apply');
-                        showToast('Template Loaded', 'Bio code applied to injector', 'success');
-                    };
-                    tGrid.appendChild(el);
-                });
-            }
-        }
-
-        function switchBioPage(page) {
-            document.querySelectorAll('.bio-page-content').forEach(el => el.classList.add('hidden'));
-            document.getElementById('bio-' + page).classList.remove('hidden');
-            
-            document.querySelectorAll('.tab-btn').forEach(el => {
-                el.classList.remove('active', 'text-white');
-                el.classList.add('text-gray-400');
-            });
-            const activeTab = document.getElementById('tab-' + page);
-            activeTab.classList.add('active', 'text-white');
-            activeTab.classList.remove('text-gray-400');
-        }
-
-        // Shared Logic
         function parseBioCode(raw) {
             let s = raw.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
             s = s.replace(/\[c\]\[([a-fA-F0-9]{6})\]/gi,'[$1]').replace(/\[\/c\]/gi,'').replace(/\[c\]/gi,'');
@@ -431,21 +361,27 @@
             setTimeout(() => toastEl.classList.add('translate-y-20', 'opacity-0'), 4000);
         }
 
-        // Apply Logic
+        function switchBioPage(page) {
+            document.querySelectorAll('.bio-page-content').forEach(el => el.classList.add('hidden'));
+            document.getElementById('bio-' + page).classList.remove('hidden');
+            document.querySelectorAll('.tab-btn').forEach(el => {
+                el.classList.remove('active', 'text-white');
+                el.classList.add('text-gray-400');
+            });
+            const activeTab = document.getElementById('tab-' + page);
+            activeTab.classList.add('active', 'text-white');
+            activeTab.classList.remove('text-gray-400');
+        }
+
         let curJWT = null, curAccount = null;
-        
         async function onTokenUpdate() {
             const token = document.getElementById('eatTokenInput').value.trim();
             const status = document.getElementById('tokenStatus');
             if(token.length > 20) {
                 status.textContent = "Verifying...";
                 status.className = "text-[10px] px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20";
-                
                 try {
-                    const res = await fetch('/api/verify-token', {
-                        method: 'POST', headers: {'Content-Type':'application/json'},
-                        body: JSON.stringify({eat_token: token})
-                    });
+                    const res = await fetch('/api/verify-token', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({eat_token: token}) });
                     const d = await res.json();
                     if(d.success) {
                         curJWT = d.jwt_token; curAccount = d.account;
@@ -463,11 +399,8 @@
         }
 
         async function pasteEatToken() {
-            try {
-                const t = await navigator.clipboard.readText();
-                document.getElementById('eatTokenInput').value = t;
-                onTokenUpdate();
-            } catch(e) { showToast('Error', 'Clipboard access denied', 'error'); }
+            try { const t = await navigator.clipboard.readText(); document.getElementById('eatTokenInput').value = t; onTokenUpdate(); }
+            catch(e) { showToast('Error', 'Clipboard access denied', 'error'); }
         }
 
         function updateApplyPreview() {
@@ -480,16 +413,11 @@
             const bio = document.getElementById('applyBioArea').value.trim();
             if(!curJWT) return showToast('Error', 'Please provide a valid EAT token first', 'error');
             if(!bio) return showToast('Error', 'Bio content cannot be empty', 'error');
-
             const btn = document.getElementById('injectBtn');
             const orig = btn.innerHTML;
             btn.disabled = true; btn.innerHTML = '<i class="ph ph-circle-notch animate-spin"></i> Injecting...';
-
             try {
-                const res = await fetch('/api/update-bio', {
-                    method: 'POST', headers: {'Content-Type':'application/json'},
-                    body: JSON.stringify({jwt_token: curJWT, bio: bio, region: curAccount.region})
-                });
+                const res = await fetch('/api/update-bio', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({jwt_token: curJWT, bio: bio, region: curAccount.region}) });
                 const d = await res.json();
                 if(d.success) {
                     document.getElementById('finalBioPreview').innerHTML = parseBioCode(bio);
@@ -500,27 +428,49 @@
         }
 
         function closeSuccessModal() { document.getElementById('successModal').classList.add('hidden'); }
-
-        // Editor Logic
-        function updateEditorPreview() {
-            const val = document.getElementById('editorArea').value;
-            document.getElementById('editorPreview').innerHTML = parseBioCode(val);
-        }
+        function updateEditorPreview() { document.getElementById('editorPreview').innerHTML = parseBioCode(document.getElementById('editorArea').value); }
         function insertTag(tag) {
             const area = document.getElementById('editorArea');
             const start = area.selectionStart, end = area.selectionEnd;
             area.value = area.value.slice(0, start) + tag + area.value.slice(end);
-            updateEditorPreview();
-            area.focus();
+            updateEditorPreview(); area.focus();
         }
         function insertHexColor(hex) { insertTag(`[c][${hex.replace('#','').toUpperCase()}]`); }
         function clearEditorArea() { document.getElementById('editorArea').value = ''; updateEditorPreview(); }
-        function useEditorBio() {
-            document.getElementById('applyBioArea').value = document.getElementById('editorArea').value;
-            updateApplyPreview();
-            switchBioPage('apply');
-        }
+        function useEditorBio() { document.getElementById('applyBioArea').value = document.getElementById('editorArea').value; updateApplyPreview(); switchBioPage('apply'); }
 
+        function init() {
+            const colorBox = document.getElementById('colorShortcuts');
+            COLORS.forEach(hex => {
+                const btn = document.createElement('button'); btn.className = 'w-6 h-6 rounded-md border border-white/10';
+                btn.style.backgroundColor = '#' + hex; btn.onclick = () => insertTag(`[c][${hex}]`);
+                colorBox.appendChild(btn);
+            });
+            const vGrid = document.getElementById('vBadgeGrid');
+            V_BADGES.forEach(v => {
+                const btn = document.createElement('button'); btn.className = 'px-3 py-2 rounded-xl bg-white/5 border border-white/5 text-sm flex items-center gap-2 hover:bg-white/10 transition-all';
+                btn.innerHTML = `<span style="color:#${v.hex}">Ⓥ</span> <span class="text-[10px] text-gray-400">${v.name}</span>`;
+                btn.onclick = () => insertTag(`[b][c][${v.hex}]Ⓥ[/c][/b]`);
+                vGrid.appendChild(btn);
+            });
+            const pGrid = document.getElementById('presetGrid');
+            PRESETS.forEach(p => {
+                const btn = document.createElement('button'); btn.className = 'px-3 py-2 rounded-xl bg-white/5 border border-white/5 text-[10px] font-bold text-gray-300 hover:text-white transition-all';
+                btn.textContent = p.name; btn.onclick = () => insertTag(p.code);
+                pGrid.appendChild(btn);
+            });
+            const tGrid = document.getElementById('templateGridMain');
+            if(CFG.templates) {
+                CFG.templates.forEach(t => {
+                    const el = document.createElement('div'); el.className = 'bg-white/5 border border-white/5 p-4 rounded-2xl hover:border-primary/30 transition-all cursor-pointer group';
+                    el.innerHTML = `<div class="flex items-center justify-between mb-3"><span class="text-[10px] font-bold text-primary uppercase tracking-tighter">${t.name}</span><i class="ph ph-copy text-gray-600 group-hover:text-primary transition-colors"></i></div><div class="text-xs leading-relaxed text-gray-300 pointer-events-none">${parseBioCode(t.bio)}</div>`;
+                    el.onclick = () => { document.getElementById('applyBioArea').value = t.bio; updateApplyPreview(); switchBioPage('apply'); showToast('Template Loaded', 'Bio code applied to injector', 'success'); };
+                    tGrid.appendChild(el);
+                });
+            }
+        }
+        window.onload = init;
+    </script>
     </div>
     <script>
         // Initialize 3D Background
@@ -539,9 +489,6 @@
             maxDistance: 22.00,
             spacing: 16.00
         });
-
-        window.onload = init;
     </script>
 </body>
 </html>
-
