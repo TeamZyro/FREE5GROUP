@@ -181,16 +181,22 @@ def get_accounts():
 
 def log_reader(process, uid):
     """Reads stdout from the spawned process and updates web logs and statuses"""
-    bot_statuses[uid] = {"status": "Connecting...", "team": "Single", "name": "Loading..."}
+    if uid not in bot_statuses:
+        bot_statuses[uid] = {"status": "Connecting...", "name": "Unknown", "last_update": time.time()}
+        
     try:
+        # Read the stream line by line
         for line in iter(process.stdout.readline, ''):
-            if not line:
-                break
+            if not line: break
             log_line = line.strip()
             
-            # Simple heuristic status extraction from the new main.py output
-            if "Authentication successful" in log_line or "ONLINE" in log_line or "Server connection established" in log_line:
+            # Update last_update timestamp to show bot is alive
+            bot_statuses[uid]["last_update"] = time.time()
+            
+            # Detect successful login/online status
+            if "NAJMI-M24 BOT - ONLINE" in log_line or "READY" in log_line or "Bot is now running" in log_line:
                 bot_statuses[uid]["status"] = "Online"
+                bot_statuses[uid]["last_update"] = time.time()
             
             if "Welcome," in log_line:
                 # Extract name: "👋 Welcome, PlayerName!"
@@ -226,7 +232,9 @@ def log_reader(process, uid):
     except Exception as e:
         client_logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - [{uid}] - ERROR reading process output: {e}")
     finally:
-        bot_statuses[uid]["status"] = "Offline"
+        if uid in bot_statuses:
+            bot_statuses[uid]["status"] = "Offline"
+            bot_statuses[uid]["last_update"] = time.time()
         process.stdout.close()
 
 @app.route('/api/bots_status', methods=['GET'])
@@ -632,60 +640,87 @@ def bot_monitor_loop():
     """Background thread to auto-restart crashed bots"""
     while True:
         try:
-            if os.path.exists('bot.txt'):
+            try:
                 with open('bot.txt', 'r') as f:
                     data = json.load(f)
                     if isinstance(data, dict):
                         data_list = [{"uid": k, "password": v} for k, v in data.items()]
                     else:
                         data_list = data
-                
-                # Count currently active bots
-                running_bots = [u for u, p in active_clients.items() if p.poll() is None]
-                
-                # KILL EXCESS BOTS: If somehow we have more than 10, kill the oldest ones
-                if len(running_bots) > MAX_BOT_LIMIT:
-                    excess = len(running_bots) - MAX_BOT_LIMIT
-                    logging.info(f"[MONITOR] Killing {excess} excess bots to stay within limit...")
-                    for i in range(excess):
-                        u_to_kill = running_bots[i]
-                        proc = active_clients.get(u_to_kill)
-                        if proc:
-                            try:
-                                if os.name == 'nt':
-                                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
-                                else:
-                                    proc.terminate()
-                                logging.info(f"[MONITOR] Killed excess bot {u_to_kill}")
-                            except:
-                                pass
-                    running_bots = running_bots[excess:] # Update list
+            except Exception as e:
+                logging.error(f"[MONITOR] Error reading bot.txt: {e}")
+                time.sleep(10)
+                continue
+            
+            # Snapshot of currently running processes
+            running_uids = [u for u, p in active_clients.items() if p.poll() is None]
+            
+            # CRITICAL FIX: Detect stalled bots (Process alive but status is Offline in UI)
+            # If a process is alive but has been 'Offline' for too long, kill it.
+            for uid in running_uids:
+                status_info = bot_statuses.get(uid, {})
+                if status_info.get("status") != "Online":
+                    # If it's been offline/connecting for more than 5 minutes, it's likely stuck
+                    last_update = status_info.get("last_update", 0)
+                    if time.time() - last_update > 300: # 5 minutes
+                        logging.warning(f"[MONITOR] Bot {uid} appears stalled (Status: {status_info.get('status')}). Killing for restart...")
+                        proc = active_clients[uid]
+                        try:
+                            if os.name == 'nt':
+                                subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
+                            else:
+                                proc.terminate()
+                            # Clear status to force fresh restart
+                            if uid in bot_statuses: del bot_statuses[uid]
+                        except:
+                            pass
+            
+            # Re-calculate running bots after cleanup
+            running_bots = [u for u, p in active_clients.items() if p.poll() is None]
+            
+            # KILL EXCESS BOTS: If somehow we have more than 10, kill the oldest ones
+            if len(running_bots) > MAX_BOT_LIMIT:
+                excess = len(running_bots) - MAX_BOT_LIMIT
+                logging.info(f"[MONITOR] Killing {excess} excess bots to stay within limit...")
+                for i in range(excess):
+                    u_to_kill = running_bots[i]
+                    proc = active_clients.get(u_to_kill)
+                    if proc:
+                        try:
+                            if os.name == 'nt':
+                                subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
+                            else:
+                                proc.terminate()
+                            logging.info(f"[MONITOR] Killed excess bot {u_to_kill}")
+                        except:
+                            pass
+                running_bots = running_bots[excess:] # Update list
 
-                for bot_obj in data_list:
-                    # Stop if we hit the limit
-                    if len(running_bots) >= MAX_BOT_LIMIT:
-                        break
-                        
-                    uid = str(bot_obj.get('uid'))
-                    pwd = bot_obj.get('password')
+            for bot_obj in data_list:
+                # Stop if we hit the limit
+                if len(running_bots) >= MAX_BOT_LIMIT:
+                    break
                     
-                    # If bot is not in active_clients or has stopped
-                    if uid not in active_clients or active_clients[uid].poll() is not None:
-                        logging.info(f"[MONITOR] Restarting bot {uid}...")
-                        
-                        cmd = [sys.executable, "main.py", str(uid), str(pwd)]
-                        env = os.environ.copy()
-                        env["PYTHONUNBUFFERED"] = "1"
-                        
-                        proc = subprocess.Popen(
-                            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, env=env
-                        )
-                        active_clients[uid] = proc
-                        threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
-                        
-                        running_bots.append(uid)
-                        time.sleep(2) # Stagger restarts to avoid CPU spikes
+                uid = str(bot_obj.get('uid'))
+                pwd = bot_obj.get('password')
+                
+                # If bot is not in active_clients or has stopped
+                if uid not in active_clients or active_clients[uid].poll() is not None:
+                    logging.info(f"[MONITOR] Restarting bot {uid}...")
+                    
+                    cmd = [sys.executable, "main.py", str(uid), str(pwd)]
+                    env = os.environ.copy()
+                    env["PYTHONUNBUFFERED"] = "1"
+                    
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1, env=env
+                    )
+                    active_clients[uid] = proc
+                    threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
+                    
+                    running_bots.append(uid)
+                    time.sleep(2) # Stagger restarts to avoid CPU spikes
         except Exception as e:
             logging.error(f"[MONITOR] Loop error: {e}")
         time.sleep(30) # Check every 30 seconds
