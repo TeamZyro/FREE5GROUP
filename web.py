@@ -347,38 +347,47 @@ def logic_start_bots():
     
     started = 0
     running_count = len([u for u, p in active_clients.items() if p.poll() is None])
+    started = 0
+    running_count = len([u for u, p in active_clients.items() if p.poll() is None])
     
-    for bot_obj in data_list:
-        if running_count >= MAX_BOT_LIMIT:
-            # Kill oldest bot if limit reached (simple heuristic: first one in the list/active_clients)
-            oldest_uid = next(iter(active_clients))
-            active_clients[oldest_uid].terminate()
-            running_count -= 1
-            
+    # ONLY start the bots for the current rotation
+    targets = []
+    for i in range(MAX_BOT_LIMIT):
+        idx = (current_rotation_index + i) % len(data_list)
+        targets.append(data_list[idx])
+        
+    for bot_obj in targets:
         uid = str(bot_obj.get('uid'))
         pwd = bot_obj.get('password')
+        
         if uid not in active_clients or active_clients[uid].poll() is not None:
+            if running_count >= MAX_BOT_LIMIT:
+                # If we have excess bots (from a previous setting), kill the oldest one
+                running_uids = [u for u, p in active_clients.items() if p.poll() is None]
+                if running_uids:
+                    oldest_uid = running_uids[0]
+                    logging.info(f"[SYSTEM] Killing excess bot {oldest_uid} to respect limit.")
+                    try:
+                        active_clients[oldest_uid].terminate()
+                    except: pass
+                    running_count -= 1
+
             try:
                 cmd = [sys.executable, "main.py", str(uid), str(pwd)]
                 env = os.environ.copy()
                 env["PYTHONUNBUFFERED"] = "1"
                 proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    env=env
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1, env=env
                 )
                 active_clients[uid] = proc
-                log_thread = threading.Thread(target=log_reader, args=(proc, uid))
-                log_thread.daemon = True
-                log_thread.start()
+                threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
                 started += 1
                 running_count += 1
-                time.sleep(1)
+                time.sleep(2)
             except Exception as e:
                 logging.error(f"Failed to start bot {uid}: {e}")
+                
     return started, "Success"
 
 @app.route('/api/start_bots', methods=['POST'])
