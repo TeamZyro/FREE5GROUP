@@ -38,6 +38,9 @@ BOT_ROTATION_INTERVAL = 3600 # 1 hour in seconds
 last_rotation_time = time.time()
 current_rotation_index = 0
 
+# History of exploit requests
+exploit_history = []
+
 class WebLogHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -515,10 +518,23 @@ def group_exploit():
     bot_uid = active_uids[0]
     resp = send_ipc_command(bot_uid, f"GROUP_EXPLOIT {uid} {slot}")
     
+    # Record in history
+    exploit_history.insert(0, {
+        "uid": uid,
+        "slot": slot,
+        "time": time.strftime("%H:%M:%S"),
+        "status": "Success" if resp and "SUCCESS" in resp else "Failed"
+    })
+    if len(exploit_history) > 20: exploit_history.pop()
+    
     if resp and "SUCCESS" in resp:
         return jsonify({"status": "success", "message": "Exploit sequence initiated."})
     else:
         return jsonify({"status": "error", "message": resp or "Failed to communicate with bot"})
+
+@app.route('/api/exploit_logs')
+def get_exploit_logs():
+    return jsonify(exploit_history)
 
 @app.route('/api/send_bot_command', methods=['POST'])
 def send_bot_command():
