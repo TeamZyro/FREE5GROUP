@@ -89,6 +89,10 @@
         .animate-pulse-subtle {
             animation: pulse-subtle 2s infinite ease-in-out;
         }
+
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
     </style>
 </head>
 
@@ -198,6 +202,19 @@
                             </span>
                         </button>
                     </div>
+                </div>
+            </div>
+        </section>
+        
+        <!-- Live Request History -->
+        <section class="glass-card p-6 border-white/10">
+            <h2 class="text-sm font-bold text-gray-500 uppercase tracking-widest flex items-center gap-2 mb-4">
+                <i class="ph ph-activity text-accent"></i>
+                Live Activity Log
+            </h2>
+            <div class="overflow-hidden">
+                <div id="exploitLogList" class="flex flex-col gap-2 max-h-[300px] overflow-y-auto custom-scrollbar pr-2">
+                    <p class="text-center py-8 text-gray-600 text-sm italic">Waiting for requests...</p>
                 </div>
             </div>
         </section>
@@ -325,9 +342,44 @@
             }
         }
 
-        // Auto refresh status
+        async function fetchExploitLogs() {
+            try {
+                const res = await fetch('/api/exploit_logs');
+                const logs = await res.json();
+                const container = document.getElementById('exploitLogList');
+                
+                if (!logs || logs.length === 0) {
+                    return;
+                }
+
+                container.innerHTML = logs.map(log => `
+                    <div class="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5 hover:border-white/10 transition-all group animate-fadeIn">
+                        <div class="flex items-center gap-3">
+                            <div class="w-8 h-8 rounded-lg ${log.slot === 6 ? 'bg-accent/20 text-accent' : 'bg-primary/20 text-primary'} flex items-center justify-center font-bold text-xs">
+                                ${log.slot}P
+                            </div>
+                            <div>
+                                <p class="text-sm font-bold text-white tracking-wide">${log.uid}</p>
+                                <p class="text-[10px] text-gray-500 uppercase tracking-tighter">${log.slot} Player Exploit</p>
+                            </div>
+                        </div>
+                        <div class="text-right">
+                            <p class="text-[10px] font-bold ${log.status === 'Success' ? 'text-success' : 'text-danger'}">${log.status}</p>
+                            <p class="text-[10px] text-gray-600">${log.time}</p>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (err) {
+                console.error('Log fetch failed', err);
+            }
+        }
+
+        // Auto refresh
         setInterval(fetchBotStatuses, 5000);
+        setInterval(fetchExploitLogs, 3000);
+        
         fetchBotStatuses();
+        fetchExploitLogs();
     </script>
     </div>
     <script>
