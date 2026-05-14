@@ -33,8 +33,10 @@ active_clients = {}
 client_logs = []
 
 # HEROKU OPTIMIZATION: Limit total bots to stay within memory limits (e.g., 512MB/1GB)
-# 100+ bots will cause R15 Memory errors. We recommend 10 bots max for stability.
-MAX_BOT_LIMIT = 10 
+MAX_BOT_LIMIT = 2 
+BOT_ROTATION_INTERVAL = 3600 # 1 hour in seconds
+last_rotation_time = time.time()
+current_rotation_index = 0
 
 class WebLogHandler(logging.Handler):
     def emit(self, record):
@@ -637,9 +639,15 @@ if os.environ.get('PORT'):
     threading.Thread(target=auto_start_bots, daemon=True).start()
 
 def bot_monitor_loop():
-    """Background thread to auto-restart crashed bots"""
+    """Background thread to rotate and monitor bots"""
+    global last_rotation_time, current_rotation_index
     while True:
         try:
+            # 1. Check if it's time to rotate
+            now = time.time()
+            is_rotation_time = (now - last_rotation_time) >= BOT_ROTATION_INTERVAL
+            
+            # 2. Load accounts
             try:
                 with open('bot.txt', 'r') as f:
                     data = json.load(f)
@@ -651,76 +659,65 @@ def bot_monitor_loop():
                 logging.error(f"[MONITOR] Error reading bot.txt: {e}")
                 time.sleep(10)
                 continue
+
+            # 3. Handle Rotation Logic
+            if is_rotation_time or not active_clients:
+                if is_rotation_time:
+                    logging.info("[MONITOR] Rotation time reached. Stopping current bots...")
+                    # Kill everyone
+                    for uid in list(active_clients.keys()):
+                        proc = active_clients.get(uid)
+                        if proc and proc.poll() is None:
+                            try:
+                                if os.name == 'nt': subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
+                                else: proc.terminate()
+                            except: pass
+                    active_clients.clear()
+                    bot_statuses.clear()
+                    
+                    # Update index for next 2 bots
+                    current_rotation_index = (current_rotation_index + MAX_BOT_LIMIT) % len(data_list)
+                    last_rotation_time = now
+                
+                # Pick the 2 bots based on current index
+                targets = []
+                for i in range(MAX_BOT_LIMIT):
+                    idx = (current_rotation_index + i) % len(data_list)
+                    targets.append(data_list[idx])
+                
+                # Start them
+                for bot_obj in targets:
+                    uid = str(bot_obj.get('uid'))
+                    pwd = bot_obj.get('password')
+                    if uid not in active_clients or active_clients[uid].poll() is not None:
+                        logging.info(f"[MONITOR] Starting bot {uid} (Rotation)...")
+                        cmd = [sys.executable, "main.py", str(uid), str(pwd)]
+                        env = os.environ.copy()
+                        env["PYTHONUNBUFFERED"] = "1"
+                        proc = subprocess.Popen(
+                            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, env=env
+                        )
+                        active_clients[uid] = proc
+                        threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
+                        time.sleep(5) # Stagger
             
-            # Snapshot of currently running processes
+            # 4. Standard Health Check (for the 2 currently running bots)
             running_uids = [u for u, p in active_clients.items() if p.poll() is None]
-            
-            # CRITICAL FIX: Detect stalled bots (Process alive but status is Offline in UI)
-            # If a process is alive but has been 'Offline' for too long, kill it.
             for uid in running_uids:
                 status_info = bot_statuses.get(uid, {})
-                if status_info.get("status") != "Online":
-                    # If it's been offline/connecting for more than 5 minutes, it's likely stuck
-                    last_update = status_info.get("last_update", 0)
-                    if time.time() - last_update > 300: # 5 minutes
-                        logging.warning(f"[MONITOR] Bot {uid} appears stalled (Status: {status_info.get('status')}). Killing for restart...")
-                        proc = active_clients[uid]
-                        try:
-                            if os.name == 'nt':
-                                subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
-                            else:
-                                proc.terminate()
-                            # Clear status to force fresh restart
-                            if uid in bot_statuses: del bot_statuses[uid]
-                        except:
-                            pass
-            
-            # Re-calculate running bots after cleanup
-            running_bots = [u for u, p in active_clients.items() if p.poll() is None]
-            
-            # KILL EXCESS BOTS: If somehow we have more than 10, kill the oldest ones
-            if len(running_bots) > MAX_BOT_LIMIT:
-                excess = len(running_bots) - MAX_BOT_LIMIT
-                logging.info(f"[MONITOR] Killing {excess} excess bots to stay within limit...")
-                for i in range(excess):
-                    u_to_kill = running_bots[i]
-                    proc = active_clients.get(u_to_kill)
-                    if proc:
-                        try:
-                            if os.name == 'nt':
-                                subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
-                            else:
-                                proc.terminate()
-                            logging.info(f"[MONITOR] Killed excess bot {u_to_kill}")
-                        except:
-                            pass
-                running_bots = running_bots[excess:] # Update list
+                # If stalled, kill it (monitor will restart it in next loop iteration within the same rotation)
+                if status_info.get("status") != "Online" and (time.time() - status_info.get("last_update", 0) > 300):
+                    logging.warning(f"[MONITOR] Bot {uid} stalled. Killing...")
+                    proc = active_clients[uid]
+                    try:
+                        if os.name == 'nt': subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
+                        else: proc.terminate()
+                    except: pass
 
-            for bot_obj in data_list:
-                # Stop if we hit the limit
-                if len(running_bots) >= MAX_BOT_LIMIT:
-                    break
-                    
-                uid = str(bot_obj.get('uid'))
-                pwd = bot_obj.get('password')
-                
-                # If bot is not in active_clients or has stopped
-                if uid not in active_clients or active_clients[uid].poll() is not None:
-                    logging.info(f"[MONITOR] Restarting bot {uid}...")
-                    
-                    cmd = [sys.executable, "main.py", str(uid), str(pwd)]
-                    env = os.environ.copy()
-                    env["PYTHONUNBUFFERED"] = "1"
-                    
-                    proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1, env=env
-                    )
-                    active_clients[uid] = proc
-                    threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
-                    
-                    running_bots.append(uid)
-                    time.sleep(2) # Stagger restarts to avoid CPU spikes
+        except Exception as e:
+            logging.error(f"[MONITOR] Loop error: {e}")
+        time.sleep(30) # Check every 30 seconds
         except Exception as e:
             logging.error(f"[MONITOR] Loop error: {e}")
         time.sleep(30) # Check every 30 seconds
