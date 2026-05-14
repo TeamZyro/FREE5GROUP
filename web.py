@@ -702,22 +702,44 @@ def bot_monitor_loop():
                         threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
                         time.sleep(5) # Stagger
             
-            # 4. Standard Health Check (for the 2 currently running bots)
+            # 4. Health Check & Auto-Restart (for the current rotation)
             running_uids = [u for u, p in active_clients.items() if p.poll() is None]
-            for uid in running_uids:
+            
+            # If any of the 2 target bots are not running, start them
+            current_targets = []
+            for i in range(MAX_BOT_LIMIT):
+                idx = (current_rotation_index + i) % len(data_list)
+                current_targets.append(data_list[idx])
+            
+            for bot_obj in current_targets:
+                uid = str(bot_obj.get('uid'))
+                pwd = bot_obj.get('password')
+                
+                # Check if it's stalled
                 status_info = bot_statuses.get(uid, {})
-                # If stalled, kill it (monitor will restart it in next loop iteration within the same rotation)
-                if status_info.get("status") != "Online" and (time.time() - status_info.get("last_update", 0) > 300):
-                    logging.warning(f"[MONITOR] Bot {uid} stalled. Killing...")
-                    proc = active_clients[uid]
-                    try:
-                        if os.name == 'nt': subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
-                        else: proc.terminate()
-                    except: pass
+                if uid in active_clients and active_clients[uid].poll() is None:
+                    if status_info.get("status") != "Online" and (time.time() - status_info.get("last_update", 0) > 300):
+                        logging.warning(f"[MONITOR] Bot {uid} stalled. Killing...")
+                        proc = active_clients[uid]
+                        try:
+                            if os.name == 'nt': subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
+                            else: proc.terminate()
+                        except: pass
+                
+                # Restart if dead or just killed
+                if uid not in active_clients or active_clients[uid].poll() is not None:
+                    logging.info(f"[MONITOR] Restarting bot {uid} (Maintain Shift)...")
+                    cmd = [sys.executable, "main.py", str(uid), str(pwd)]
+                    env = os.environ.copy()
+                    env["PYTHONUNBUFFERED"] = "1"
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1, env=env
+                    )
+                    active_clients[uid] = proc
+                    threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
+                    time.sleep(2)
 
-        except Exception as e:
-            logging.error(f"[MONITOR] Loop error: {e}")
-        time.sleep(30) # Check every 30 seconds
         except Exception as e:
             logging.error(f"[MONITOR] Loop error: {e}")
         time.sleep(30) # Check every 30 seconds
