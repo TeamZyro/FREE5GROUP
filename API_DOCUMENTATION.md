@@ -193,3 +193,20 @@ Get current running terminal outputs from the bot server.
 * **Endpoint**: `/api/get_all_logs`
 * **Method**: `GET`
 * **Response**: A JSON array containing the last 500 lines of execution logs.
+
+---
+
+### 8. App Version Check
+Check if a new app version update is available.
+
+* **Endpoint**: `/api/version`
+* **Method**: `GET`
+* **Response**:
+```json
+{
+  "status": "success",
+  "version": "1.1",
+  "update_required": false,
+  "message": "You are running the latest version of the app."
+}
+```

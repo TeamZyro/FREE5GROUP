@@ -146,6 +146,15 @@ def download_ios():
         "message": "iOS App Config ready. (Place your iOS configuration profile here or replace this link with your actual URL)"
     })
 
+@app.route('/api/version')
+def get_version():
+    return jsonify({
+        "status": "success",
+        "version": "1.1",
+        "update_required": False,
+        "message": "You are running the latest version of the app."
+    })
+
 @app.route('/api/verify-token', methods=['POST'])
 def verify_token():
     try:
