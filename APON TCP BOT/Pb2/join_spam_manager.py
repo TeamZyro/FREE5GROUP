@@ -95,7 +95,7 @@ class JoinSpamManager:
                 3: str(datetime.now())[:-7],
                 4: "free fire",
                 5: 1,
-                7: "1.118.1",
+                7: "1.128.2",
                 8: "Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)",
                 9: "Handheld",
                 10: "Verizon Wireless",
@@ -135,7 +135,7 @@ class JoinSpamManager:
                 78: 6,
                 79: 1,
                 81: "32",
-                83: "2019118695",
+                83: "2019120828",
                 86: "OpenGLES2",
                 87: 255,
                 88: 4,
@@ -166,7 +166,7 @@ class JoinSpamManager:
             conn = http.client.HTTPSConnection("loginbp.ggblueshark.com", context=context)
             headers = {
                 "X-Unity-Version": "2018.4.11f1",
-                "ReleaseVersion": "OB52",
+                "ReleaseVersion": "OB54",
                 "Content-Type": "application/x-www-form-urlencoded",
                 "X-GA": "v1 1",
                 "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 7.1.2; ASUS_Z01QD Build/QKQ1.190825.002)",

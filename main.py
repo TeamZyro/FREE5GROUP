@@ -370,7 +370,7 @@ def send_friend_request_single(uid, token, region="IND"):
             "Authorization": f"Bearer {token}",
             "X-Unity-Version": "2018.4.11f1",
             "X-GA": "v1 1",
-            "ReleaseVersion": "OB53",
+            "ReleaseVersion": "OB54",
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Dalvik/2.1.0"
         }
@@ -3327,7 +3327,7 @@ Hr = {
     'Expect': "100-continue",
     'X-Unity-Version': "2018.4.11f1",
     'X-GA': "v1 1",
-    'ReleaseVersion': "OB53"}
+    'ReleaseVersion': "OB54"}
 
 # ---- Random Colores ----
 def get_random_color():
@@ -3518,7 +3518,7 @@ async def EncRypTMajoRLoGin(open_id, access_token):
     major_login.event_time = str(datetime.now())[:-7]
     major_login.game_name = "free fire"
     major_login.platform_id = 1
-    major_login.client_version = "1.123.1"
+    major_login.client_version = "1.128.2"
     major_login.system_software = "Android OS 9 / API-28 (PQ3B.190801.10101846/G9650ZHU2ARC6)"
     major_login.system_hardware = "Handheld"
     major_login.telecom_operator = "Verizon"
@@ -3559,7 +3559,7 @@ async def EncRypTMajoRLoGin(open_id, access_token):
     major_login.channel_type = 3
     major_login.cpu_type = 2
     major_login.cpu_architecture = "64"
-    major_login.client_version_code = "2019118695"
+    major_login.client_version_code = "2019120828"
     major_login.graphics_api = "OpenGLES2"
     major_login.supported_astc_bitset = 16383
     major_login.login_open_id_type = 4
@@ -3958,7 +3958,7 @@ async def send_required_packets(key, iv, region, bot_uid):
             1: 100,
             2: {
                 1: bot_uid,
-                2: "1.120.1",  # Game version
+                2: "1.128.2",  # Game version
                 3: "Android",
                 4: "en",
             }
@@ -4066,7 +4066,7 @@ async def ArohiAccepted(uid,code,K,V):
             2: 161,
             4: "y[WW",
             6: 11,
-            8: "1.114.18",
+            8: "1.128.2",
             9: 3,
             10: 1
             },
@@ -5175,7 +5175,7 @@ import asyncio
 # Add these constants with your other global variables
 BIO_ENCRYPTION_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 BIO_ENCRYPTION_IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
-FREEFIRE_VERSION = "OB53"
+FREEFIRE_VERSION = "OB54"
 
 def decode_jwt_noverify(token: str):
     """Decode JWT without verification"""
@@ -5682,7 +5682,7 @@ async def RedZed_SendInv(bot_uid, uid, key, iv):
                     2: 159, 
                     4: "y[WW", 
                     6: 11, 
-                    8: "1.120.1", 
+                    8: "1.128.2", 
                     9: 3, 
                     10: 1
                 }, 
@@ -6703,6 +6703,7 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
         except asyncio.TimeoutError:
             print(f"Connection attempt to {ip}:{port} timed out.")
         except Exception as e:
+            import traceback
             print(f"- ErroR With {ip}:{port} - {e}")
             traceback.print_exc() 
             

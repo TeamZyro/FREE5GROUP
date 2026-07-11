@@ -117,7 +117,7 @@ def update_bio_with_jwt(jwt_token, bio_text, region):
 
         headers = {
             "Authorization": f"Bearer {jwt_token}",
-            "ReleaseVersion": SITE_CONFIG.get('freefire_version', 'OB53'),
+            "ReleaseVersion": SITE_CONFIG.get('freefire_version', 'OB54'),
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-A305F Build/RP1A.200720.012)",
             "Host": host,
@@ -257,6 +257,10 @@ def bots_status():
         except:
             stored_bots = []
             
+    logging.warning(f"[DEBUG] active_clients keys: {list(active_clients.keys())}")
+    for u, p in active_clients.items():
+        logging.warning(f"[DEBUG] bot {u} poll: {p.poll()} pid: {p.pid}")
+        
     bot_list = []
     online_count = 0
     offline_count = 0
@@ -410,7 +414,14 @@ def start_specific_bots():
         return jsonify({"status": "error", "message": "No accounts found."}), 400
         
     with open('bot.txt', 'r') as f:
-        data = json.load(f)
+        try:
+            stored_data = json.load(f)
+            if isinstance(stored_data, dict):
+                data_dict = stored_data
+            else:
+                data_dict = {str(item.get('uid')): item.get('password') for item in stored_data}
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"Error loading bot.txt: {e}"}), 400
     
     started = 0
     running_count = len([u for u, p in active_clients.items() if p.poll() is None])
@@ -422,8 +433,8 @@ def start_specific_bots():
             running_count -= 1
             
         uid = str(uid)
-        pwd = data.get(uid)
-        if uid in data:
+        pwd = data_dict.get(uid)
+        if pwd:
             if uid not in active_clients or active_clients[uid].poll() is not None:
                 try:
                     cmd = [sys.executable, "main.py", str(uid), str(pwd)]
@@ -566,6 +577,38 @@ def send_bot_command():
         return jsonify({"status": "success", "message": resp.split("SUCCESS: ")[-1]})
     else:
         return jsonify({"status": "error", "message": resp or "Failed to execute command"})
+
+@app.route('/api/create_squad', methods=['POST'])
+def create_squad():
+    squad_file = ".ipc/latest_squad.txt"
+    if os.path.exists(squad_file):
+        try:
+            os.remove(squad_file)
+        except:
+            pass
+
+    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
+    if not active_uids:
+        return jsonify({"status": "error", "message": "No active bots connected"}), 400
+        
+    bot_uid = active_uids[0]
+    resp = send_ipc_command(bot_uid, "CREATE_SQUAD")
+    if not resp or "OK" not in resp:
+        return jsonify({"status": "error", "message": f"Failed to send create squad command to bot: {resp}"}), 500
+
+    # Poll latest_squad.txt for up to 3 seconds
+    for _ in range(30):
+        if os.path.exists(squad_file):
+            try:
+                with open(squad_file, "r") as f:
+                    code = f.read().strip()
+                if code:
+                    return jsonify({"status": "success", "team_code": code, "bot_uid": bot_uid})
+            except:
+                pass
+        time.sleep(0.1)
+
+    return jsonify({"status": "error", "message": "Squad created, but team code interception timed out."}), 500
 
 @app.route('/api/generate_group', methods=['POST'])
 def generate_group():
@@ -768,6 +811,10 @@ def bot_monitor_loop():
         except Exception as e:
             logging.error(f"[MONITOR] Loop error: {e}")
         time.sleep(30) # Check every 30 seconds
+
+@app.route('/api/get_all_logs')
+def get_all_logs():
+    return jsonify(client_logs)
 
 if __name__ == '__main__':
     # Force templates dir exists
