@@ -7,7 +7,7 @@ import logging
 import subprocess
 import signal
 import sys
-from flask import Flask, jsonify, request, render_template, Response, send_from_directory
+from flask import Flask, jsonify, request, render_template, Response, send_from_directory, send_file
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf import descriptor as _descriptor
@@ -134,17 +134,17 @@ def index():
 
 @app.route('/download/apk')
 def download_apk():
-    return jsonify({
-        "status": "success", 
-        "message": "Android App download started. (Place your APK file here or replace this link with your actual APK URL)"
-    })
-
-@app.route('/download/ios')
-def download_ios():
-    return jsonify({
-        "status": "success", 
-        "message": "iOS App Config ready. (Place your iOS configuration profile here or replace this link with your actual URL)"
-    })
+    apk_path = "MVCreatorPRO.apk"
+    if os.path.exists(apk_path):
+        try:
+            return send_file(apk_path, as_attachment=True)
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"Error downloading APK: {e}"}), 500
+    else:
+        return jsonify({
+            "status": "error", 
+            "message": "APK file not found on the server. Please upload 'MVCreatorPRO.apk' to the FREE5GROUP directory."
+        }), 404
 
 @app.route('/api/version')
 def get_version():
