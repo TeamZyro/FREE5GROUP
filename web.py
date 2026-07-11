@@ -132,13 +132,19 @@ def update_bio_with_jwt(jwt_token, bio_text, region):
 def index():
     return render_template('index.html')
 
-@app.route('/group')
-def group_page():
-    return render_template('group.html')
+@app.route('/download/apk')
+def download_apk():
+    return jsonify({
+        "status": "success", 
+        "message": "Android App download started. (Place your APK file here or replace this link with your actual APK URL)"
+    })
 
-@app.route('/bio')
-def bio_page():
-    return render_template('bio.html', config=SITE_CONFIG)
+@app.route('/download/ios')
+def download_ios():
+    return jsonify({
+        "status": "success", 
+        "message": "iOS App Config ready. (Place your iOS configuration profile here or replace this link with your actual URL)"
+    })
 
 @app.route('/api/verify-token', methods=['POST'])
 def verify_token():
