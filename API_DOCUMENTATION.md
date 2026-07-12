@@ -207,6 +207,8 @@ Check if a new app version update is available.
   "status": "success",
   "version": "1.1",
   "update_required": false,
-  "message": "You are running the latest version of the app."
+  "message": "Server is online",
+  "telegram_url": "https://t.me/MissCodeX",
+  "youtube_url": "https://www.youtube.com/@MvFemily"
 }
 ```

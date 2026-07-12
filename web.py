@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import requests
 import os
 import time
@@ -128,6 +129,74 @@ def update_bio_with_jwt(jwt_token, bio_text, region):
     except Exception as e: raise Exception(str(e))
 
 
+def init_db():
+    try:
+        conn = sqlite3.connect("app_config.db")
+        cursor = conn.cursor()
+        
+        # Create AppConfig table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS AppConfig (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version TEXT DEFAULT '1.1',
+                update_required BOOLEAN DEFAULT 0,
+                message TEXT DEFAULT 'Server is online',
+                telegram_url TEXT DEFAULT 'https://t.me/MissCodeX',
+                youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily'
+            )
+        """)
+        
+        # Check if table has rows, if not insert default row
+        cursor.execute("SELECT COUNT(*) FROM AppConfig")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO AppConfig (version, update_required, message, telegram_url, youtube_url)
+                VALUES ('1.1', 0, 'Server is online', 'https://t.me/MissCodeX', 'https://www.youtube.com/@MvFemily')
+            """)
+            conn.commit()
+            
+        # Create Version table if not exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS Version (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version TEXT DEFAULT '1.1',
+                update_required BOOLEAN DEFAULT 0,
+                message TEXT DEFAULT 'Server is online',
+                telegram_url TEXT DEFAULT 'https://t.me/MissCodeX',
+                youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily'
+            )
+        """)
+        
+        # Check if table has rows, if not insert default row
+        cursor.execute("SELECT COUNT(*) FROM Version")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("""
+                INSERT INTO Version (version, update_required, message, telegram_url, youtube_url)
+                VALUES ('1.1', 0, 'Server is online', 'https://t.me/MissCodeX', 'https://www.youtube.com/@MvFemily')
+            """)
+            conn.commit()
+            
+        # Ensure the columns telegram_url and youtube_url exist in both tables
+        for table_name in ["AppConfig", "Version"]:
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [col[1] for col in cursor.fetchall()]
+            if "telegram_url" not in columns:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN telegram_url TEXT DEFAULT 'https://t.me/MissCodeX'")
+            if "youtube_url" not in columns:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily'")
+            conn.commit()
+            
+        # Update existing records from old default URLs to new ones
+        for table_name in ["AppConfig", "Version"]:
+            cursor.execute(f"UPDATE {table_name} SET telegram_url = 'https://t.me/MissCodeX' WHERE telegram_url = 'https://t.me/blackapis' OR telegram_url IS NULL")
+            cursor.execute(f"UPDATE {table_name} SET youtube_url = 'https://www.youtube.com/@MvFemily' WHERE youtube_url = 'https://youtube.com/@harshmanjhi180' OR youtube_url IS NULL")
+            conn.commit()
+            
+        conn.close()
+    except Exception as e:
+        print(f"[DB] Error initializing database: {e}")
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -148,12 +217,51 @@ def download_apk():
 
 @app.route('/api/version')
 def get_version():
+    version_val = "1.1"
+    update_required_val = False
+    message_val = "Server is online"
+    telegram_url_val = "https://t.me/MissCodeX"
+    youtube_url_val = "https://www.youtube.com/@MvFemily"
+    
+    try:
+        conn = sqlite3.connect("app_config.db")
+        cursor = conn.cursor()
+        
+        # Try fetching from AppConfig first, then fallback to Version
+        row = None
+        try:
+            cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url FROM AppConfig LIMIT 1")
+            row = cursor.fetchone()
+        except sqlite3.OperationalError:
+            pass
+            
+        if not row:
+            try:
+                cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url FROM Version LIMIT 1")
+                row = cursor.fetchone()
+            except sqlite3.OperationalError:
+                pass
+                
+        conn.close()
+        
+        if row:
+            version_val = row[0]
+            update_required_val = bool(row[1])
+            message_val = row[2]
+            telegram_url_val = row[3]
+            youtube_url_val = row[4]
+    except Exception as e:
+        logging.error(f"[API] Error reading version from DB: {e}")
+        
     return jsonify({
         "status": "success",
-        "version": "1.1",
-        "update_required": False,
-        "message": "You are running the latest version of the app."
+        "version": version_val,
+        "update_required": update_required_val,
+        "message": message_val,
+        "telegram_url": telegram_url_val,
+        "youtube_url": youtube_url_val
     })
+
 
 @app.route('/api/verify-token', methods=['POST'])
 def verify_token():
@@ -834,6 +942,9 @@ def get_all_logs():
 if __name__ == '__main__':
     # Force templates dir exists
     os.makedirs('templates', exist_ok=True)
+    
+    # Initialize SQLite database
+    init_db()
     
     # Start bot monitor thread (handles both initial start and auto-restart)
     threading.Thread(target=bot_monitor_loop, daemon=True).start()
