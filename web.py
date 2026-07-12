@@ -950,6 +950,6 @@ if __name__ == '__main__':
     threading.Thread(target=bot_monitor_loop, daemon=True).start()
     
     # Use dynamic port for Heroku or 5000 for local
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 80))
     print(f"[SYSTEM] Web Server starting on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
