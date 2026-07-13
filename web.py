@@ -294,30 +294,6 @@ def verify_admin_password():
 
 @app.route('/api/admin/upload_update', methods=['POST'])
 def upload_update():
-    # Attempt to retrieve password from form-data, query parameters, or headers
-    password = request.form.get('password')
-    if not password:
-        password = request.args.get('password')
-    if not password:
-        password = request.headers.get('password')
-    if not password:
-        auth_header = request.headers.get('Authorization')
-        if auth_header:
-            if auth_header.lower().startswith('bearer '):
-                password = auth_header[7:].strip()
-            elif auth_header.lower().startswith('basic '):
-                import base64
-                try:
-                    decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
-                    if ':' in decoded:
-                        password = decoded.split(':', 1)[1]
-                    else:
-                        password = decoded
-                except:
-                    password = auth_header[6:].strip()
-            else:
-                password = auth_header.strip()
-                
     # Extract other fields robustly
     version = request.form.get('version') or request.args.get('version') or request.headers.get('version') or '1.1'
     update_required_str = request.form.get('update_required') or request.args.get('update_required') or request.headers.get('update_required') or 'false'
@@ -330,11 +306,6 @@ def upload_update():
     logging.info(f"[UPLOAD] Query params: {list(request.args.keys())}")
     logging.info(f"[UPLOAD] Headers: {list(request.headers.keys())}")
     logging.info(f"[UPLOAD] Files: {list(request.files.keys())}")
-    logging.info(f"[UPLOAD] Password present: {password is not None}")
-    
-    if password != ADMIN_PASSWORD:
-        logging.warning("[UPLOAD] Unauthorized upload attempt (password mismatch or missing).")
-        return jsonify({"status": "error", "message": "Unauthorized: Invalid password"}), 401
         
     if 'file' not in request.files:
         logging.warning("[UPLOAD] Upload failed: No APK file in request.")
