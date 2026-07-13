@@ -208,16 +208,51 @@ def index():
 
 @app.route('/download/apk')
 def download_apk():
+    # Try to get the latest uploaded APK path from the database
     apk_path = "MVCreatorPRO.apk"
+    try:
+        conn = sqlite3.connect("app_config.db")
+        cursor = conn.cursor()
+        
+        row = None
+        try:
+            cursor.execute("SELECT apk_url FROM AppConfig LIMIT 1")
+            row = cursor.fetchone()
+        except sqlite3.OperationalError:
+            pass
+            
+        if not row:
+            try:
+                cursor.execute("SELECT apk_url FROM Version LIMIT 1")
+                row = cursor.fetchone()
+            except sqlite3.OperationalError:
+                pass
+                
+        conn.close()
+        
+        if row and row[0]:
+            clean_path = row[0].lstrip('/')
+            if clean_path.startswith('uploads/'):
+                apk_path = clean_path
+    except Exception as e:
+        logging.error(f"[API] Error reading APK download path from DB: {e}")
+
     if os.path.exists(apk_path):
         try:
-            return send_file(apk_path, as_attachment=True)
+            return send_file(os.path.abspath(apk_path), as_attachment=True)
         except Exception as e:
             return jsonify({"status": "error", "message": f"Error downloading APK: {e}"}), 500
     else:
+        # Fallback to default in root directory
+        if os.path.exists("MVCreatorPRO.apk"):
+            try:
+                return send_file(os.path.abspath("MVCreatorPRO.apk"), as_attachment=True)
+            except Exception as e:
+                return jsonify({"status": "error", "message": f"Error downloading APK: {e}"}), 500
+                
         return jsonify({
             "status": "error", 
-            "message": "APK file not found on the server. Please upload 'MVCreatorPRO.apk' to the FREE5GROUP directory."
+            "message": f"APK file not found on the server ({apk_path}). Please upload update via admin panel."
         }), 404
 
 @app.route('/api/version')
