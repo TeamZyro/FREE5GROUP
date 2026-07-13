@@ -36,6 +36,7 @@ client_logs = []
 # HEROKU OPTIMIZATION: Limit total bots to stay within memory limits (e.g., 512MB/1GB)
 MAX_BOT_LIMIT = 5 
 BOT_ROTATION_INTERVAL = 3600 # 1 hour in seconds
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin12345")
 last_rotation_time = time.time()
 current_rotation_index = 0
 
@@ -142,7 +143,8 @@ def init_db():
                 update_required BOOLEAN DEFAULT 0,
                 message TEXT DEFAULT 'Server is online',
                 telegram_url TEXT DEFAULT 'https://t.me/MissCodeX',
-                youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily'
+                youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily',
+                apk_url TEXT DEFAULT '/uploads/MVCreatorPRO.apk'
             )
         """)
         
@@ -150,8 +152,8 @@ def init_db():
         cursor.execute("SELECT COUNT(*) FROM AppConfig")
         if cursor.fetchone()[0] == 0:
             cursor.execute("""
-                INSERT INTO AppConfig (version, update_required, message, telegram_url, youtube_url)
-                VALUES ('1.1', 0, 'Server is online', 'https://t.me/MissCodeX', 'https://www.youtube.com/@MvFemily')
+                INSERT INTO AppConfig (version, update_required, message, telegram_url, youtube_url, apk_url)
+                VALUES ('1.1', 0, 'Server is online', 'https://t.me/MissCodeX', 'https://www.youtube.com/@MvFemily', '/uploads/MVCreatorPRO.apk')
             """)
             conn.commit()
             
@@ -163,7 +165,8 @@ def init_db():
                 update_required BOOLEAN DEFAULT 0,
                 message TEXT DEFAULT 'Server is online',
                 telegram_url TEXT DEFAULT 'https://t.me/MissCodeX',
-                youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily'
+                youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily',
+                apk_url TEXT DEFAULT '/uploads/MVCreatorPRO.apk'
             )
         """)
         
@@ -171,12 +174,12 @@ def init_db():
         cursor.execute("SELECT COUNT(*) FROM Version")
         if cursor.fetchone()[0] == 0:
             cursor.execute("""
-                INSERT INTO Version (version, update_required, message, telegram_url, youtube_url)
-                VALUES ('1.1', 0, 'Server is online', 'https://t.me/MissCodeX', 'https://www.youtube.com/@MvFemily')
+                INSERT INTO Version (version, update_required, message, telegram_url, youtube_url, apk_url)
+                VALUES ('1.1', 0, 'Server is online', 'https://t.me/MissCodeX', 'https://www.youtube.com/@MvFemily', '/uploads/MVCreatorPRO.apk')
             """)
             conn.commit()
             
-        # Ensure the columns telegram_url and youtube_url exist in both tables
+        # Ensure the columns telegram_url, youtube_url, and apk_url exist in both tables
         for table_name in ["AppConfig", "Version"]:
             cursor.execute(f"PRAGMA table_info({table_name})")
             columns = [col[1] for col in cursor.fetchall()]
@@ -184,6 +187,8 @@ def init_db():
                 cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN telegram_url TEXT DEFAULT 'https://t.me/MissCodeX'")
             if "youtube_url" not in columns:
                 cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily'")
+            if "apk_url" not in columns:
+                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN apk_url TEXT DEFAULT '/uploads/MVCreatorPRO.apk'")
             conn.commit()
             
         # Update existing records from old default URLs to new ones
@@ -222,6 +227,7 @@ def get_version():
     message_val = "Server is online"
     telegram_url_val = "https://t.me/MissCodeX"
     youtube_url_val = "https://www.youtube.com/@MvFemily"
+    apk_url_val = "/uploads/MVCreatorPRO.apk"
     
     try:
         conn = sqlite3.connect("app_config.db")
@@ -230,17 +236,25 @@ def get_version():
         # Try fetching from AppConfig first, then fallback to Version
         row = None
         try:
-            cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url FROM AppConfig LIMIT 1")
+            cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url, apk_url FROM AppConfig LIMIT 1")
             row = cursor.fetchone()
         except sqlite3.OperationalError:
-            pass
-            
-        if not row:
             try:
-                cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url FROM Version LIMIT 1")
+                cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url FROM AppConfig LIMIT 1")
                 row = cursor.fetchone()
             except sqlite3.OperationalError:
                 pass
+            
+        if not row:
+            try:
+                cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url, apk_url FROM Version LIMIT 1")
+                row = cursor.fetchone()
+            except sqlite3.OperationalError:
+                try:
+                    cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url FROM Version LIMIT 1")
+                    row = cursor.fetchone()
+                except sqlite3.OperationalError:
+                    pass
                 
         conn.close()
         
@@ -250,17 +264,99 @@ def get_version():
             message_val = row[2]
             telegram_url_val = row[3]
             youtube_url_val = row[4]
+            if len(row) > 5 and row[5]:
+                apk_url_val = row[5]
     except Exception as e:
         logging.error(f"[API] Error reading version from DB: {e}")
         
+    scheme = "https" if request.is_secure or "herokuapp.com" in request.host else "http"
+    download_url = f"{scheme}://{request.host}{apk_url_val}"
+    
     return jsonify({
         "status": "success",
         "version": version_val,
         "update_required": update_required_val,
         "message": message_val,
         "telegram_url": telegram_url_val,
-        "youtube_url": youtube_url_val
+        "youtube_url": youtube_url_val,
+        "download_url": download_url
     })
+
+
+@app.route('/api/admin/verify_password', methods=['POST'])
+def verify_admin_password():
+    data = request.get_json(silent=True) or {}
+    password = data.get('password')
+    if password == ADMIN_PASSWORD:
+        return jsonify({"status": "success", "message": "Verification successful"})
+    return jsonify({"status": "error", "message": "Incorrect admin password. Access denied!"}), 401
+
+
+@app.route('/api/admin/upload_update', methods=['POST'])
+def upload_update():
+    password = request.form.get('password')
+    version = request.form.get('version', '1.1')
+    update_required_str = request.form.get('update_required', 'false')
+    message = request.form.get('message', '')
+    telegram_url = request.form.get('telegram_url')
+    youtube_url = request.form.get('youtube_url')
+    
+    if password != ADMIN_PASSWORD:
+        return jsonify({"status": "error", "message": "Unauthorized: Invalid password"}), 401
+        
+    if 'file' not in request.files:
+        return jsonify({"status": "error", "message": "No APK file uploaded"}), 400
+        
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"status": "error", "message": "No selected file"}), 400
+        
+    os.makedirs('uploads', exist_ok=True)
+    filename = file.filename
+    file_path = os.path.join('uploads', filename)
+    file.save(file_path)
+    
+    update_required = 1 if update_required_str.lower() == 'true' else 0
+    apk_url = f"/uploads/{filename}"
+    
+    try:
+        conn = sqlite3.connect("app_config.db")
+        cursor = conn.cursor()
+        
+        updates = [("version", version), ("update_required", update_required), ("message", message), ("apk_url", apk_url)]
+        if telegram_url:
+            updates.append(("telegram_url", telegram_url))
+        if youtube_url:
+            updates.append(("youtube_url", youtube_url))
+            
+        for table_name in ["AppConfig", "Version"]:
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            if cursor.fetchone()[0] == 0:
+                cols = [u[0] for u in updates]
+                vals = [u[1] for u in updates]
+                placeholders = ", ".join(["?"] * len(vals))
+                col_names = ", ".join(cols)
+                cursor.execute(f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})", vals)
+            else:
+                set_clause = ", ".join([f"{u[0]} = ?" for u in updates])
+                vals = [u[1] for u in updates]
+                cursor.execute(f"UPDATE {table_name} SET {set_clause} WHERE id = (SELECT id FROM {table_name} LIMIT 1)", vals)
+                
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"[API] Error saving update to DB: {e}")
+        return jsonify({"status": "error", "message": f"Database save failed: {str(e)}"}), 500
+        
+    return jsonify({
+        "status": "success",
+        "message": f"Version {version} has been successfully published! Users will see the update popup instantly."
+    })
+
+
+@app.route('/uploads/<path:filename>')
+def serve_uploads(filename):
+    return send_from_directory(os.path.join(os.getcwd(), 'uploads'), filename)
 
 
 @app.route('/api/verify-token', methods=['POST'])
