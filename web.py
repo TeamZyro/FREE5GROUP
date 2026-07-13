@@ -294,27 +294,62 @@ def verify_admin_password():
 
 @app.route('/api/admin/upload_update', methods=['POST'])
 def upload_update():
+    # Attempt to retrieve password from form-data, query parameters, or headers
     password = request.form.get('password')
-    version = request.form.get('version', '1.1')
-    update_required_str = request.form.get('update_required', 'false')
-    message = request.form.get('message', '')
-    telegram_url = request.form.get('telegram_url')
-    youtube_url = request.form.get('youtube_url')
+    if not password:
+        password = request.args.get('password')
+    if not password:
+        password = request.headers.get('password')
+    if not password:
+        auth_header = request.headers.get('Authorization')
+        if auth_header:
+            if auth_header.lower().startswith('bearer '):
+                password = auth_header[7:].strip()
+            elif auth_header.lower().startswith('basic '):
+                import base64
+                try:
+                    decoded = base64.b64decode(auth_header[6:]).decode('utf-8')
+                    if ':' in decoded:
+                        password = decoded.split(':', 1)[1]
+                    else:
+                        password = decoded
+                except:
+                    password = auth_header[6:].strip()
+            else:
+                password = auth_header.strip()
+                
+    # Extract other fields robustly
+    version = request.form.get('version') or request.args.get('version') or request.headers.get('version') or '1.1'
+    update_required_str = request.form.get('update_required') or request.args.get('update_required') or request.headers.get('update_required') or 'false'
+    message = request.form.get('message') or request.args.get('message') or request.headers.get('message') or ''
+    telegram_url = request.form.get('telegram_url') or request.args.get('telegram_url') or request.headers.get('telegram_url')
+    youtube_url = request.form.get('youtube_url') or request.args.get('youtube_url') or request.headers.get('youtube_url')
+    
+    # Log the request structure for debugging
+    logging.info(f"[UPLOAD] Form fields: {list(request.form.keys())}")
+    logging.info(f"[UPLOAD] Query params: {list(request.args.keys())}")
+    logging.info(f"[UPLOAD] Headers: {list(request.headers.keys())}")
+    logging.info(f"[UPLOAD] Files: {list(request.files.keys())}")
+    logging.info(f"[UPLOAD] Password present: {password is not None}")
     
     if password != ADMIN_PASSWORD:
+        logging.warning("[UPLOAD] Unauthorized upload attempt (password mismatch or missing).")
         return jsonify({"status": "error", "message": "Unauthorized: Invalid password"}), 401
         
     if 'file' not in request.files:
+        logging.warning("[UPLOAD] Upload failed: No APK file in request.")
         return jsonify({"status": "error", "message": "No APK file uploaded"}), 400
         
     file = request.files['file']
     if file.filename == '':
+        logging.warning("[UPLOAD] Upload failed: Empty filename.")
         return jsonify({"status": "error", "message": "No selected file"}), 400
         
     os.makedirs('uploads', exist_ok=True)
     filename = file.filename
     file_path = os.path.join('uploads', filename)
     file.save(file_path)
+    logging.info(f"[UPLOAD] Saved file to {file_path}")
     
     update_required = 1 if update_required_str.lower() == 'true' else 0
     apk_url = f"/uploads/{filename}"
