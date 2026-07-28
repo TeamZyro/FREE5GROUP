@@ -74,12 +74,6 @@ def cleanup_expired_sessions():
 def is_bot_locked(current_team_code=None):
     """Check if bot is currently locked in an active non-expired session for a DIFFERENT squad"""
     cleanup_expired_sessions()
-    global insquad
-    if insquad is None:
-        # If bot is not in any squad in Free Fire (kicked or left), clear lock session!
-        ACTIVE_LOCK_SESSIONS.clear()
-        return False, None
-
     if not ACTIVE_LOCK_SESSIONS:
         return False, None
     
@@ -3615,6 +3609,8 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
             if leave_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
                 print(f"⚡ [FAST EMOTE] Left team (Quit mode)")
+            global insquad
+            insquad = None
             if session_id:
                 invalidate_lock_session(session_id)
 
@@ -3624,6 +3620,8 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
                 "message": f"Fast emote attack completed (quit mode)"
             }
         else:
+            global insquad
+            insquad = session_id or True
             return True, {
                 "status": "success",
                 "mode": "lock",
