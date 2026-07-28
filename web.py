@@ -8,7 +8,7 @@ import logging
 import subprocess
 import signal
 import sys
-from flask import Flask, jsonify, request, render_template, Response, send_from_directory, send_file
+from flask import Flask, jsonify, request, render_template, render_template_string, Response, send_from_directory, send_file
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf import descriptor as _descriptor
@@ -1144,10 +1144,9 @@ def get_all_logs():
     return jsonify(client_logs)
 
 @app.route('/api/allstats', methods=['GET'])
-@app.route('/allstats', methods=['GET'])
 def get_all_stats():
     """
-    Returns comprehensive system status, running processes, and active bot stats.
+    Returns comprehensive system status, running processes, and active bot stats in JSON format.
     Supports multi-user concurrency monitoring and real-time bot state inspection.
     """
     import psutil
@@ -1262,6 +1261,270 @@ def get_all_stats():
     }
     
     return jsonify(server_stats)
+
+@app.route('/allstats', methods=['GET'])
+def get_all_stats_ui():
+    """
+    Renders an interactive, real-time Telemetry Dashboard UI for viewing bot pool health,
+    CPU/RAM usage, process breakdown, lock concurrency, and live statistics.
+    """
+    dashboard_html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FREE5GROUP - Telemetry & Bot Control Center</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0b0f19;
+            --card-bg: rgba(23, 31, 51, 0.7);
+            --card-border: rgba(255, 255, 255, 0.08);
+            --primary: #6366f1;
+            --primary-glow: rgba(99, 102, 241, 0.35);
+            --success: #10b981;
+            --success-glow: rgba(16, 185, 129, 0.35);
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
+        body { background: var(--bg); color: var(--text-main); padding: 24px; min-height: 100vh; background-image: radial-gradient(circle at 10% 20%, rgba(99, 102, 241, 0.15) 0%, transparent 40%), radial-gradient(circle at 90% 80%, rgba(16, 185, 129, 0.15) 0%, transparent 40%); }
+        .container { max-width: 1400px; margin: 0 auto; }
+        header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--card-border); }
+        .logo-title { display: flex; align-items: center; gap: 14px; }
+        .logo-badge { background: linear-gradient(135deg, #6366f1, #a855f7); padding: 8px 14px; border-radius: 10px; font-weight: 800; font-size: 1.1rem; box-shadow: 0 0 20px var(--primary-glow); }
+        .live-badge { display: flex; align-items: center; gap: 8px; background: rgba(16, 185, 129, 0.12); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); padding: 6px 14px; border-radius: 20px; font-size: 0.85rem; font-weight: 600; }
+        .pulse-dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; box-shadow: 0 0 10px var(--success); animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { opacity: 0.4; } 50% { opacity: 1; transform: scale(1.2); } 100% { opacity: 0.4; } }
+        
+        .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 28px; }
+        .card { background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--card-border); border-radius: 16px; padding: 20px; transition: transform 0.2s, box-shadow 0.2s; }
+        .card:hover { border-color: rgba(255, 255, 255, 0.2); }
+        .card-header { display: flex; justify-content: space-between; align-items: center; color: var(--text-muted); font-size: 0.85rem; font-weight: 600; text-transform: uppercase; margin-bottom: 12px; }
+        .metric-value { font-size: 2rem; font-weight: 700; color: #fff; }
+        .progress-bar-bg { width: 100%; height: 8px; background: rgba(255, 255, 255, 0.1); border-radius: 4px; margin-top: 12px; overflow: hidden; }
+        .progress-bar-fill { height: 100%; background: linear-gradient(90deg, #6366f1, #10b981); border-radius: 4px; transition: width 0.4s ease; }
+        
+        .section-title { font-size: 1.25rem; font-weight: 700; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
+        .bots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; margin-bottom: 32px; }
+        .bot-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 14px; padding: 18px; position: relative; }
+        .bot-card.locked { border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.05); }
+        .bot-card.online { border-color: rgba(16, 185, 129, 0.3); }
+        .bot-uid { font-size: 1.1rem; font-weight: 700; display: flex; align-items: center; justify-content: space-between; }
+        .status-tag { font-size: 0.75rem; padding: 4px 10px; border-radius: 12px; font-weight: 700; text-transform: uppercase; }
+        .tag-online { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+        .tag-locked { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
+        .tag-offline { background: rgba(239, 68, 68, 0.2); color: #f87171; }
+        
+        .bot-stats-row { display: flex; justify-content: space-between; margin-top: 12px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.06); font-size: 0.85rem; color: var(--text-muted); }
+        .bot-stats-row span strong { color: #fff; }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.9rem; }
+        th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--card-border); }
+        th { color: var(--text-muted); font-weight: 600; text-transform: uppercase; font-size: 0.8rem; background: rgba(255, 255, 255, 0.02); }
+        tr:hover { background: rgba(255, 255, 255, 0.03); }
+        .btn-api { background: rgba(99, 102, 241, 0.2); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.4); padding: 8px 16px; border-radius: 8px; font-size: 0.85rem; font-weight: 600; text-decoration: none; transition: all 0.2s; }
+        .btn-api:hover { background: var(--primary); color: #fff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-title">
+                <div class="logo-badge">FREE5GROUP</div>
+                <div>
+                    <h2>Server Telemetry & Bot Monitor</h2>
+                    <p style="color: var(--text-muted); font-size: 0.85rem;">Real-time Bot Pool Inspection & System Metrics</p>
+                </div>
+            </div>
+            <div style="display: flex; gap: 12px; align-items: center;">
+                <div class="live-badge"><div class="pulse-dot"></div> LIVE AUTO-REFRESH (2s)</div>
+                <a href="/api/allstats" target="_blank" class="btn-api">🔗 Raw JSON API</a>
+            </div>
+        </header>
+
+        <!-- Top Overview Cards -->
+        <div class="metrics-grid">
+            <div class="card">
+                <div class="card-header"><span>CPU Usage</span> <span>💻</span></div>
+                <div class="metric-value" id="cpu-val">0%</div>
+                <div class="progress-bar-bg"><div class="progress-bar-fill" id="cpu-bar" style="width: 0%;"></div></div>
+            </div>
+            <div class="card">
+                <div class="card-header"><span>RAM Usage</span> <span>🧠</span></div>
+                <div class="metric-value" id="ram-val">0 MB</div>
+                <div style="color: var(--text-muted); font-size: 0.8rem; margin-top: 4px;" id="ram-sub">Used: 0 / 0 MB</div>
+                <div class="progress-bar-bg"><div class="progress-bar-fill" id="ram-bar" style="width: 0%;"></div></div>
+            </div>
+            <div class="card">
+                <div class="card-header"><span>Active Bot Pool</span> <span>🤖</span></div>
+                <div class="metric-value" id="bots-online-val">0</div>
+                <div style="color: var(--text-muted); font-size: 0.8rem; margin-top: 4px;" id="bots-sub">Online Bots / Configured Pool</div>
+            </div>
+            <div class="card">
+                <div class="card-header"><span>Lock Concurrency</span> <span>🔒</span></div>
+                <div class="metric-value" id="lock-val">0</div>
+                <div style="color: var(--text-muted); font-size: 0.8rem; margin-top: 4px;" id="lock-sub">Locked Squad Sessions Active</div>
+            </div>
+        </div>
+
+        <!-- Bot Pool Section -->
+        <div class="section-title">
+            <span>Active Bot Instances</span>
+            <input type="text" id="bot-search" placeholder="Search UID..." style="background: rgba(255,255,255,0.08); border: 1px solid var(--card-border); color: #fff; padding: 6px 14px; border-radius: 8px; font-size: 0.85rem;">
+        </div>
+        <div class="bots-grid" id="bots-container">
+            <!-- Bot cards rendered dynamically -->
+        </div>
+
+        <!-- Python Processes Section -->
+        <div class="section-title"><span>System Python Subprocesses</span></div>
+        <div class="card" style="padding: 0; overflow: hidden; margin-bottom: 32px;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>PID</th>
+                        <th>Process Name</th>
+                        <th>CPU %</th>
+                        <th>RAM (MB)</th>
+                        <th>Command Line</th>
+                    </tr>
+                </thead>
+                <tbody id="proc-tbody">
+                    <!-- Process rows rendered dynamically -->
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Recent Attacks Feed -->
+        <div class="section-title"><span>Recent Emote & Exploit Attacks</span></div>
+        <div class="card" style="padding: 0; overflow: hidden;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Timestamp</th>
+                        <th>Target</th>
+                        <th>Emote ID</th>
+                        <th>Mode</th>
+                        <th>Bot UID</th>
+                    </tr>
+                </thead>
+                <tbody id="attacks-tbody">
+                    <!-- Attacks rows rendered dynamically -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/allstats');
+                const data = await res.json();
+                
+                // Update Top Cards
+                document.getElementById('cpu-val').innerText = `${data.system.cpu_percent}%`;
+                document.getElementById('cpu-bar').style.width = `${Math.min(data.system.cpu_percent, 100)}%`;
+                
+                document.getElementById('ram-val').innerText = `${data.system.memory.percent}%`;
+                document.getElementById('ram-sub').innerText = `Used: ${data.system.memory.used_mb} MB / ${data.system.memory.total_mb} MB`;
+                document.getElementById('ram-bar').style.width = `${data.system.memory.percent}%`;
+                
+                document.getElementById('bots-online-val').innerText = `${data.bot_pool.total_online} / ${data.bot_pool.total_configured}`;
+                document.getElementById('bots-sub').innerText = `Available Unlocked: ${data.bot_pool.total_unlocked_available} | Locked: ${data.bot_pool.total_locked}`;
+                
+                document.getElementById('lock-val').innerText = `${data.bot_pool.total_locked}`;
+                document.getElementById('lock-sub').innerText = `Active Locked Sessions`;
+
+                // Update Bot Grid
+                const searchTerm = document.getElementById('bot-search').value.toLowerCase();
+                const botsContainer = document.getElementById('bots-container');
+                botsContainer.innerHTML = '';
+                
+                if (data.bots && data.bots.length > 0) {
+                    data.bots.filter(b => b.uid.toLowerCase().includes(searchTerm)).forEach(bot => {
+                        const isLocked = bot.is_locked;
+                        const isOnline = bot.status === 'ONLINE';
+                        const tagClass = isLocked ? 'tag-locked' : (isOnline ? 'tag-online' : 'tag-offline');
+                        const statusLabel = isLocked ? 'LOCKED' : (isOnline ? 'ONLINE' : 'OFFLINE');
+                        const cardBorderClass = isLocked ? 'locked' : (isOnline ? 'online' : '');
+                        
+                        const squadInfo = bot.insquad ? `In Squad (Members: ${bot.squad_member_count})` : 'Solo Mode';
+                        const lockId = bot.lock_session_id ? `<code>${bot.lock_session_id}</code>` : 'None';
+                        const remSec = (bot.lock_info && bot.lock_info.remaining_seconds) ? `${bot.lock_info.remaining_seconds}s remaining` : 'N/A';
+
+                        const html = `
+                            <div class="bot-card ${cardBorderClass}">
+                                <div class="bot-uid">
+                                    <span>🤖 ${bot.uid}</span>
+                                    <span class="status-tag ${tagClass}">${statusLabel}</span>
+                                </div>
+                                <div class="bot-stats-row">
+                                    <span>PID: <strong>${bot.pid || 'N/A'}</strong></span>
+                                    <span>CPU: <strong>${bot.cpu_percent}%</strong></span>
+                                    <span>RAM: <strong>${bot.memory_mb} MB</strong></span>
+                                </div>
+                                <div class="bot-stats-row">
+                                    <span>Squad: <strong>${squadInfo}</strong></span>
+                                </div>
+                                <div class="bot-stats-row">
+                                    <span>Lock Session: ${lockId}</span>
+                                </div>
+                                ${isLocked ? `<div class="bot-stats-row" style="color: #fbbf24;"><span>⏱️ Timer: ${remSec}</span></div>` : ''}
+                            </div>
+                        `;
+                        botsContainer.innerHTML += html;
+                    });
+                } else {
+                    botsContainer.innerHTML = '<p style="color: var(--text-muted); grid-column: 1/-1;">No bots active in pool.</p>';
+                }
+
+                // Update Processes Table
+                const procTbody = document.getElementById('proc-tbody');
+                procTbody.innerHTML = '';
+                if (data.running_python_processes && data.running_python_processes.length > 0) {
+                    data.running_python_processes.forEach(proc => {
+                        procTbody.innerHTML += `
+                            <tr>
+                                <td><strong>${proc.pid}</strong></td>
+                                <td>${proc.name}</td>
+                                <td>${proc.cpu_percent}%</td>
+                                <td>${proc.memory_mb} MB</td>
+                                <td style="font-family: monospace; font-size: 0.8rem; color: var(--text-muted);">${proc.cmdline.slice(0, 80)}</td>
+                            </tr>
+                        `;
+                    });
+                }
+
+                // Update Attacks Table
+                const attacksTbody = document.getElementById('attacks-tbody');
+                attacksTbody.innerHTML = '';
+                if (data.recent_exploits && data.recent_exploits.length > 0) {
+                    data.recent_exploits.forEach(att => {
+                        attacksTbody.innerHTML += `
+                            <tr>
+                                <td>${att.timestamp || 'N/A'}</td>
+                                <td>${att.target || att.team_code || 'N/A'}</td>
+                                <td>${att.emote_id || 'N/A'}</td>
+                                <td><span class="status-tag tag-online">${att.mode || 'quit'}</span></td>
+                                <td>${att.bot_uid || 'N/A'}</td>
+                            </tr>
+                        `;
+                    });
+                }
+            } catch (err) {
+                console.error("Telemetry fetch error:", err);
+            }
+        }
+
+        setInterval(fetchStats, 2000);
+        fetchStats();
+    </script>
+</body>
+</html>"""
+    return render_template_string(dashboard_html)
 
 if __name__ == '__main__':
     # Force templates dir exists
