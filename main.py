@@ -123,7 +123,11 @@ async def lock_and_squad_monitor_loop(key, iv, region):
         try:
             cleanup_expired_sessions()
             
-            # Case 1: Bot is not in squad anymore according to insquad flag
+            # Sync insquad state if ACTIVE_LOCK_SESSIONS is present
+            if ACTIVE_LOCK_SESSIONS and (not insquad or insquad is None or insquad == False):
+                insquad = list(ACTIVE_LOCK_SESSIONS.keys())[0]
+            
+            # Case 1: Bot is not in squad anymore according to insquad flag and no active lock session exists
             if not insquad or insquad is None or insquad == False:
                 if ACTIVE_LOCK_SESSIONS:
                     print("🔓 [AUTO RELEASE] Bot is not in any squad. Clearing lock session(s).")
@@ -3654,12 +3658,26 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
 
         cleanup_expired_sessions()
 
-        if target_identifier in ACTIVE_LOCK_SESSIONS:
+        # CASE 1: Target is a LOCK session ID (e.g. LOCK_14010319252_A1B2C3) or active session
+        if target_identifier.startswith("LOCK_") or target_identifier in ACTIVE_LOCK_SESSIONS:
             session_id = target_identifier
             is_locked_session = True
-            if not mode or mode == "quit":
-                mode = "lock"  # Lock session defaults to lock unless explicitly asked to leave
-            print(f"⚡ [FAST EMOTE] Using active lock session {session_id} for emote {resolved_emote_id} (Mode={mode})")
+
+            # Register/refresh session in ACTIVE_LOCK_SESSIONS & keep insquad set
+            current_uid = sys.argv[1] if len(sys.argv) > 1 else "14010319252"
+            if session_id not in ACTIVE_LOCK_SESSIONS:
+                ACTIVE_LOCK_SESSIONS[session_id] = {
+                    "team_code": "LOCKED_SQUAD",
+                    "bot_uid": str(current_uid),
+                    "created_at": time.time()
+                }
+            insquad = session_id
+
+            if not mode or mode.lower() != "quit":
+                mode = "lock"
+            print(f"⚡ [FAST EMOTE LOCK] Executing emote via active session {session_id} for emote {resolved_emote_id} (Mode={mode})")
+
+        # CASE 2: New squad join request (team_code like 123456)
         else:
             is_locked, lock_sid = is_bot_locked()
             if is_locked:
@@ -3668,29 +3686,40 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
                 return False, {"status": "error", "message": err_msg}
 
             team_code = target_identifier
-            print(f"⚡ [FAST EMOTE] Joining team {team_code} (Mode={mode}) for emote {resolved_emote_id} on UIDs: {uids_list}")
+            print(f"⚡ [FAST EMOTE JOIN] Joining team {team_code} (Mode={mode}) for emote {resolved_emote_id} on UIDs: {uids_list}")
             join_packet = await GenJoinSquadsPacket(team_code, key, iv)
             if join_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
 
-            await asyncio.sleep(0.25)
+            # Wait 0.55s for server to place bot in squad & authenticate session
+            await asyncio.sleep(0.55)
 
             if str(mode).lower() == "lock":
                 session_id = create_lock_session(team_code)
                 is_locked_session = True
+                insquad = session_id
                 print(f"🔒 [LOCK MODE] Lock session created: {session_id}")
+            else:
+                insquad = True
 
-        for target_uid in uids_list:
+        # Send emote to target UIDs (or squad broadcast 0 if uids_list empty)
+        target_targets = uids_list if uids_list else ["0"]
+        for target_uid in target_targets:
             try:
-                emote_packet = await Emote_k(int(target_uid), int(resolved_emote_id), key, iv, region)
+                target_num = int(target_uid) if str(target_uid).isdigit() else 0
+                emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, region)
                 if emote_packet:
-                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-                    print(f"⚡ [FAST EMOTE] Sent emote {resolved_emote_id} to UID {target_uid}")
+                    # Burst of 2 packets (80ms gap) to guarantee server delivery under multi-bot load
+                    for _ in range(2):
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
+                        await asyncio.sleep(0.08)
+                    print(f"⚡ [FAST EMOTE] Sent burst emote {resolved_emote_id} to UID {target_uid}")
             except Exception as e:
                 print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
 
         if str(mode).lower() == "quit":
-            await asyncio.sleep(0.15)
+            # Wait 0.45s so emote animation renders for everyone in the squad before leaving
+            await asyncio.sleep(0.45)
             leave_packet = await ExiT(None, key, iv)
             if leave_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
