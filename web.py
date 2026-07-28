@@ -858,22 +858,33 @@ def fast_emote():
     if not active_uids:
         return jsonify({"status": "error", "message": "No active bots connected"}), 400
         
-    bot_uid = active_uids[0]
     if isinstance(uids, list):
         uids_str = ",".join([str(u) for u in uids])
     else:
         uids_str = str(uids)
-        
-    resp = send_ipc_command(bot_uid, f"FAST_EMOTE {target_identifier} {uids_str} {emote_id} {mode}")
-    if resp and "SUCCESS" in resp:
-        res_str = resp.split("SUCCESS: ")[-1].strip()
-        try:
-            res_dict = json.loads(res_str)
-            return jsonify(res_dict)
-        except Exception:
-            return jsonify({"status": "success", "message": res_str})
-    else:
-        return jsonify({"status": "error", "message": resp or "Failed to execute fast emote"})
+
+    # Multi-bot Routing Strategy: iterate active bots to find available unlocked bot
+    last_err_text = None
+    for bot_uid in active_uids:
+        resp = send_ipc_command(bot_uid, f"FAST_EMOTE {target_identifier} {uids_str} {emote_id} {mode}")
+        if resp and "SUCCESS" in resp:
+            res_str = resp.split("SUCCESS: ")[-1].strip()
+            try:
+                res_dict = json.loads(res_str)
+                return jsonify(res_dict)
+            except Exception:
+                return jsonify({"status": "success", "message": res_str})
+        elif resp and "ERROR" in resp:
+            err_text = resp.split("ERROR: ")[-1].strip()
+            # If this bot is locked in another squad, try the next available online bot!
+            if "locked in squad" in err_text.lower() or "busy" in err_text.lower():
+                last_err_text = err_text
+                logging.info(f"[ROUTING] Bot {bot_uid} is busy/locked. Trying next online bot...")
+                continue
+            else:
+                return jsonify({"status": "error", "message": err_text}), 400
+
+    return jsonify({"status": "error", "message": last_err_text or "All online bots are currently busy/locked in squads"}), 400
 
 @app.route('/api/create_squad', methods=['POST'])
 def create_squad():
