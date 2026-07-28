@@ -800,13 +800,16 @@ def send_ipc_to_target_or_free_bot(command, target_bot_uid=None):
                 return bot_uid, resp
             elif "ERROR" in resp:
                 err_text = resp.split("ERROR: ")[-1].strip() if "ERROR: " in resp else resp
-                # Check for any locked / busy error message
-                if "locked" in err_text.lower() or "busy" in err_text.lower():
+                # Check for any locked / busy / failed error message
+                err_lower = err_text.lower()
+                if any(k in err_lower for k in ["locked", "busy", "failed", "cannot", "timeout", "error"]):
                     last_err = err_text
-                    logging.info(f"[ROUTING] Bot {bot_uid} is locked ({err_text}). Trying next free bot...")
+                    logging.info(f"[ROUTING] Bot {bot_uid} is unavailable ({err_text}). Trying next free bot...")
                     continue
                 else:
                     return bot_uid, resp
+        else:
+            logging.info(f"[ROUTING] Bot {bot_uid} did not respond via IPC. Trying next free bot...")
 
     return None, f"ERROR: {last_err or 'All online bots are currently busy/locked in squads'}"
 
