@@ -819,7 +819,8 @@ def send_bot_command():
         "like": "LIKE",
         "check_ban": "CHECK_BAN",
         "kick": "KICK",
-        "room_msg": "ROOM_MSG"
+        "room_msg": "ROOM_MSG",
+        "fast_emote": "FAST_EMOTE"
     }
     
     ipc_cmd = type_map.get(cmd_type)
@@ -837,6 +838,42 @@ def send_bot_command():
         return jsonify({"status": "success", "message": resp.split("SUCCESS: ")[-1]})
     else:
         return jsonify({"status": "error", "message": resp or "Failed to execute command"})
+
+@app.route('/api/fast_emote', methods=['POST'])
+def fast_emote():
+    data = request.json or {}
+    team_code = data.get('team_code')
+    session_id = data.get('session_id')
+    uids = data.get('uids')
+    emote_id = data.get('emote_id')
+    mode = data.get('mode')
+    if not mode:
+        mode = "lock" if session_id else "quit"
+    
+    target_identifier = session_id or team_code
+    if not target_identifier or not uids or not emote_id:
+        return jsonify({"status": "error", "message": "Missing team_code/session_id, uids, or emote_id"}), 400
+        
+    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
+    if not active_uids:
+        return jsonify({"status": "error", "message": "No active bots connected"}), 400
+        
+    bot_uid = active_uids[0]
+    if isinstance(uids, list):
+        uids_str = ",".join([str(u) for u in uids])
+    else:
+        uids_str = str(uids)
+        
+    resp = send_ipc_command(bot_uid, f"FAST_EMOTE {target_identifier} {uids_str} {emote_id} {mode}")
+    if resp and "SUCCESS" in resp:
+        res_str = resp.split("SUCCESS: ")[-1].strip()
+        try:
+            res_dict = json.loads(res_str)
+            return jsonify(res_dict)
+        except Exception:
+            return jsonify({"status": "success", "message": res_str})
+    else:
+        return jsonify({"status": "error", "message": resp or "Failed to execute fast emote"})
 
 @app.route('/api/create_squad', methods=['POST'])
 def create_squad():
