@@ -61,6 +61,9 @@ joining_team = False
 
 ACTIVE_LOCK_SESSIONS = {}
 LOCK_SESSION_MAX_TIMEOUT = 300  # 5 minutes in seconds
+SQUAD_MEMBER_COUNT = 0
+BOT_START_TIME = time.time()
+TOTAL_IPC_COMMANDS = 0
 
 def cleanup_expired_sessions():
     """Remove lock sessions older than 5 minutes (300 seconds)"""
@@ -74,20 +77,28 @@ def cleanup_expired_sessions():
 def is_bot_locked(current_team_code=None):
     """Check if bot is currently locked in an active non-expired session for a DIFFERENT squad"""
     cleanup_expired_sessions()
+    global insquad
+    if not insquad or insquad is None or insquad == False:
+        # Bot is not in any squad in Free Fire -> auto release lock session!
+        ACTIVE_LOCK_SESSIONS.clear()
+        return False, None
+
     if not ACTIVE_LOCK_SESSIONS:
         return False, None
     
     for sid, data in list(ACTIVE_LOCK_SESSIONS.items()):
-        if current_team_code and data.get("team_code") == current_team_code:
+        if current_team_code and str(data.get("team_code")) == str(current_team_code):
             return False, sid
         return True, sid
     return False, None
 
 def create_lock_session(team_code):
     cleanup_expired_sessions()
-    session_id = f"LOCK_{uuid.uuid4().hex[:6].upper()}"
+    current_uid = sys.argv[1] if len(sys.argv) > 1 else "14010319252"
+    session_id = f"LOCK_{current_uid}_{uuid.uuid4().hex[:6].upper()}"
     ACTIVE_LOCK_SESSIONS[session_id] = {
         "team_code": team_code,
+        "bot_uid": str(current_uid),
         "created_at": time.time()
     }
     return session_id
@@ -98,6 +109,44 @@ def invalidate_lock_session(session_id=None):
         ACTIVE_LOCK_SESSIONS.pop(session_id, None)
     else:
         ACTIVE_LOCK_SESSIONS.clear()
+
+async def lock_and_squad_monitor_loop(key, iv, region):
+    """
+    Background loop that continuously checks:
+    1. 5-minute auto-expiry of lock sessions
+    2. If bot left squad or was kicked -> auto release lock session
+    3. If bot is alone in squad (0 human players, squad member count <= 1) -> auto exit squad & release lock session
+    """
+    global insquad, ACTIVE_LOCK_SESSIONS, SQUAD_MEMBER_COUNT, online_writer
+    print("🔒 [LOCK MONITOR] Solitary & Expiry lock monitor loop started.")
+    while True:
+        try:
+            cleanup_expired_sessions()
+            
+            # Case 1: Bot is not in squad anymore according to insquad flag
+            if not insquad or insquad is None or insquad == False:
+                if ACTIVE_LOCK_SESSIONS:
+                    print("🔓 [AUTO RELEASE] Bot is not in any squad. Clearing lock session(s).")
+                    invalidate_lock_session()
+            
+            # Case 2: Bot has an active lock session and is in squad, but is alone (solitary player)
+            elif ACTIVE_LOCK_SESSIONS:
+                # Check if bot is the only member in the squad
+                if SQUAD_MEMBER_COUNT <= 1 and SQUAD_MEMBER_COUNT > 0:
+                    print(f"🔓 [AUTO UNLOCK] Bot is alone in squad (Member count={SQUAD_MEMBER_COUNT}). Exiting squad and releasing lock.")
+                    try:
+                        leave_packet = await ExiT(None, key, iv)
+                        if leave_packet and online_writer:
+                            online_writer.write(leave_packet)
+                            await online_writer.drain()
+                    except Exception as ex:
+                        print(f" [AUTO UNLOCK EXIT ERROR] {ex}")
+                    insquad = None
+                    invalidate_lock_session()
+        except Exception as e:
+            print(f"⚠️ [LOCK MONITOR ERROR] {e}")
+            
+        await asyncio.sleep(1.5)
 online_writer = None 
 whisper_writer = None 
 last_bot_status_check = 0
@@ -1236,6 +1285,8 @@ async def handle_ipc(reader, writer, key, iv, region):
                 
             command = data.decode('utf-8').strip()
             print(f" Received Web Command: {command}")
+            global TOTAL_IPC_COMMANDS
+            TOTAL_IPC_COMMANDS += 1
             
             if command == "START_CS":
                 packet = await create_simple_start_packet(key, iv)
@@ -1461,7 +1512,41 @@ async def handle_ipc(reader, writer, key, iv, region):
                         writer.write(json.dumps({"error": str(e)}).encode('utf-8') + b"\n")
                 else:
                     writer.write(b"ERROR\n")
-            
+
+            elif command == "GET_BOT_STATUS":
+                try:
+                    cleanup_expired_sessions()
+                    current_uid = sys.argv[1] if len(sys.argv) > 1 else "14010319252"
+                    is_locked_flag, lock_sid = is_bot_locked()
+                    lock_info = None
+                    if ACTIVE_LOCK_SESSIONS:
+                        first_sid = list(ACTIVE_LOCK_SESSIONS.keys())[0]
+                        session_data = ACTIVE_LOCK_SESSIONS[first_sid]
+                        elapsed = int(time.time() - session_data.get("created_at", time.time()))
+                        rem = max(0, LOCK_SESSION_MAX_TIMEOUT - elapsed)
+                        lock_info = {
+                            "session_id": first_sid,
+                            "team_code": session_data.get("team_code"),
+                            "elapsed_seconds": elapsed,
+                            "remaining_seconds": rem
+                        }
+                    
+                    status_dict = {
+                        "bot_uid": str(current_uid),
+                        "online": online_writer is not None,
+                        "insquad": insquad is not None and insquad != False,
+                        "insquad_detail": str(insquad) if insquad else None,
+                        "squad_member_count": SQUAD_MEMBER_COUNT,
+                        "is_locked": is_locked_flag,
+                        "lock_session_id": lock_sid,
+                        "lock_info": lock_info,
+                        "uptime_seconds": int(time.time() - BOT_START_TIME),
+                        "total_ipc_commands": TOTAL_IPC_COMMANDS
+                    }
+                    writer.write(f"SUCCESS: {json.dumps(status_dict)}\n".encode())
+                except Exception as e:
+                    writer.write(f"ERROR: {str(e)}\n".encode())
+
             await writer.drain()
 
         except Exception as e:
@@ -9729,9 +9814,10 @@ async def MaiiiinE():
         async with server:
             await server.serve_forever()
             
-    # Include IPC task
+    # Include IPC task & Lock Monitor task
     task_ipc = asyncio.create_task(ipc_server())    
-    
+    task_monitor = asyncio.create_task(lock_and_squad_monitor_loop(key, iv, region))
+
     # Final status display
     # Clear screen only if not on Heroku
     if not os.environ.get('PORT'):
@@ -9781,7 +9867,7 @@ async def MaiiiinE():
     
     # Keep all tasks running
     try:
-        await asyncio.gather(task1, task2, task_ipc)
+        await asyncio.gather(task1, task2, task_ipc, task_monitor)
     except asyncio.CancelledError:
         print("\n Bot tasks cancelled")
     except Exception as e:
