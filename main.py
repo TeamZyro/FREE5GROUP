@@ -6570,7 +6570,12 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                     emote_id = 909050009
                                     # bot_uid = 14009897329 # No longer strictly needed or should be dynamic
                 
-                                    #  FIX: Check SQUAD_OWNER (person who clicked "invite")
+                                    # FIX: Check SQUAD_OWNER and ensure bot is NOT currently locked in an active emote session
+                                    is_locked, lock_sid = is_bot_locked()
+                                    if is_locked:
+                                        print(f"🚫 Ignoring in-game squad invite from {squad_owner} because bot is locked in session {lock_sid}")
+                                        continue
+
                                     if "NM" in WHITELISTED_UIDS or True: # Force true right now for auto-accepting test requests from our UI
                                         print(f" Auto-accepting squad invite from {squad_owner}...")
                                     
