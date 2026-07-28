@@ -1055,7 +1055,7 @@ def bot_monitor_loop():
             if is_rotation_time or not active_clients:
                 if is_rotation_time:
                     logging.info("[MONITOR] Rotation time reached. Stopping current bots...")
-                    # Kill everyone
+                    # Kill everyone and remove stale IPC port files
                     for uid in list(active_clients.keys()):
                         proc = active_clients.get(uid)
                         if proc and proc.poll() is None:
@@ -1063,10 +1063,14 @@ def bot_monitor_loop():
                                 if os.name == 'nt': subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
                                 else: proc.terminate()
                             except: pass
+                        port_file = f".ipc/{uid}.port"
+                        if os.path.exists(port_file):
+                            try: os.remove(port_file)
+                            except: pass
                     active_clients.clear()
                     bot_statuses.clear()
                     
-                    # Update index for next 2 bots
+                    # Update index for next bots
                     current_rotation_index = (current_rotation_index + MAX_BOT_LIMIT) % len(data_list)
                     last_rotation_time = now
                 
