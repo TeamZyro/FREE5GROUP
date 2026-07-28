@@ -3542,6 +3542,7 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
       - 'lock': Join, emote, stay in squad, return a unique session_id (e.g. LOCK_A1B2C3).
       - 'session': If team_code_or_session is a valid active session_id, send emote directly without joining!
     """
+    global insquad
     try:
         if isinstance(uids_input, str):
             uids_list = [u.strip() for u in uids_input.replace(',', ' ').split() if u.strip()]
@@ -3609,7 +3610,6 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
             if leave_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
                 print(f"⚡ [FAST EMOTE] Left team (Quit mode)")
-            global insquad
             insquad = None
             if session_id:
                 invalidate_lock_session(session_id)
@@ -3620,7 +3620,6 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
                 "message": f"Fast emote attack completed (quit mode)"
             }
         else:
-            global insquad
             insquad = session_id or True
             return True, {
                 "status": "success",
