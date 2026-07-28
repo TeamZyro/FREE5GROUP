@@ -781,27 +781,32 @@ def group_exploit():
     if not uid:
         return jsonify({"status": "error", "message": "UID required"}), 400
         
-    # Use the first active bot to send command
     active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
     if not active_uids:
         return jsonify({"status": "error", "message": "No active bots connected"}), 400
         
-    bot_uid = active_uids[0]
-    resp = send_ipc_command(bot_uid, f"GROUP_EXPLOIT {uid} {slot}")
-    
-    # Record in history
-    exploit_history.insert(0, {
-        "uid": uid,
-        "slot": slot,
-        "time": time.strftime("%H:%M:%S"),
-        "status": "Success" if resp and "SUCCESS" in resp else "Failed"
-    })
-    if len(exploit_history) > 20: exploit_history.pop()
-    
-    if resp and "SUCCESS" in resp:
-        return jsonify({"status": "success", "message": "Exploit sequence initiated."})
-    else:
-        return jsonify({"status": "error", "message": resp or "Failed to communicate with bot"})
+    last_err = None
+    for bot_uid in active_uids:
+        resp = send_ipc_command(bot_uid, f"GROUP_EXPLOIT {uid} {slot}")
+        if resp and "SUCCESS" in resp:
+            exploit_history.insert(0, {
+                "uid": uid,
+                "slot": slot,
+                "time": time.strftime("%H:%M:%S"),
+                "status": "Success"
+            })
+            if len(exploit_history) > 20: exploit_history.pop()
+            return jsonify({"status": "success", "message": "Exploit sequence initiated."})
+        elif resp and "ERROR" in resp:
+            err_text = resp.split("ERROR: ")[-1].strip()
+            if "locked in session" in err_text.lower() or "busy" in err_text.lower():
+                last_err = err_text
+                logging.info(f"[ROUTING] Bot {bot_uid} is locked in emote session. Trying next free bot for GROUP_EXPLOIT...")
+                continue
+            else:
+                return jsonify({"status": "error", "message": err_text}), 400
+
+    return jsonify({"status": "error", "message": last_err or "All online bots are locked/busy in emote sessions"}), 400
 
 @app.route('/api/exploit_logs')
 def get_exploit_logs():
@@ -809,7 +814,7 @@ def get_exploit_logs():
 
 @app.route('/api/send_bot_command', methods=['POST'])
 def send_bot_command():
-    data = request.json
+    data = request.json or {}
     cmd_type = data.get('type')
     payload = data.get('payload', '')
     
@@ -831,13 +836,21 @@ def send_bot_command():
     if not active_uids:
         return jsonify({"status": "error", "message": "No active bots connected"}), 400
         
-    bot_uid = active_uids[0]
-    resp = send_ipc_command(bot_uid, f"{ipc_cmd} {payload}")
-    
-    if resp and "SUCCESS" in resp:
-        return jsonify({"status": "success", "message": resp.split("SUCCESS: ")[-1]})
-    else:
-        return jsonify({"status": "error", "message": resp or "Failed to execute command"})
+    last_err = None
+    for bot_uid in active_uids:
+        resp = send_ipc_command(bot_uid, f"{ipc_cmd} {payload}")
+        if resp and "SUCCESS" in resp:
+            return jsonify({"status": "success", "message": resp.split("SUCCESS: ")[-1]})
+        elif resp and "ERROR" in resp:
+            err_text = resp.split("ERROR: ")[-1].strip()
+            if "locked in session" in err_text.lower() or "busy" in err_text.lower():
+                last_err = err_text
+                logging.info(f"[ROUTING] Bot {bot_uid} is locked in session. Trying next free bot for command {cmd_type}...")
+                continue
+            else:
+                return jsonify({"status": "error", "message": err_text}), 400
+
+    return jsonify({"status": "error", "message": last_err or "All online bots are currently locked/busy"}), 400
 
 @app.route('/api/fast_emote', methods=['POST'])
 def fast_emote():
@@ -877,7 +890,7 @@ def fast_emote():
         elif resp and "ERROR" in resp:
             err_text = resp.split("ERROR: ")[-1].strip()
             # If this bot is locked in another squad, try the next available online bot!
-            if "locked in squad" in err_text.lower() or "busy" in err_text.lower():
+            if "locked in session" in err_text.lower() or "busy" in err_text.lower():
                 last_err_text = err_text
                 logging.info(f"[ROUTING] Bot {bot_uid} is busy/locked. Trying next online bot...")
                 continue
@@ -899,24 +912,27 @@ def create_squad():
     if not active_uids:
         return jsonify({"status": "error", "message": "No active bots connected"}), 400
         
-    bot_uid = active_uids[0]
-    resp = send_ipc_command(bot_uid, "CREATE_SQUAD")
-    if not resp or "OK" not in resp:
-        return jsonify({"status": "error", "message": f"Failed to send create squad command to bot: {resp}"}), 500
+    for bot_uid in active_uids:
+        resp = send_ipc_command(bot_uid, "CREATE_SQUAD")
+        if resp and "OK" in resp:
+            # Poll latest_squad.txt for up to 3 seconds
+            for _ in range(30):
+                if os.path.exists(squad_file):
+                    try:
+                        with open(squad_file, "r") as f:
+                            team_code = f.read().strip()
+                        return jsonify({"status": "success", "team_code": team_code, "bot_uid": bot_uid})
+                    except Exception as e:
+                        print(f" Error reading squad file: {e}")
+                time.sleep(0.1)
+            return jsonify({"status": "error", "message": "Timed out waiting for team code"}), 500
+        elif resp and "ERROR" in resp:
+            err_text = resp.split("ERROR: ")[-1].strip() if "ERROR: " in resp else resp
+            if "locked in session" in err_text.lower() or "busy" in err_text.lower():
+                logging.info(f"[ROUTING] Bot {bot_uid} is locked in session. Skipping for CREATE_SQUAD and trying next free bot...")
+                continue
 
-    # Poll latest_squad.txt for up to 3 seconds
-    for _ in range(30):
-        if os.path.exists(squad_file):
-            try:
-                with open(squad_file, "r") as f:
-                    code = f.read().strip()
-                if code:
-                    return jsonify({"status": "success", "team_code": code, "bot_uid": bot_uid})
-            except:
-                pass
-        time.sleep(0.1)
-
-    return jsonify({"status": "error", "message": "Squad created, but team code interception timed out."}), 500
+    return jsonify({"status": "error", "message": "All online bots are currently locked/busy in emote sessions"}), 500
 
 @app.route('/api/generate_group', methods=['POST'])
 def generate_group():
