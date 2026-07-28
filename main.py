@@ -1,5 +1,5 @@
 # ======================== IMPORTS =======================
-import requests , os , psutil , jwt , pickle , json , binascii , time , urllib3 , base64 , datetime , re , socket , threading , ssl , pytz , aiohttp , traceback , signal , multiprocessing , asyncio , sys
+import requests , os , psutil , jwt , pickle , json , binascii , time , urllib3 , base64 , datetime , re , socket , threading , ssl , pytz , aiohttp , traceback , signal , multiprocessing , asyncio , sys, uuid
 
 # Fix encoding for Windows
 if sys.platform == "win32":
@@ -58,6 +58,46 @@ room_info_cache = {}
 last_status_packet = None
 insquad = None 
 joining_team = False 
+
+ACTIVE_LOCK_SESSIONS = {}
+LOCK_SESSION_MAX_TIMEOUT = 300  # 5 minutes in seconds
+
+def cleanup_expired_sessions():
+    """Remove lock sessions older than 5 minutes (300 seconds)"""
+    global ACTIVE_LOCK_SESSIONS
+    now = time.time()
+    expired_keys = [sid for sid, data in list(ACTIVE_LOCK_SESSIONS.items()) if now - data.get("created_at", 0) > LOCK_SESSION_MAX_TIMEOUT]
+    for sid in expired_keys:
+        print(f"⏰ [AUTO EXPIRY 5MIN] Lock session {sid} expired after 5 minutes.")
+        ACTIVE_LOCK_SESSIONS.pop(sid, None)
+
+def is_bot_locked(current_team_code=None):
+    """Check if bot is currently locked in an active non-expired session for a DIFFERENT squad"""
+    cleanup_expired_sessions()
+    if not ACTIVE_LOCK_SESSIONS:
+        return False, None
+    
+    for sid, data in list(ACTIVE_LOCK_SESSIONS.items()):
+        if current_team_code and data.get("team_code") == current_team_code:
+            return False, sid
+        return True, sid
+    return False, None
+
+def create_lock_session(team_code):
+    cleanup_expired_sessions()
+    session_id = f"LOCK_{uuid.uuid4().hex[:6].upper()}"
+    ACTIVE_LOCK_SESSIONS[session_id] = {
+        "team_code": team_code,
+        "created_at": time.time()
+    }
+    return session_id
+
+def invalidate_lock_session(session_id=None):
+    global ACTIVE_LOCK_SESSIONS
+    if session_id:
+        ACTIVE_LOCK_SESSIONS.pop(session_id, None)
+    else:
+        ACTIVE_LOCK_SESSIONS.clear()
 online_writer = None 
 whisper_writer = None 
 last_bot_status_check = 0
@@ -1207,6 +1247,10 @@ async def handle_ipc(reader, writer, key, iv, region):
                 else:
                     writer.write(b"ERROR\n")
             elif command == "CREATE_SQUAD":
+                is_locked, lock_sid = is_bot_locked()
+                if is_locked:
+                    writer.write(f"ERROR: Bot is currently locked in session {lock_sid}\n".encode())
+                    continue
                 try:
                     await reset_bot_state(key, iv, region)
                     squad_packet = await OpEnSq(key, iv, region)
@@ -1232,6 +1276,10 @@ async def handle_ipc(reader, writer, key, iv, region):
                     traceback.print_exc()
                     writer.write(b"ERROR\n")
             elif command.startswith("JOIN_SQUAD"):
+                is_locked, lock_sid = is_bot_locked()
+                if is_locked:
+                    writer.write(f"ERROR: Bot is currently locked in session {lock_sid}\n".encode())
+                    continue
                 parts = command.split()
                 if len(parts) >= 2:
                     team_code = parts[1]
@@ -1254,6 +1302,10 @@ async def handle_ipc(reader, writer, key, iv, region):
                 else:
                     writer.write(b"ERROR\n")
             elif command.startswith("GROUP_EXPLOIT"):
+                is_locked, lock_sid = is_bot_locked()
+                if is_locked:
+                    writer.write(f"ERROR: Bot is currently locked in session {lock_sid}\n".encode())
+                    continue
                 parts = command.split()
                 if len(parts) >= 2:
                     target_uid = parts[1]
@@ -1352,6 +1404,26 @@ async def handle_ipc(reader, writer, key, iv, region):
                     writer.write(b"SUCCESS: Room message sent\n")
                 except Exception as e:
                     writer.write(f"ERROR: {str(e)}\n".encode())
+
+            elif command.startswith("FAST_EMOTE"):
+                parts = command.split()
+                if len(parts) >= 4:
+                    target_identifier = parts[1]
+                    target_uids = parts[2]
+                    emote_id = parts[3]
+                    mode = parts[4] if len(parts) > 4 else "quit"
+                    print(f" [IPC] Fast Emote requested: Target={target_identifier}, UIDs={target_uids}, Emote={emote_id}, Mode={mode}")
+                    try:
+                        success, result_dict = await fast_squad_emote_attack(target_identifier, target_uids, emote_id, key, iv, region, mode=mode)
+                        if success:
+                            res_str = json.dumps(result_dict)
+                            writer.write(f"SUCCESS: {res_str}\n".encode())
+                        else:
+                            writer.write(f"ERROR: {result_dict.get('message', 'Failed')}\n".encode())
+                    except Exception as e:
+                        writer.write(f"ERROR: {str(e)}\n".encode())
+                else:
+                    writer.write(b"ERROR: Usage: FAST_EMOTE target uids emote_id [mode]\n")
             
             elif command.startswith("GET_STATS"):
                 parts = command.split()
@@ -3461,6 +3533,101 @@ async def ultra_quick_emote_attack(team_code, emote_id, target_uid, key, iv, reg
         
     except Exception as e:
         return False, f"Quick emote attack failed: {str(e)}"
+
+async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input, key, iv, region, mode="quit"):
+    """
+    Ultra-fast squad join / locked session -> emote targeting player UID(s) -> leave squad (if mode=="quit")
+    Modes:
+      - 'quit': Join, emote, immediately exit squad.
+      - 'lock': Join, emote, stay in squad, return a unique session_id (e.g. LOCK_A1B2C3).
+      - 'session': If team_code_or_session is a valid active session_id, send emote directly without joining!
+    """
+    try:
+        if isinstance(uids_input, str):
+            uids_list = [u.strip() for u in uids_input.replace(',', ' ').split() if u.strip()]
+        elif isinstance(uids_input, (list, tuple)):
+            uids_list = [str(u).strip() for u in uids_input if str(u).strip()]
+        else:
+            uids_list = [str(uids_input)]
+
+        resolved_emote_id = 909000063
+        emote_str = str(emote_input).strip().lower()
+
+        if 'NAME_EMOTES' in globals() and emote_str in NAME_EMOTES:
+            resolved_emote_id = NAME_EMOTES[emote_str]
+        elif 'evo_emotes' in globals() and emote_str in evo_emotes:
+            resolved_emote_id = evo_emotes[emote_str]
+        elif 'EMOTE_MAP' in globals() and emote_str.isdigit() and int(emote_str) in EMOTE_MAP:
+            resolved_emote_id = EMOTE_MAP[int(emote_str)]
+        elif emote_str.isdigit():
+            resolved_emote_id = int(emote_str)
+
+        target_identifier = str(team_code_or_session).strip()
+        session_id = None
+        is_locked_session = False
+
+        cleanup_expired_sessions()
+
+        if target_identifier in ACTIVE_LOCK_SESSIONS:
+            session_id = target_identifier
+            is_locked_session = True
+            if not mode or mode == "quit":
+                mode = "lock"  # Lock session defaults to lock unless explicitly asked to leave
+            print(f"⚡ [FAST EMOTE] Using active lock session {session_id} for emote {resolved_emote_id} (Mode={mode})")
+        else:
+            is_locked, lock_sid = is_bot_locked()
+            if is_locked:
+                err_msg = f"Bot is currently locked in squad session {lock_sid}. Cannot join team {target_identifier} until session expires (5 min max) or leaves!"
+                print(f"🚫 [LOCK BUSY] {err_msg}")
+                return False, {"status": "error", "message": err_msg}
+
+            team_code = target_identifier
+            print(f"⚡ [FAST EMOTE] Joining team {team_code} (Mode={mode}) for emote {resolved_emote_id} on UIDs: {uids_list}")
+            join_packet = await GenJoinSquadsPacket(team_code, key, iv)
+            if join_packet:
+                await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
+
+            await asyncio.sleep(0.25)
+
+            if str(mode).lower() == "lock":
+                session_id = create_lock_session(team_code)
+                is_locked_session = True
+                print(f"🔒 [LOCK MODE] Lock session created: {session_id}")
+
+        for target_uid in uids_list:
+            try:
+                emote_packet = await Emote_k(int(target_uid), int(resolved_emote_id), key, iv, region)
+                if emote_packet:
+                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
+                    print(f"⚡ [FAST EMOTE] Sent emote {resolved_emote_id} to UID {target_uid}")
+            except Exception as e:
+                print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
+
+        if str(mode).lower() == "quit":
+            await asyncio.sleep(0.15)
+            leave_packet = await ExiT(None, key, iv)
+            if leave_packet:
+                await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
+                print(f"⚡ [FAST EMOTE] Left team (Quit mode)")
+            if session_id:
+                invalidate_lock_session(session_id)
+
+            return True, {
+                "status": "success",
+                "mode": "quit",
+                "message": f"Fast emote attack completed (quit mode)"
+            }
+        else:
+            return True, {
+                "status": "success",
+                "mode": "lock",
+                "session_id": session_id,
+                "message": f"Fast emote performed. Bot locked in squad (Session: {session_id})"
+            }
+
+    except Exception as e:
+        print(f"⚡ [FAST EMOTE] Error: {e}")
+        return False, {"status": "error", "message": str(e)}
         
         
 async def encrypted_proto(encoded_hex):
@@ -8212,6 +8379,37 @@ Modified by - NAJMI-M24
                                 except Exception as e:
                                     error_msg = f"[B][C][FF0000] ERROR! Ghost join failed: {str(e)}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
+
+                        # NEW FAST EMOTE ATTACK COMMAND (QUIT / LOCK MODES)
+                        if inPuTMsG.strip().startswith('/emote '):
+                            parts = inPuTMsG.strip().split()
+                            if len(parts) < 4:
+                                error_msg = f"[B][C][FF0000] ❌ Usage:\n"
+                                error_msg += f"[FFFFFF]/emote (team_code) (uids) (emote) [quit/lock]\n"
+                                error_msg += f"[FFFFFF]/emote (LOCK_ID) (uids) (emote)\n"
+                                error_msg += f"[FFFF00]Example 1: /emote ABC123 123456789 ak lock\n"
+                                error_msg += f"[FFFF00]Example 2: /emote LOCK_A1B2C3 123456789 ak\n"
+                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
+                            else:
+                                target_id = parts[1]
+                                target_uids = parts[2]
+                                emote_id = parts[3]
+                                mode = parts[4] if len(parts) > 4 else "quit"
+
+                                if target_id.startswith("LOCK_"):
+                                    initial_message = f"[B][C]{get_random_color()}\n⚡ Executing emote via Lock Session {target_id}...\n"
+                                else:
+                                    initial_message = f"[B][C]{get_random_color()}\n⚡ Fast Emote ({mode.upper()} mode) on team {target_id}...\n"
+
+                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
+
+                                async def run_and_reply():
+                                    success, res = await fast_squad_emote_attack(target_id, target_uids, emote_id, key, iv, region, mode=mode)
+                                    if success and res.get("mode") == "lock":
+                                        reply = f"[B][C][00FF00]🔒 BOT LOCKED IN SQUAD!\nSession ID: [FFFF00]{res.get('session_id')}\n[FFFFFF]Use: /emote {res.get('session_id')} {target_uids} {emote_id}\n"
+                                        await safe_send_message(response.Data.chat_type, reply, uid, chat_id, key, iv)
+
+                                asyncio.create_task(run_and_reply())
 
                         # NEW LAG COMMAND
                         if inPuTMsG.strip().startswith('/lag '):
