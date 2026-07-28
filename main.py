@@ -74,6 +74,12 @@ def cleanup_expired_sessions():
 def is_bot_locked(current_team_code=None):
     """Check if bot is currently locked in an active non-expired session for a DIFFERENT squad"""
     cleanup_expired_sessions()
+    global insquad
+    if insquad is None:
+        # If bot is not in any squad in Free Fire (kicked or left), clear lock session!
+        ACTIVE_LOCK_SESSIONS.clear()
+        return False, None
+
     if not ACTIVE_LOCK_SESSIONS:
         return False, None
     
@@ -6649,11 +6655,12 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                         if packet_type in [6, 7, 8, 9, 10, 11, 12]:
                             print(f" Kick/Leave packet detected (Type: {packet_type})")
             
-                            # RESET SQUAD STATUS
+                            # RESET SQUAD STATUS & RELEASE LOCK
                             insquad = None
                             joining_team = False
+                            invalidate_lock_session()
             
-                            print(f" Bot reset after kick. Ready for new invites.")
+                            print(f" Bot reset after kick. Lock session released & ready for new invites.")
                             
                             # Try to extract squad info for possible reconnection
                             try:
