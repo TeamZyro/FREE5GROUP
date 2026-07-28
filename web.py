@@ -721,27 +721,30 @@ def start_specific_bots():
                     logging.error(f"Failed to start bot {uid}: {e}")
                     
     return jsonify({"status": "success", "message": f"{started} bots started."})
+ipc_lock = threading.Lock()
+
 def send_ipc_command(uid, command):
     port_file = f".ipc/{uid}.port"
     if not os.path.exists(port_file): 
         logging.error(f"[IPC] Port file missing for {uid}")
         return None
-    try:
-        with open(port_file, "r") as f:
-            port = int(f.read().strip())
-        import socket
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(10.0)
-            logging.info(f"[IPC] Connecting to {uid} on port {port}...")
-            s.connect(('127.0.0.1', port))
-            logging.info(f"[IPC] Sending command: {command}")
-            s.sendall((command + "\n").encode())
-            resp = s.recv(1024).decode().strip()
-            logging.info(f"[IPC] Received response: '{resp}'")
-            return resp
-    except Exception as e:
-        logging.error(f"[IPC] Error sending {command} to {uid}: {e}")
-        return None
+    with ipc_lock:
+        try:
+            with open(port_file, "r") as f:
+                port = int(f.read().strip())
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(10.0)
+                logging.info(f"[IPC] Connecting to {uid} on port {port}...")
+                s.connect(('127.0.0.1', port))
+                logging.info(f"[IPC] Sending command: {command}")
+                s.sendall((command + "\n").encode())
+                resp = s.recv(1024).decode().strip()
+                logging.info(f"[IPC] Received response: '{resp}'")
+                return resp
+        except Exception as e:
+            logging.error(f"[IPC] Error sending {command} to {uid}: {e}")
+            return None
 
 @app.route('/api/player_stats/<uid>')
 def player_stats(uid):
@@ -774,6 +777,39 @@ def player_stats(uid):
         "real_time": real_time_status
     })
 
+def send_ipc_to_target_or_free_bot(command, target_bot_uid=None):
+    """
+    Routes IPC commands to a specific bot (if targeted by session_id) 
+    or iterates through active online bots to find an available (unlocked) bot.
+    """
+    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
+    if not active_uids:
+        return None, "ERROR: No active bots connected"
+
+    # 1. Target specific bot if target_bot_uid is provided (e.g. from LOCK_<bot_uid>_<hash>)
+    if target_bot_uid and str(target_bot_uid) in active_uids:
+        resp = send_ipc_command(str(target_bot_uid), command)
+        return str(target_bot_uid), resp
+
+    # 2. Otherwise iterate active_uids to find an available (unlocked) bot
+    last_err = None
+    for bot_uid in active_uids:
+        resp = send_ipc_command(bot_uid, command)
+        if resp:
+            if "SUCCESS" in resp or "OK" in resp:
+                return bot_uid, resp
+            elif "ERROR" in resp:
+                err_text = resp.split("ERROR: ")[-1].strip() if "ERROR: " in resp else resp
+                # Check for any locked / busy error message
+                if "locked" in err_text.lower() or "busy" in err_text.lower():
+                    last_err = err_text
+                    logging.info(f"[ROUTING] Bot {bot_uid} is locked ({err_text}). Trying next free bot...")
+                    continue
+                else:
+                    return bot_uid, resp
+
+    return None, f"ERROR: {last_err or 'All online bots are currently busy/locked in squads'}"
+
 @app.route('/api/group_exploit', methods=['POST'])
 def group_exploit():
     uid = request.json.get('uid')
@@ -781,32 +817,19 @@ def group_exploit():
     if not uid:
         return jsonify({"status": "error", "message": "UID required"}), 400
         
-    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
-    if not active_uids:
-        return jsonify({"status": "error", "message": "No active bots connected"}), 400
-        
-    last_err = None
-    for bot_uid in active_uids:
-        resp = send_ipc_command(bot_uid, f"GROUP_EXPLOIT {uid} {slot}")
-        if resp and "SUCCESS" in resp:
-            exploit_history.insert(0, {
-                "uid": uid,
-                "slot": slot,
-                "time": time.strftime("%H:%M:%S"),
-                "status": "Success"
-            })
-            if len(exploit_history) > 20: exploit_history.pop()
-            return jsonify({"status": "success", "message": "Exploit sequence initiated."})
-        elif resp and "ERROR" in resp:
-            err_text = resp.split("ERROR: ")[-1].strip()
-            if "locked in session" in err_text.lower() or "busy" in err_text.lower():
-                last_err = err_text
-                logging.info(f"[ROUTING] Bot {bot_uid} is locked in emote session. Trying next free bot for GROUP_EXPLOIT...")
-                continue
-            else:
-                return jsonify({"status": "error", "message": err_text}), 400
-
-    return jsonify({"status": "error", "message": last_err or "All online bots are locked/busy in emote sessions"}), 400
+    bot_uid, resp = send_ipc_to_target_or_free_bot(f"GROUP_EXPLOIT {uid} {slot}")
+    if resp and "SUCCESS" in resp:
+        exploit_history.insert(0, {
+            "uid": uid,
+            "slot": slot,
+            "time": time.strftime("%H:%M:%S"),
+            "status": "Success"
+        })
+        if len(exploit_history) > 20: exploit_history.pop()
+        return jsonify({"status": "success", "message": "Exploit sequence initiated.", "bot_uid": bot_uid})
+    else:
+        err_msg = resp.split("ERROR: ")[-1].strip() if resp and "ERROR: " in resp else (resp or "All online bots are busy")
+        return jsonify({"status": "error", "message": err_msg}), 400
 
 @app.route('/api/exploit_logs')
 def get_exploit_logs():
@@ -818,7 +841,6 @@ def send_bot_command():
     cmd_type = data.get('type')
     payload = data.get('payload', '')
     
-    # Map friendly types to IPC commands
     type_map = {
         "invite": "INVITE",
         "like": "LIKE",
@@ -831,26 +853,13 @@ def send_bot_command():
     ipc_cmd = type_map.get(cmd_type)
     if not ipc_cmd:
         return jsonify({"status": "error", "message": "Invalid command type"}), 400
-        
-    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
-    if not active_uids:
-        return jsonify({"status": "error", "message": "No active bots connected"}), 400
-        
-    last_err = None
-    for bot_uid in active_uids:
-        resp = send_ipc_command(bot_uid, f"{ipc_cmd} {payload}")
-        if resp and "SUCCESS" in resp:
-            return jsonify({"status": "success", "message": resp.split("SUCCESS: ")[-1]})
-        elif resp and "ERROR" in resp:
-            err_text = resp.split("ERROR: ")[-1].strip()
-            if "locked in session" in err_text.lower() or "busy" in err_text.lower():
-                last_err = err_text
-                logging.info(f"[ROUTING] Bot {bot_uid} is locked in session. Trying next free bot for command {cmd_type}...")
-                continue
-            else:
-                return jsonify({"status": "error", "message": err_text}), 400
 
-    return jsonify({"status": "error", "message": last_err or "All online bots are currently locked/busy"}), 400
+    bot_uid, resp = send_ipc_to_target_or_free_bot(f"{ipc_cmd} {payload}")
+    if resp and "SUCCESS" in resp:
+        return jsonify({"status": "success", "message": resp.split("SUCCESS: ")[-1], "bot_uid": bot_uid})
+    else:
+        err_msg = resp.split("ERROR: ")[-1].strip() if resp and "ERROR: " in resp else (resp or "Failed to execute command")
+        return jsonify({"status": "error", "message": err_msg}), 400
 
 @app.route('/api/fast_emote', methods=['POST'])
 def fast_emote():
@@ -867,37 +876,34 @@ def fast_emote():
     if not target_identifier or not uids or not emote_id:
         return jsonify({"status": "error", "message": "Missing team_code/session_id, uids, or emote_id"}), 400
         
-    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
-    if not active_uids:
-        return jsonify({"status": "error", "message": "No active bots connected"}), 400
-        
     if isinstance(uids, list):
         uids_str = ",".join([str(u) for u in uids])
     else:
         uids_str = str(uids)
 
-    # Multi-bot Routing Strategy: iterate active bots to find available unlocked bot
-    last_err_text = None
-    for bot_uid in active_uids:
-        resp = send_ipc_command(bot_uid, f"FAST_EMOTE {target_identifier} {uids_str} {emote_id} {mode}")
-        if resp and "SUCCESS" in resp:
-            res_str = resp.split("SUCCESS: ")[-1].strip()
-            try:
-                res_dict = json.loads(res_str)
-                return jsonify(res_dict)
-            except Exception:
-                return jsonify({"status": "success", "message": res_str})
-        elif resp and "ERROR" in resp:
-            err_text = resp.split("ERROR: ")[-1].strip()
-            # If this bot is locked in another squad, try the next available online bot!
-            if "locked in session" in err_text.lower() or "busy" in err_text.lower():
-                last_err_text = err_text
-                logging.info(f"[ROUTING] Bot {bot_uid} is busy/locked. Trying next online bot...")
-                continue
-            else:
-                return jsonify({"status": "error", "message": err_text}), 400
+    # If session_id format is LOCK_<bot_uid>_<hash>, extract targeted bot_uid
+    target_bot_uid = None
+    if session_id and "_" in str(session_id):
+        parts = str(session_id).split("_")
+        if len(parts) >= 3:
+            target_bot_uid = parts[1]
 
-    return jsonify({"status": "error", "message": last_err_text or "All online bots are currently busy/locked in squads"}), 400
+    bot_uid, resp = send_ipc_to_target_or_free_bot(
+        f"FAST_EMOTE {target_identifier} {uids_str} {emote_id} {mode}",
+        target_bot_uid=target_bot_uid
+    )
+
+    if resp and "SUCCESS" in resp:
+        res_str = resp.split("SUCCESS: ")[-1].strip()
+        try:
+            res_dict = json.loads(res_str)
+            res_dict["bot_uid"] = bot_uid
+            return jsonify(res_dict)
+        except Exception:
+            return jsonify({"status": "success", "message": res_str, "bot_uid": bot_uid})
+    else:
+        err_msg = resp.split("ERROR: ")[-1].strip() if resp and "ERROR: " in resp else (resp or "Failed to execute fast emote")
+        return jsonify({"status": "error", "message": err_msg}), 400
 
 @app.route('/api/create_squad', methods=['POST'])
 def create_squad():
@@ -908,31 +914,21 @@ def create_squad():
         except:
             pass
 
-    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
-    if not active_uids:
-        return jsonify({"status": "error", "message": "No active bots connected"}), 400
-        
-    for bot_uid in active_uids:
-        resp = send_ipc_command(bot_uid, "CREATE_SQUAD")
-        if resp and "OK" in resp:
-            # Poll latest_squad.txt for up to 3 seconds
-            for _ in range(30):
-                if os.path.exists(squad_file):
-                    try:
-                        with open(squad_file, "r") as f:
-                            team_code = f.read().strip()
-                        return jsonify({"status": "success", "team_code": team_code, "bot_uid": bot_uid})
-                    except Exception as e:
-                        print(f" Error reading squad file: {e}")
-                time.sleep(0.1)
-            return jsonify({"status": "error", "message": "Timed out waiting for team code"}), 500
-        elif resp and "ERROR" in resp:
-            err_text = resp.split("ERROR: ")[-1].strip() if "ERROR: " in resp else resp
-            if "locked in session" in err_text.lower() or "busy" in err_text.lower():
-                logging.info(f"[ROUTING] Bot {bot_uid} is locked in session. Skipping for CREATE_SQUAD and trying next free bot...")
-                continue
-
-    return jsonify({"status": "error", "message": "All online bots are currently locked/busy in emote sessions"}), 500
+    bot_uid, resp = send_ipc_to_target_or_free_bot("CREATE_SQUAD")
+    if resp and "OK" in resp:
+        for _ in range(30):
+            if os.path.exists(squad_file):
+                try:
+                    with open(squad_file, "r") as f:
+                        team_code = f.read().strip()
+                    return jsonify({"status": "success", "team_code": team_code, "bot_uid": bot_uid})
+                except Exception as e:
+                    print(f" Error reading squad file: {e}")
+            time.sleep(0.1)
+        return jsonify({"status": "error", "message": "Timed out waiting for team code"}), 500
+    else:
+        err_msg = resp.split("ERROR: ")[-1].strip() if resp and "ERROR: " in resp else (resp or "All online bots are busy")
+        return jsonify({"status": "error", "message": err_msg}), 500
 
 @app.route('/api/generate_group', methods=['POST'])
 def generate_group():
@@ -1139,6 +1135,126 @@ def bot_monitor_loop():
 @app.route('/api/get_all_logs')
 def get_all_logs():
     return jsonify(client_logs)
+
+@app.route('/api/allstats', methods=['GET'])
+@app.route('/allstats', methods=['GET'])
+def get_all_stats():
+    """
+    Returns comprehensive system status, running processes, and active bot stats.
+    Supports multi-user concurrency monitoring and real-time bot state inspection.
+    """
+    import psutil
+    import datetime
+    
+    # 1. System Info
+    cpu_percent = psutil.cpu_percent(interval=0.1)
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage('/') if os.name != 'nt' else psutil.disk_usage('C:\\')
+    
+    # 2. Active bots inspection
+    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
+    bot_details = []
+    locked_bots_count = 0
+    free_bots_count = 0
+    
+    for uid, proc in list(active_clients.items()):
+        is_running = proc.poll() is None
+        proc_memory_mb = 0
+        proc_cpu_percent = 0
+        if is_running:
+            try:
+                p = psutil.Process(proc.pid)
+                proc_memory_mb = round(p.memory_info().rss / (1024 * 1024), 2)
+                proc_cpu_percent = p.cpu_percent(interval=0.05)
+            except Exception:
+                pass
+
+        bot_info = {
+            "uid": uid,
+            "status": "ONLINE" if is_running else "OFFLINE",
+            "pid": proc.pid if is_running else None,
+            "memory_mb": proc_memory_mb,
+            "cpu_percent": proc_cpu_percent,
+            "is_locked": False,
+            "lock_session_id": None,
+            "squad_member_count": 0,
+            "insquad": False,
+            "real_time_status": None
+        }
+
+        # Query IPC GET_BOT_STATUS if online
+        if is_running:
+            raw_resp = send_ipc_command(uid, "GET_BOT_STATUS")
+            if raw_resp and "SUCCESS: " in raw_resp:
+                try:
+                    status_json_str = raw_resp.split("SUCCESS: ")[-1].strip()
+                    parsed_bot_status = json.loads(status_json_str)
+                    bot_info["real_time_status"] = parsed_bot_status
+                    bot_info["is_locked"] = parsed_bot_status.get("is_locked", False)
+                    bot_info["lock_session_id"] = parsed_bot_status.get("lock_session_id")
+                    bot_info["insquad"] = parsed_bot_status.get("insquad", False)
+                    bot_info["squad_member_count"] = parsed_bot_status.get("squad_member_count", 0)
+                    bot_info["lock_info"] = parsed_bot_status.get("lock_info")
+                except Exception as ex:
+                    logging.error(f"Error parsing bot status for {uid}: {ex}")
+
+        if is_running:
+            if bot_info["is_locked"]:
+                locked_bots_count += 1
+            else:
+                free_bots_count += 1
+
+        bot_details.append(bot_info)
+
+    # 3. Overall server processes breakdown
+    python_processes = []
+    try:
+        for p in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_info', 'cpu_percent']):
+            try:
+                cmd = " ".join(p.info['cmdline'] or [])
+                if 'python' in (p.info['name'] or '').lower() or 'main.py' in cmd or 'web.py' in cmd:
+                    python_processes.append({
+                        "pid": p.info['pid'],
+                        "name": p.info['name'],
+                        "cmdline": cmd,
+                        "memory_mb": round((p.info['memory_info'].rss if p.info['memory_info'] else 0) / (1024 * 1024), 2),
+                        "cpu_percent": p.info['cpu_percent']
+                    })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception as e:
+        logging.error(f"Error reading process list: {e}")
+
+    server_stats = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "status": "ONLINE",
+        "system": {
+            "cpu_percent": cpu_percent,
+            "memory": {
+                "total_mb": round(memory.total / (1024 * 1024), 2),
+                "available_mb": round(memory.available / (1024 * 1024), 2),
+                "used_mb": round(memory.used / (1024 * 1024), 2),
+                "percent": memory.percent
+            },
+            "disk": {
+                "total_gb": round(disk.total / (1024 * 1024 * 1024), 2),
+                "free_gb": round(disk.free / (1024 * 1024 * 1024), 2),
+                "percent": disk.percent
+            }
+        },
+        "bot_pool": {
+            "total_configured": len(active_clients),
+            "total_online": len(active_uids),
+            "total_locked": locked_bots_count,
+            "total_unlocked_available": free_bots_count,
+        },
+        "bots": bot_details,
+        "running_python_processes": python_processes,
+        "exploit_history_count": len(exploit_history),
+        "recent_exploits": exploit_history[:10]
+    }
+    
+    return jsonify(server_stats)
 
 if __name__ == '__main__':
     # Force templates dir exists
