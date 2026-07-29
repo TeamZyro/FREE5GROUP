@@ -463,7 +463,7 @@ def send_friend_request_single(uid, token, region="IND"):
             "Authorization": f"Bearer {token}",
             "X-Unity-Version": "2018.4.11f1",
             "X-GA": "v1 1",
-            "ReleaseVersion": "OB54",
+            "ReleaseVersion": "OB56",
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Dalvik/2.1.0"
         }
@@ -3498,7 +3498,7 @@ Hr = {
     'Expect': "100-continue",
     'X-Unity-Version': "2018.4.11f1",
     'X-GA': "v1 1",
-    'ReleaseVersion': "OB54"}
+    'ReleaseVersion': "OB56"}
 
 # ---- Random Colores ----
 def get_random_color():
@@ -5490,7 +5490,7 @@ import asyncio
 # Add these constants with your other global variables
 BIO_ENCRYPTION_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 BIO_ENCRYPTION_IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
-FREEFIRE_VERSION = "OB54"
+FREEFIRE_VERSION = "OB56"
 
 def decode_jwt_noverify(token: str):
     """Decode JWT without verification"""
