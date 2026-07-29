@@ -3621,18 +3621,21 @@ async def ultra_quick_emote_attack(team_code, emote_id, target_uid, key, iv, reg
         return True, f"Quick emote attack completed! Sent emote to UID {xMsGFixinG(target_uid)}"
         
     except Exception as e:
-        return False, f"Quick emote attack failed: {str(e)}"
+        return False, f"Quick emote attack failed"
 
 async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input, key, iv, region, mode="quit"):
     """
     Ultra-fast squad join / locked session -> emote targeting player UID(s) -> leave squad (if mode=="quit")
     Modes:
-      - 'quit': Join, emote, immediately exit squad.
+      - 'quit': Join, emote, stay briefly for animation, exit squad.
       - 'lock': Join, emote, stay in squad, return a unique session_id (e.g. LOCK_A1B2C3).
       - 'session': If team_code_or_session is a valid active session_id, send emote directly without joining!
     """
-    global insquad
+    global insquad, online_writer
     try:
+        if not region:
+            region = "IND"
+
         if isinstance(uids_input, str):
             uids_list = [u.strip() for u in uids_input.replace(',', ' ').split() if u.strip()]
         elif isinstance(uids_input, (list, tuple)):
@@ -3643,14 +3646,30 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
         resolved_emote_id = 909000063
         emote_str = str(emote_input).strip().lower()
 
-        if 'NAME_EMOTES' in globals() and emote_str in NAME_EMOTES:
+        if 'NUMBER_EMOTES' in globals() and emote_str in NUMBER_EMOTES:
+            resolved_emote_id = NUMBER_EMOTES[emote_str]
+        elif 'NAME_EMOTES' in globals() and emote_str in NAME_EMOTES:
             resolved_emote_id = NAME_EMOTES[emote_str]
         elif 'evo_emotes' in globals() and emote_str in evo_emotes:
             resolved_emote_id = evo_emotes[emote_str]
         elif 'EMOTE_MAP' in globals() and emote_str.isdigit() and int(emote_str) in EMOTE_MAP:
             resolved_emote_id = EMOTE_MAP[int(emote_str)]
         elif emote_str.isdigit():
-            resolved_emote_id = int(emote_str)
+            if int(emote_str) < 10000 and 'NUMBER_EMOTES' in globals() and emote_str in NUMBER_EMOTES:
+                resolved_emote_id = NUMBER_EMOTES[emote_str]
+            else:
+                resolved_emote_id = int(emote_str)
+
+        # Retrieve current bot's UID for self-emote packet
+        curr_bot_uid = 0
+        if 'LoGinDaTaUncRypTinG' in globals() and hasattr(LoGinDaTaUncRypTinG, 'AccountUID'):
+            curr_bot_uid = int(LoGinDaTaUncRypTinG.AccountUID)
+        elif len(sys.argv) > 1 and str(sys.argv[1]).isdigit():
+            curr_bot_uid = int(sys.argv[1])
+        elif 'uid' in globals() and str(globals()['uid']).isdigit():
+            curr_bot_uid = int(globals()['uid'])
+        else:
+            curr_bot_uid = 14010319252
 
         target_identifier = str(team_code_or_session).strip()
         session_id = None
@@ -3663,12 +3682,10 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
             session_id = target_identifier
             is_locked_session = True
 
-            # Register/refresh session in ACTIVE_LOCK_SESSIONS & keep insquad set
-            current_uid = sys.argv[1] if len(sys.argv) > 1 else "14010319252"
             if session_id not in ACTIVE_LOCK_SESSIONS:
                 ACTIVE_LOCK_SESSIONS[session_id] = {
                     "team_code": "LOCKED_SQUAD",
-                    "bot_uid": str(current_uid),
+                    "bot_uid": str(curr_bot_uid),
                     "created_at": time.time()
                 }
             insquad = session_id
@@ -3691,8 +3708,8 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
             if join_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
 
-            # Wait 0.55s for server to place bot in squad & authenticate session
-            await asyncio.sleep(0.55)
+            # Wait 1.2s for server to place bot in squad & confirm squad membership
+            await asyncio.sleep(1.2)
 
             if str(mode).lower() == "lock":
                 session_id = create_lock_session(team_code)
@@ -3702,24 +3719,45 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
             else:
                 insquad = True
 
-        # Send emote to target UIDs (or squad broadcast 0 if uids_list empty)
+        region = "IND"
+
+        # Send emote to target UIDs
         target_targets = uids_list if uids_list else ["0"]
         for target_uid in target_targets:
             try:
                 target_num = int(target_uid) if str(target_uid).isdigit() else 0
+                
+                # 1. Emote packet targeting player UID
                 emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, region)
                 if emote_packet:
-                    # Burst of 2 packets (80ms gap) to guarantee server delivery under multi-bot load
                     for _ in range(2):
                         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
                         await asyncio.sleep(0.08)
-                    print(f"⚡ [FAST EMOTE] Sent burst emote {resolved_emote_id} to UID {target_uid}")
+
+                # 2. Emote packet targeting bot UID (renders bot model animation)
+                if curr_bot_uid > 0 and curr_bot_uid != target_num:
+                    await asyncio.sleep(0.05)
+                    bot_emote_packet = await Emote_k(curr_bot_uid, int(resolved_emote_id), key, iv, region)
+                    if bot_emote_packet:
+                        for _ in range(2):
+                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', bot_emote_packet)
+                            await asyncio.sleep(0.08)
+
+                # 3. Squad Broadcast Emote Packet (UID 0) to guarantee all players see the emote
+                if target_num != 0:
+                    await asyncio.sleep(0.05)
+                    bcast_packet = await Emote_k(0, int(resolved_emote_id), key, iv, region)
+                    if bcast_packet:
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', bcast_packet)
+
+                print(f"⚡ [FAST EMOTE] Sent triple-targeted emote ({resolved_emote_id}) to UID {target_uid}, bot {curr_bot_uid}, and squad broadcast 0")
+
             except Exception as e:
                 print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
 
         if str(mode).lower() == "quit":
-            # Wait 0.45s so emote animation renders for everyone in the squad before leaving
-            await asyncio.sleep(0.45)
+            # Wait 1.5s so emote animation renders for everyone in squad before leaving
+            await asyncio.sleep(1.5)
             leave_packet = await ExiT(None, key, iv)
             if leave_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
