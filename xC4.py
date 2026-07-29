@@ -397,8 +397,13 @@ async def Emote_k(TarGeT , idT, K, V,region):
             }
         }
     }
-    # Hardcoded for IND (India Server) region: packet type 0514
-    packet = '0514'
+    reg_clean = str(region or '').strip().lower()
+    if 'bd' in reg_clean:
+        packet = "0519"
+    elif reg_clean in ['us', 'sac', 'br', 'na']:
+        packet = "0515"
+    else:
+        packet = '0514'
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
 
 #EMOTES BY PARAHEX X CODEX
@@ -983,8 +988,13 @@ async def Emote_k(TarGeT , idT, K, V,region):
             }
         }
     }
-    # Hardcoded for IND (India Server) region: packet type 0514
-    packet = '0514'
+    reg_clean = str(region or '').strip().lower()
+    if 'bd' in reg_clean:
+        packet = "0519"
+    elif reg_clean in ['us', 'sac', 'br', 'na']:
+        packet = "0515"
+    else:
+        packet = '0514'
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
 
 #EMOTES BY PARAHEX X CODEX
