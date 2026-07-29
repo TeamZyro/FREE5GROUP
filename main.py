@@ -6703,28 +6703,34 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                         if online_writer and Join:
                                             online_writer.write(Join)
                                             await online_writer.drain()
-                                        insquad = code
-                    except Exception as e:
-                        if "string indices must be integers" not in str(e) and "'5'" not in str(e):
-                            print(f"Error in auto-accept: {e}")
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', Join)
-        
-                            await asyncio.sleep(2)
-                                                    
-                            emote_to_sender = await Emote_k(int(uid), emote_id, key, iv, region)
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_to_sender)
-        
-                            bot_emote = await Emote_k(int(bot_uid), emote_id, key, iv, region)
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', bot_emote)
-                            
-                            
-            
-                            # Set squad status
-                            insquad = True
-                            print(f" Bot joined squad of {squad_owner}")
-        
-        
-        
+                                        insquad = True
+                                        joining_team = False
+
+                                        await asyncio.sleep(2)
+                                                                
+                                        emote_to_sender = await Emote_k(int(uid), emote_id, key, iv, region)
+                                        if emote_to_sender and online_writer:
+                                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_to_sender)
+
+                                        bot_emote = await Emote_k(int(bot_uid), emote_id, key, iv, region)
+                                        if bot_emote and online_writer:
+                                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', bot_emote)
+                                        
+                                        print(f" Bot joined squad of {squad_owner} and performed emote")
+
+                                        # Immediately authenticate group chat so bot appears in group
+                                        await asyncio.sleep(1)
+                                        try:
+                                            OwNer_UiD, CHaT_CoDe, SQuAD_CoDe = await GeTSQDaTa(packet_json)
+                                            JoinCHaT = await AutH_Chat(3, OwNer_UiD, CHaT_CoDe, key, iv)
+                                            if JoinCHaT and (whisper_writer or online_writer):
+                                                await SEndPacKeT(whisper_writer, online_writer, 'ChaT', JoinCHaT)
+                                                print(f" Bot authenticated group chat immediately after join.")
+                                        except Exception as auth_err:
+                                            print(f" Immediate group auth failed: {auth_err}")
+
+                                        continue
+
                         else:
                             try:
                                 print(f" Bot is private! Ignoring invite from {squad_owner}")
@@ -6750,7 +6756,7 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                     
                             except Exception as e:
                                 print(" got an error in can't accept")
-    
+                            continue
 
                     except Exception as e:
                         print(f"Error in auto-accept: {e}")
@@ -6760,7 +6766,7 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                 
                 # =================== HANDLE KICK/RECONNECT ===================
                 # Case 3: Bot was kicked and needs to re-join chat
-                if data_hex.startswith('0500') and len(data_hex) > 1000:
+                if data_hex.startswith('0500') and len(data_hex) > 1000 and insquad is None:
                     try:
                         packet = await DeCode_PackEt(data_hex[10:])
                         packet_json = json.loads(packet)
