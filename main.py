@@ -3718,23 +3718,20 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
         # Force IND region for Free Fire India Server
         region = "IND"
 
-        # Perform emote 3 times (3 distinct triggers with animation delay for 3x emote show)
+        # Perform 1 clean emote performance per request
         target_targets = uids_list if uids_list else ["0"]
         for target_uid in target_targets:
             try:
                 target_num = int(target_uid) if str(target_uid).isdigit() else 0
                 emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, "IND")
                 if emote_packet:
-                    for cycle in range(3):
-                        # Send 2-packet burst per cycle to guarantee 100% server delivery
-                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-                        await asyncio.sleep(0.06)
-                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-                        print(f"⚡ [FAST EMOTE 3X] Emote trigger {cycle+1}/3 ({resolved_emote_id}) sent to UID {target_uid}")
-                        if cycle < 2:
-                            await asyncio.sleep(0.25)  # Short delay between the 3 emote animations
+                    # 2-packet burst (60ms gap) for smooth & guaranteed server rendering
+                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
+                    await asyncio.sleep(0.06)
+                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
+                    print(f"⚡ [FAST EMOTE] Sent single emote ({resolved_emote_id}) to UID {target_uid}")
             except Exception as e:
-                print(f"⚡ [FAST EMOTE 3X] Error sending emote to {target_uid}: {e}")
+                print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
 
         if str(mode).lower() == "quit":
             # Wait 0.45s so emote animation renders for everyone in the squad before leaving
