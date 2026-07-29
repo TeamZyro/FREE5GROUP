@@ -3704,8 +3704,8 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
             if join_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
 
-            # Wait 0.55s for server to place bot in squad & authenticate session
-            await asyncio.sleep(0.55)
+            # Wait 0.85s for server to place bot in squad & process squad join state
+            await asyncio.sleep(0.85)
 
             if str(mode).lower() == "lock":
                 session_id = create_lock_session(team_code)
@@ -3718,22 +3718,23 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
         # Force IND region for Free Fire India Server
         region = "IND"
 
-        # Send EXACTLY 1 single emote packet to target (NO burst, NO duplicate, NO 3x repeat)
+        # Send 2-packet burst (40ms gap) to guarantee server delivery and rendering in lock & squad modes
         target_targets = uids_list if uids_list else ["0"]
-        for target_uid in target_targets[:1]:
+        for target_uid in target_targets:
             try:
                 target_num = int(target_uid) if str(target_uid).isdigit() else 0
-                emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, "IND")
+                emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, region)
                 if emote_packet:
-                    # EXACTLY 1 SINGLE PACKET SENT TO FREE FIRE SERVER
                     await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-                    print(f"⚡ [FAST EMOTE] Sent EXACTLY 1 single emote packet ({resolved_emote_id}) to UID {target_uid}")
+                    await asyncio.sleep(0.04)
+                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
+                    print(f"⚡ [FAST EMOTE] Sent emote ({resolved_emote_id}) to UID {target_uid}")
             except Exception as e:
                 print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
 
         if str(mode).lower() == "quit":
-            # Wait 0.45s so emote animation renders for everyone in the squad before leaving
-            await asyncio.sleep(0.45)
+            # Wait 1.2s so emote animation fully renders for everyone in the squad before leaving
+            await asyncio.sleep(1.2)
             leave_packet = await ExiT(None, key, iv)
             if leave_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
