@@ -147,6 +147,20 @@ async def lock_and_squad_monitor_loop(key, iv, region):
                         print(f" [AUTO UNLOCK EXIT ERROR] {ex}")
                     insquad = None
                     invalidate_lock_session()
+
+            # TCP Keepalive Heartbeat: Send ping every 9s to prevent Free Fire server idle disconnects
+            ping_counter = getattr(lock_and_squad_monitor_loop, 'counter', 0) + 1
+            setattr(lock_and_squad_monitor_loop, 'counter', ping_counter)
+            if ping_counter % 6 == 0:
+                if online_writer and not online_writer.is_closing():
+                    try:
+                        ping_pk = await GeneRaTePk("", "0500", key, iv)
+                        if ping_pk:
+                            online_writer.write(ping_pk)
+                            await online_writer.drain()
+                    except Exception:
+                        pass
+
         except Exception as e:
             print(f"⚠️ [LOCK MONITOR ERROR] {e}")
             
@@ -3641,8 +3655,14 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
       - 'lock': Join, emote, stay in squad, return a unique session_id (e.g. LOCK_A1B2C3).
       - 'session': If team_code_or_session is a valid active session_id, send emote directly without joining!
     """
-    global insquad
+    global insquad, online_writer
     try:
+        # Check TCP socket readiness to ensure socket is not reconnecting or dead
+        for _ in range(25):
+            if online_writer and not online_writer.is_closing():
+                break
+            await asyncio.sleep(0.1)
+
         if not region:
             region = "IND"
 
@@ -3718,18 +3738,16 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
         # Force IND region for Free Fire India Server
         region = "IND"
 
-        # Perform 1 clean emote performance per request
+        # Send EXACTLY 1 single emote packet to target (NO burst, NO duplicate, NO 3x repeat)
         target_targets = uids_list if uids_list else ["0"]
-        for target_uid in target_targets:
+        for target_uid in target_targets[:1]:
             try:
                 target_num = int(target_uid) if str(target_uid).isdigit() else 0
                 emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, "IND")
                 if emote_packet:
-                    # 2-packet burst (60ms gap) for smooth & guaranteed server rendering
+                    # EXACTLY 1 SINGLE PACKET SENT TO FREE FIRE SERVER
                     await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-                    await asyncio.sleep(0.06)
-                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-                    print(f"⚡ [FAST EMOTE] Sent single emote ({resolved_emote_id}) to UID {target_uid}")
+                    print(f"⚡ [FAST EMOTE] Sent EXACTLY 1 single emote packet ({resolved_emote_id}) to UID {target_uid}")
             except Exception as e:
                 print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
 
