@@ -36,7 +36,7 @@ client_logs = []
 # HEROKU OPTIMIZATION: Limit total bots to stay within memory limits (e.g., 512MB/1GB)
 MAX_BOT_LIMIT = 5 
 BOT_ROTATION_INTERVAL = 3600 # 1 hour in seconds
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "minato")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin12345")
 last_rotation_time = time.time()
 current_rotation_index = 0
 
@@ -119,7 +119,7 @@ def update_bio_with_jwt(jwt_token, bio_text, region):
 
         headers = {
             "Authorization": f"Bearer {jwt_token}",
-            "ReleaseVersion": SITE_CONFIG.get('freefire_version', 'OB54'),
+            "ReleaseVersion": SITE_CONFIG.get('freefire_version', 'OB56'),
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-A305F Build/RP1A.200720.012)",
             "Host": host,
