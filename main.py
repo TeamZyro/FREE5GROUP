@@ -1467,26 +1467,16 @@ async def handle_ipc(reader, writer, key, iv, region):
                     target_uids = parts[2]
                     emote_id = parts[3]
                     mode = parts[4] if len(parts) > 4 else "quit"
-                    # Ensure bot's TCP connection to Free Fire is ready
-                    if online_writer is None:
-                        for _ in range(20):
-                            await asyncio.sleep(0.2)
-                            if online_writer is not None:
-                                break
-
-                    if online_writer is None:
-                        writer.write(b"ERROR: Bot online socket is connecting. Try next bot.\n")
-                    else:
-                        print(f"⚡ [IPC] Fast Emote requested: Target={target_identifier}, UIDs={target_uids}, Emote={emote_id}, Mode={mode}")
-                        try:
-                            success, result_dict = await fast_squad_emote_attack(target_identifier, target_uids, emote_id, key, iv, region, mode=mode)
-                            if success:
-                                res_str = json.dumps(result_dict)
-                                writer.write(f"SUCCESS: {res_str}\n".encode())
-                            else:
-                                writer.write(f"ERROR: {result_dict.get('message', 'Failed')}\n".encode())
-                        except Exception as e:
-                            writer.write(f"ERROR: {str(e)}\n".encode())
+                    print(f" [IPC] Fast Emote requested: Target={target_identifier}, UIDs={target_uids}, Emote={emote_id}, Mode={mode}")
+                    try:
+                        success, result_dict = await fast_squad_emote_attack(target_identifier, target_uids, emote_id, key, iv, region, mode=mode)
+                        if success:
+                            res_str = json.dumps(result_dict)
+                            writer.write(f"SUCCESS: {res_str}\n".encode())
+                        else:
+                            writer.write(f"ERROR: {result_dict.get('message', 'Failed')}\n".encode())
+                    except Exception as e:
+                        writer.write(f"ERROR: {str(e)}\n".encode())
                 else:
                     writer.write(b"ERROR: Usage: FAST_EMOTE target uids emote_id [mode]\n")
             
@@ -3968,27 +3958,9 @@ async def SEndMsG(H, message, Uid, chat_id, key, iv, region):
     
     
 async def SEndPacKeT(OnLinE , ChaT , TypE , PacKeT):
-    try:
-        if TypE == 'ChaT':
-            if whisper_writer and not whisper_writer.is_closing():
-                whisper_writer.write(PacKeT)
-                await whisper_writer.drain()
-            else:
-                print("⚠️ [SEND PACKET] whisper_writer unavailable")
-                return False
-        elif TypE == 'OnLine':
-            if online_writer and not online_writer.is_closing():
-                online_writer.write(PacKeT)
-                await online_writer.drain()
-            else:
-                print("⚠️ [SEND PACKET] online_writer unavailable")
-                return False
-        else:
-            return 'UnsoPorTed TypE ! >> ErrrroR (:():)'
-        return True
-    except Exception as e:
-        print(f"⚠️ [SEND PACKET ERROR] {e}")
-        return False 
+    if TypE == 'ChaT' and ChaT: whisper_writer.write(PacKeT) ; await whisper_writer.drain()
+    elif TypE == 'OnLine': online_writer.write(PacKeT) ; await online_writer.drain()
+    else: return 'UnsoPorTed TypE ! >> ErrrroR (:():)' 
 
 async def safe_send_message(chat_type, message, target_uid, chat_id, key, iv, max_retries=3, region="ind"):
     """Enhanced safe send message that works with custom rooms"""
