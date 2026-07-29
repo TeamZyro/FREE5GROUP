@@ -463,7 +463,7 @@ def send_friend_request_single(uid, token, region="IND"):
             "Authorization": f"Bearer {token}",
             "X-Unity-Version": "2018.4.11f1",
             "X-GA": "v1 1",
-            "ReleaseVersion": "OB56",
+            "ReleaseVersion": "OB54",
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Dalvik/2.1.0"
         }
@@ -3498,7 +3498,7 @@ Hr = {
     'Expect': "100-continue",
     'X-Unity-Version': "2018.4.11f1",
     'X-GA': "v1 1",
-    'ReleaseVersion': "OB56"}
+    'ReleaseVersion': "OB54"}
 
 # ---- Random Colores ----
 def get_random_color():
@@ -3641,11 +3641,8 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
       - 'lock': Join, emote, stay in squad, return a unique session_id (e.g. LOCK_A1B2C3).
       - 'session': If team_code_or_session is a valid active session_id, send emote directly without joining!
     """
-    global insquad, online_writer
+    global insquad
     try:
-        if not region:
-            region = "IND"
-
         if isinstance(uids_input, str):
             uids_list = [u.strip() for u in uids_input.replace(',', ' ').split() if u.strip()]
         elif isinstance(uids_input, (list, tuple)):
@@ -3704,8 +3701,8 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
             if join_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
 
-            # Wait 0.85s for server to place bot in squad & process squad join state
-            await asyncio.sleep(0.85)
+            # Wait 0.55s for server to place bot in squad & authenticate session
+            await asyncio.sleep(0.55)
 
             if str(mode).lower() == "lock":
                 session_id = create_lock_session(team_code)
@@ -3715,26 +3712,24 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
             else:
                 insquad = True
 
-        # Force IND region for Free Fire India Server
-        region = "IND"
-
-        # Send 2-packet burst (40ms gap) to guarantee server delivery and rendering in lock & squad modes
+        # Send emote to target UIDs (or squad broadcast 0 if uids_list empty)
         target_targets = uids_list if uids_list else ["0"]
         for target_uid in target_targets:
             try:
                 target_num = int(target_uid) if str(target_uid).isdigit() else 0
                 emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, region)
                 if emote_packet:
-                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-                    await asyncio.sleep(0.04)
-                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-                    print(f"⚡ [FAST EMOTE] Sent emote ({resolved_emote_id}) to UID {target_uid}")
+                    # Burst of 2 packets (80ms gap) to guarantee server delivery under multi-bot load
+                    for _ in range(2):
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
+                        await asyncio.sleep(0.08)
+                    print(f"⚡ [FAST EMOTE] Sent burst emote {resolved_emote_id} to UID {target_uid}")
             except Exception as e:
                 print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
 
         if str(mode).lower() == "quit":
-            # Wait 1.2s so emote animation fully renders for everyone in the squad before leaving
-            await asyncio.sleep(1.2)
+            # Wait 0.45s so emote animation renders for everyone in the squad before leaving
+            await asyncio.sleep(0.45)
             leave_packet = await ExiT(None, key, iv)
             if leave_packet:
                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
@@ -5492,7 +5487,7 @@ import asyncio
 # Add these constants with your other global variables
 BIO_ENCRYPTION_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 BIO_ENCRYPTION_IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
-FREEFIRE_VERSION = "OB56"
+FREEFIRE_VERSION = "OB54"
 
 def decode_jwt_noverify(token: str):
     """Decode JWT without verification"""
