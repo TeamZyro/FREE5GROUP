@@ -1,6 +1,12 @@
-# # ======================== IMPORTS =======================
-import requests , os , psutil , sys , jwt , pickle , json , binascii , time , urllib3 , base64 , datetime , re , socket , threading , ssl , pytz , aiohttp , traceback , signal , multiprocessing , asyncio
-from Pb2 import DEcwHisPErMsG_pb2 , MajoRLoGinrEs_pb2 , PorTs_pb2 , MajoRLoGinrEq_pb2 , sQ_pb2 , Team_msg_pb2, RemoveFriend_Req_pb2, GetFriend_Res_pb2, spam_request_pb2, devxt_count_pb2, dev_generator_pb2, kyro_title_pb2, room_join_pb2
+# ======================== IMPORTS =======================
+import requests , os , psutil , jwt , pickle , json , binascii , time , urllib3 , base64 , datetime , re , socket , threading , ssl , pytz , aiohttp , traceback , signal , multiprocessing , asyncio , sys, uuid
+
+# Fix encoding for Windows
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+from Plugins import DEcwHisPErMsG_pb2 , MajoRLoGinrEs_pb2 , PorTs_pb2 , MajoRLoGinrEq_pb2 , sQ_pb2 , Team_msg_pb2, RemoveFriend_Req_pb2, GetFriend_Res_pb2, spam_request_pb2, devxt_count_pb2, dev_generator_pb2, kyro_title_pb2, room_join_pb2
 from protobuf_decoder.protobuf_decoder import Parser
 from xC4 import * ; from xHeaders import *
 from datetime import datetime
@@ -52,6 +58,99 @@ room_info_cache = {}
 last_status_packet = None
 insquad = None 
 joining_team = False 
+
+ACTIVE_LOCK_SESSIONS = {}
+LOCK_SESSION_MAX_TIMEOUT = 300  # 5 minutes in seconds
+SQUAD_MEMBER_COUNT = 0
+BOT_START_TIME = time.time()
+TOTAL_IPC_COMMANDS = 0
+
+def cleanup_expired_sessions():
+    """Remove lock sessions older than 5 minutes (300 seconds)"""
+    global ACTIVE_LOCK_SESSIONS
+    now = time.time()
+    expired_keys = [sid for sid, data in list(ACTIVE_LOCK_SESSIONS.items()) if now - data.get("created_at", 0) > LOCK_SESSION_MAX_TIMEOUT]
+    for sid in expired_keys:
+        print(f"⏰ [AUTO EXPIRY 5MIN] Lock session {sid} expired after 5 minutes.")
+        ACTIVE_LOCK_SESSIONS.pop(sid, None)
+
+def is_bot_locked(current_team_code=None):
+    """Check if bot is currently locked in an active non-expired session for a DIFFERENT squad"""
+    cleanup_expired_sessions()
+    global insquad
+    if not insquad or insquad is None or insquad == False:
+        # Bot is not in any squad in Free Fire -> auto release lock session!
+        ACTIVE_LOCK_SESSIONS.clear()
+        return False, None
+
+    if not ACTIVE_LOCK_SESSIONS:
+        return False, None
+    
+    for sid, data in list(ACTIVE_LOCK_SESSIONS.items()):
+        if current_team_code and str(data.get("team_code")) == str(current_team_code):
+            return False, sid
+        return True, sid
+    return False, None
+
+def create_lock_session(team_code):
+    cleanup_expired_sessions()
+    current_uid = sys.argv[1] if len(sys.argv) > 1 else "14010319252"
+    session_id = f"LOCK_{current_uid}_{uuid.uuid4().hex[:6].upper()}"
+    ACTIVE_LOCK_SESSIONS[session_id] = {
+        "team_code": team_code,
+        "bot_uid": str(current_uid),
+        "created_at": time.time()
+    }
+    return session_id
+
+def invalidate_lock_session(session_id=None):
+    global ACTIVE_LOCK_SESSIONS
+    if session_id:
+        ACTIVE_LOCK_SESSIONS.pop(session_id, None)
+    else:
+        ACTIVE_LOCK_SESSIONS.clear()
+
+async def lock_and_squad_monitor_loop(key, iv, region):
+    """
+    Background loop that continuously checks:
+    1. 5-minute auto-expiry of lock sessions
+    2. If bot left squad or was kicked -> auto release lock session
+    3. If bot is alone in squad (0 human players, squad member count <= 1) -> auto exit squad & release lock session
+    """
+    global insquad, ACTIVE_LOCK_SESSIONS, SQUAD_MEMBER_COUNT, online_writer
+    print("🔒 [LOCK MONITOR] Solitary & Expiry lock monitor loop started.")
+    while True:
+        try:
+            cleanup_expired_sessions()
+            
+            # Sync insquad state if ACTIVE_LOCK_SESSIONS is present
+            if ACTIVE_LOCK_SESSIONS and (not insquad or insquad is None or insquad == False):
+                insquad = list(ACTIVE_LOCK_SESSIONS.keys())[0]
+            
+            # Case 1: Bot is not in squad anymore according to insquad flag and no active lock session exists
+            if not insquad or insquad is None or insquad == False:
+                if ACTIVE_LOCK_SESSIONS:
+                    print("🔓 [AUTO RELEASE] Bot is not in any squad. Clearing lock session(s).")
+                    invalidate_lock_session()
+            
+            # Case 2: Bot has an active lock session and is in squad, but is alone (solitary player)
+            elif ACTIVE_LOCK_SESSIONS:
+                # Check if bot is the only member in the squad
+                if SQUAD_MEMBER_COUNT <= 1 and SQUAD_MEMBER_COUNT > 0:
+                    print(f"🔓 [AUTO UNLOCK] Bot is alone in squad (Member count={SQUAD_MEMBER_COUNT}). Exiting squad and releasing lock.")
+                    try:
+                        leave_packet = await ExiT(None, key, iv)
+                        if leave_packet and online_writer:
+                            online_writer.write(leave_packet)
+                            await online_writer.drain()
+                    except Exception as ex:
+                        print(f" [AUTO UNLOCK EXIT ERROR] {ex}")
+                    insquad = None
+                    invalidate_lock_session()
+        except Exception as e:
+            print(f"⚠️ [LOCK MONITOR ERROR] {e}")
+            
+        await asyncio.sleep(1.5)
 online_writer = None 
 whisper_writer = None 
 last_bot_status_check = 0
@@ -64,36 +163,42 @@ WAIT_AFTER_MATCH_SECONDS = 20
 START_SPAM_DELAY = 0.2       
 region = 'IN'
 WHITELISTED_UIDS = {
-    "2270928791"  
+    "NFE", # don't change this text
+    "5513136279"
 }
-WHITELIST_ONLY = True  
-BOT_OWNER_UID = 11686472351  
+# ADMIN INFO FUNCTION FOR ADMIN COMMAND 
+ADMIN_UID = "5513136279"
+server2 = "ind"
+key2 = "nfe69"
+BYPASS_TOKEN = "NFE-NAJME-ALAM-TOKENS-SJDJSJ72NDJE83"
+WHITELIST_ONLY = False
+bot_enabled = True
+BOT_OWNER_UID = 2050444909  
 PLAYER_NAME_CACHE = {}  
 freeze_running = False
 freeze_task = None
 FREEZE_EMOTES = [909052010, 909052010, 909052010]
 FREEZE_DURATION = 10  # seconds
-manager = multiprocessing.Manager()
-status_response_cache = manager.dict()
+status_response_cache = {}
 evo_emotes = {
-"1": "909047007",   # AK
-    "2": "909040005",   # SCAR
-    "3": "909000135",   # 1st MP40
-    "4": "909042001",   # 2nd MP40
-    "5": "909035006",   # 1st M1014
-    "6": "909037009",   # 2nd M1014
-    "7": "909035009",   # XM8
-    "8": "909041014",   # Famas
-    "9": "909038004",   # UMP
+    "1": "909000063",   # AK
+    "2": "909000068",   # SCAR
+    "3": "909000075",   # 1st MP40
+    "4": "909040010",   # 2nd MP40
+    "5": "909000081",   # 1st M1014
+    "6": "909039011",   # 2nd M1014
+    "7": "909000085",   # XM8
+    "8": "909000090",   # Famas
+    "9": "909000098",   # UMP
     "10": "909035007",  # M1887
-    "11": "909000137",  # Woodpecker
-    "12": "909041014",  # Groza
+    "11": "909042008",  # Woodpecker
+    "12": "909041005",  # Groza
     "13": "909033001",  # M4A1
     "14": "909038010",  # Thompson
-    "15": "909000075",  # G18
+    "15": "909038012",  # G18
     "16": "909045001",  # Parafal
     "17": "909049010",  # P90
-    "18": "909000088"   # m60
+    "18": "909051003"   # m60
 }
 #------------------------------------------#
 
@@ -122,464 +227,16 @@ EMOTE_MAP = {
     21: 909034001
 }
 
-BUNDLE = {
-    "look1": 914000002,
-    "look2": 914000003,
-    "look3": 914038001,
-    "look5": 914039001,
-    "look6": 914042001,
-    "look7": 914044001,
-    "look8": 914047001,
-    "look9": 914047002,
-    "look10": 914048001,
-    "look11": 914050001,
-    "look12": 914051001,
-    "look13": 914053001
-}
-
-ALL_EMOTE = {
-    1: 909000001,
-    2: 909000002,
-    3: 909000003,
-    4: 909000004,
-    5: 909000005,
-    6: 909000006,
-    7: 909000007,
-    8: 909000008,
-    9: 909000009,
-    10: 909000010,
-    11: 909000011,
-    12: 909000012,
-    13: 909000013,
-    14: 909000014,
-    15: 909000015,
-    16: 909000016,
-    17: 909000017,
-    18: 909000018,
-    19: 909000019,
-    20: 909000020,
-    21: 909000021,
-    22: 909000022,
-    23: 909000023,
-    24: 909000024,
-    25: 909000025,
-    26: 909000026,
-    27: 909000027,
-    28: 909000028,
-    29: 909000029,
-    30: 909000031,
-    31: 909000032,
-    32: 909000033,
-    33: 909000034,
-    34: 909000035,
-    35: 909000036,
-    36: 909000037,
-    37: 909000038,
-    38: 909000039,
-    39: 909000040,
-    40: 909000041,
-    41: 909000042,
-    42: 909000043,
-    43: 909000044,
-    44: 909000045,
-    45: 909000046,
-    46: 909000047,
-    47: 909000048,
-    48: 909000049,
-    49: 909000051,
-    50: 909000052,
-    51: 909000053,
-    52: 909000054,
-    53: 909000055,
-    54: 909000056,
-    55: 909000057,
-    56: 909000058,
-    57: 909000059,
-    58: 909000060,
-    59: 909000061,
-    60: 909000062,
-    61: 909000063,
-    62: 909000064,
-    63: 909000065,
-    64: 909000066,
-    65: 909000067,
-    66: 909000068,
-    67: 909000069,
-    68: 909000070,
-    69: 909000071,
-    70: 909000072,
-    71: 909000073,
-    72: 909000074,
-    73: 909000075,
-    74: 909000076,
-    75: 909000077,
-    76: 909000078,
-    77: 909000079,
-    78: 909000080,
-    79: 909000081,
-    80: 909000082,
-    81: 909000083,
-    82: 909000084,
-    83: 909000085,
-    84: 909000086,
-    85: 909000087,
-    86: 909000088,
-    87: 909000089,
-    88: 909000090,
-    89: 909000091,
-    90: 909000092,
-    91: 909000093,
-    92: 909000094,
-    93: 909000095,
-    94: 909000096,
-    95: 909000097,
-    96: 909000098,
-    97: 909000099,
-    98: 909000100,
-    99: 909000101,
-    100: 909000102,
-    101: 909000103,
-    102: 909000104,
-    103: 909000105,
-    104: 909000106,
-    105: 909000107,
-    106: 909000108,
-    107: 909000109,
-    108: 909000110,
-    109: 909000111,
-    110: 909000112,
-    111: 909000113,
-    112: 909000114,
-    113: 909000115,
-    114: 909000116,
-    115: 909000117,
-    116: 909000118,
-    117: 909000119,
-    118: 909000120,
-    119: 909000121,
-    120: 909000122,
-    121: 909000123,
-    122: 909000124,
-    123: 909000125,
-    124: 909000126,
-    125: 909000127,
-    126: 909000128,
-    127: 909000129,
-    128: 909000130,
-    129: 909000131,
-    130: 909000132,
-    131: 909000133,
-    132: 909000134,
-    133: 909000135,
-    134: 909000136,
-    135: 909000137,
-    136: 909000138,
-    137: 909000139,
-    138: 909000140,
-    139: 909000141,
-    140: 909000142,
-    141: 909000143,
-    142: 909000144,
-    143: 909000145,
-    144: 909000150,
-    145: 909033001,
-    146: 909033002,
-    147: 909033003,
-    148: 909033004,
-    149: 909033005,
-    150: 909033006,
-    151: 909033007,
-    152: 909033008,
-    153: 909033009,
-    154: 909033010,
-    155: 909034001,
-    156: 909034002,
-    157: 909034003,
-    158: 909034004,
-    159: 909034005,
-    160: 909034006,
-    161: 909034007,
-    162: 909034008,
-    163: 909034009,
-    164: 909034010,
-    165: 909034011,
-    166: 909034012,
-    167: 909034013,
-    168: 909034014,
-    169: 909035001,
-    170: 909035002,
-    171: 909035003,
-    172: 909035004,
-    173: 909035005,
-    174: 909035006,
-    175: 909035007,
-    176: 909035008,
-    177: 909035009,
-    178: 909035010,
-    179: 909035011,
-    180: 909035012,
-    181: 909035013,
-    182: 909035014,
-    183: 909035015,
-    184: 909036001,
-    185: 909036002,
-    186: 909036003,
-    187: 909036004,
-    188: 909036005,
-    189: 909036006,
-    190: 909036008,
-    191: 909036009,
-    192: 909036010,
-    193: 909036011,
-    194: 909036012,
-    195: 909036014,
-    196: 909037001,
-    197: 909037002,
-    198: 909037003,
-    199: 909037004,
-    200: 909037005,
-    201: 909037006,
-    202: 909037007,
-    203: 909037008,
-    204: 909037009,
-    205: 909037010,
-    206: 909037011,
-    207: 909037012,
-    208: 909038001,
-    209: 909038002,
-    210: 909038003,
-    211: 909038004,
-    212: 909038005,
-    213: 909038006,
-    214: 909038008,
-    215: 909038009,
-    216: 909038010,
-    217: 909038011,
-    218: 909038012,
-    219: 909038013,
-    220: 909039001,
-    221: 909039002,
-    222: 909039003,
-    223: 909039004,
-    224: 909039005,
-    225: 909039006,
-    226: 909039007,
-    227: 909039008,
-    228: 909039009,
-    229: 909039010,
-    230: 909039011,
-    231: 909039012,
-    232: 909039013,
-    233: 909039014,
-    234: 909040001,
-    235: 909040002,
-    236: 909040003,
-    237: 909040004,
-    238: 909040005,
-    239: 909040006,
-    240: 909040008,
-    241: 909040009,
-    242: 909040010,
-    243: 909040011,
-    244: 909040012,
-    245: 909040013,
-    246: 909040014,
-    247: 909041001,
-    248: 909041002,
-    249: 909041003,
-    250: 909041004,
-    251: 909041005,
-    252: 909041006,
-    253: 909041007,
-    254: 909041008,
-    255: 909041009,
-    256: 909041010,
-    257: 909041011,
-    258: 909041012,
-    259: 909041013,
-    260: 909041014,
-    261: 909041015,
-    262: 909042001,
-    263: 909042002,
-    264: 909042003,
-    265: 909042004,
-    266: 909042005,
-    267: 909042006,
-    268: 909042007,
-    269: 909042008,
-    270: 909042009,
-    271: 909042011,
-    272: 909042012,
-    273: 909042013,
-    274: 909042016,
-    275: 909042017,
-    276: 909042018,
-    277: 909043001,
-    278: 909043002,
-    279: 909043003,
-    280: 909043004,
-    281: 909043005,
-    282: 909043006,
-    283: 909043007,
-    284: 909043008,
-    285: 909043009,
-    286: 909043010,
-    287: 909043013,
-    288: 909044001,
-    289: 909044002,
-    290: 909044003,
-    291: 909044004,
-    292: 909044005,
-    293: 909044006,
-    294: 909044007,
-    295: 909044008,
-    296: 909044009,
-    297: 909044010,
-    298: 909044011,
-    299: 909044012,
-    300: 909044015,
-    301: 909044016,
-    302: 909045001,
-    303: 909045002,
-    304: 909045003,
-    305: 909045004,
-    306: 909045005,
-    307: 909045006,
-    308: 909045007,
-    309: 909045008,
-    310: 909045009,
-    311: 909045010,
-    312: 909045011,
-    313: 909045012,
-    314: 909045015,
-    315: 909045016,
-    316: 909045017,
-    317: 909046001,
-    318: 909046002,
-    319: 909046003,
-    320: 909046004,
-    321: 909046005,
-    322: 909046006,
-    323: 909046007,
-    324: 909046008,
-    325: 909046009,
-    326: 909046010,
-    327: 909046011,
-    328: 909046012,
-    329: 909046013,
-    330: 909046014,
-    331: 909046015,
-    332: 909046016,
-    333: 909046017,
-    334: 909047001,
-    335: 909047002,
-    336: 909047003,
-    337: 909047004,
-    338: 909047005,
-    339: 909047006,
-    340: 909047007,
-    341: 909047008,
-    342: 909047009,
-    343: 909047010,
-    344: 909047011,
-    345: 909047012,
-    346: 909047013,
-    347: 909047015,
-    348: 909047016,
-    349: 909047017,
-    350: 909047018,
-    351: 909047019,
-    352: 909048001,
-    353: 909048002,
-    354: 909048003,
-    355: 909048004,
-    356: 909048005,
-    357: 909048006,
-    358: 909048007,
-    359: 909048008,
-    360: 909048009,
-    361: 909048010,
-    362: 909048011,
-    363: 909048012,
-    364: 909048013,
-    365: 909048014,
-    366: 909048015,
-    367: 909048016,
-    368: 909048017,
-    369: 909048018,
-    370: 909049001,
-    371: 909049002,
-    372: 909049003,
-    373: 909049004,
-    374: 909049005,
-    375: 909049006,
-    376: 909049007,
-    377: 909049008,
-    378: 909049009,
-    379: 909049010,
-    380: 909049011,
-    381: 909049012,
-    382: 909049013,
-    383: 909049014,
-    384: 909049015,
-    385: 909049016,
-    386: 909049017,
-    387: 909049018,
-    388: 909049019,
-    389: 909049020,
-    390: 909049021,
-    391: 909050002,
-    392: 909050003,
-    393: 909050004,
-    394: 909050005,
-    395: 909050006,
-    396: 909050008,
-    397: 909050009,
-    398: 909050010,
-    399: 909050011,
-    400: 909050012,
-    401: 909050013,
-    402: 909050014,
-    403: 909050015,
-    404: 909050016,
-    405: 909050017,
-    406: 909050018,
-    407: 909050019,
-    408: 909050020,
-    409: 909050021,
-    410: 909050026,
-    411: 909050027,
-    412: 909050028,
-    413: 909547001,
-    414: 909550001,
-    415: 909053001,
-    416: 909053003,
-    417: 909053004,
-    418: 909053005,
-    419: 909053006,
-    420: 909053007,
-    421: 909053008,
-    422: 909053009,
-    423: 909053010,
-    424: 909053011
-}
-
-# Badge values for v1 to s8 commands - using your exact values
+# Badge values for s1 to s8 commands - using your exact values
 BADGE_VALUES = {
-    "v1": 1048576,    # Your first badge
-    "v2": 32768,      # Your second badge  
-    "v3": 2048,       # Your third badge
-    "v4": 64,         # Your fourth badge
-    "v5": 262144     # Your seventh badge
+    "s1": 1048576,    # Your first badge
+    "s2": 32768,      # Your second badge  
+    "s3": 2048,       # Your third badge
+    "s4": 64,         # Your fourth badge
+    "s5": 262144     # Your seventh badge
 }
 
-def titles():
-    """Return all titles instead of just one random"""
-    titles_list = [
-        905090075, 904990072, 904990069, 905190079
-    ]
-    return titles_list  # Return the full list instead of random.choice     
-           
+# Admin Functions
 def is_admin(uid):
     return str(uid) == ADMIN_UID
 
@@ -596,19 +253,25 @@ def human_time(ts):
         return datetime.fromtimestamp(ts).strftime("%d %b %Y, %I:%M %p")
     except:
         return "N/A"
+
+def titles():
+    """Return all titles instead of just one random"""
+    titles_list = [
+        905090075, 904990072, 904990069, 905190079
+    ]
+    return titles_list  # Return the full list instead of random.choice            
     
-            
 def create_credentials_template():
     """Create a template credentials file"""
-    template = """# Flash_ff Free Fire Bot Credentials
+    template = """# Rijexx Free Fire Bot Credentials
 # Fill in your Free Fire account credentials below
 
 # Format 1: Comma-separated (RECOMMENDED)
-uid=uid-your,password=pass-your
+uid=4263143059,password=2336099414_W0363_BY_SPIDEERIO_GAMING_WBYMF
 
 # OR Format 2: Line-separated
-# uid: Uid-your
-# password: pass-your
+# uid: 4263143059
+# password: 2336099414_W0363_BY_SPIDEERIO_GAMING_WBYMF
 
 # Save this file and restart the bot
 """
@@ -617,8 +280,8 @@ uid=uid-your,password=pass-your
     if not os.path.exists(filename):
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(template)
-        print(f"📝 Created {filename} template file")
-        print("✏️ Please edit it with your actual credentials")
+        print(f" Created {filename} template file")
+        print(" Please edit it with your actual credentials")
         return False
     return True
     
@@ -738,13 +401,13 @@ def load_jwt_token():
             data = json.load(f)
         token = data.get("token")
         if token:
-            print(f"✅ Loaded token: {token[:20]}...")
+            print(f" Loaded token: {token[:20]}...")
             return token
         else:
-            print("❌ No token found in token.json")
+            print(" No token found in token.json")
             return None
     except Exception as e:
-        print(f"❌ Error loading token: {e}")
+        print(f" Error loading token: {e}")
         return None
 
 def load_tokens_ind():
@@ -752,48 +415,34 @@ def load_tokens_ind():
     try:
         with open("token_ind.json", "r") as f:
             tokens = json.load(f)
-        print(f"📦 Loaded {len(tokens)} tokens from token_ind.json")
+        print(f" Loaded {len(tokens)} tokens from token_ind.json")
         return tokens
     except:
-        print("❌ No tokens found in token_ind.json")
+        print(" No tokens found in token_ind.json")
         return None
 
-def get_player_info(uid, token):
-    """Get player info - modified to accept token"""
-    url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
-    
-    encrypted_uid = enc(uid)
-    edata = bytes.fromhex(encrypted_uid)
-    
-    headers = {
-        'User-Agent': "Dalvik/2.1.0",
-        'Connection': "Keep-Alive",
-        'Accept-Encoding': "gzip",
-        'Authorization': f"Bearer {token}",
-        'Content-Type': "application/x-www-form-urlencoded",
-        'X-Unity-Version': "2018.4.11f1",
-        'X-GA': "v1 1",
-        'ReleaseVersion': "OB54"
-    }
-    
+
+def get_player_info(uid):
     try:
-        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
-        
-        if response.status_code != 200:
-            return "Unknown", uid
-        
-        info = decode_player_info(response.content)
-        data = json.loads(json_format.MessageToJson(info))
-        
-        account = data.get("AccountInfo", {})
-        player_name = account.get("PlayerNickname", "Unknown")
-        player_uid = account.get("UID", uid)
-        
-        return player_name, player_uid
-        
+        url = f"https://info-api-mg24-pro.vercel.app/get?uid={uid}"
+        res = requests.get(url, timeout=10)
+
+        if res.status_code != 200:
+            return None, f"API Error: {res.status_code}"
+
+        data = res.json()
+
+        # basic validation
+        if "AccountInfo" not in data:
+            return None, "Invalid API response"
+
+        return data
+
+    except requests.exceptions.Timeout:
+        return None, "Request timeout"
+
     except Exception as e:
-        print(f"❌ Error getting player info: {e}")
-        return "Unknown", uid
+        return None, str(e)
 
 def send_friend_request_single(uid, token, region="IND"):
     """EXACT SAME as your Flask function but single"""
@@ -814,23 +463,23 @@ def send_friend_request_single(uid, token, region="IND"):
             "Authorization": f"Bearer {token}",
             "X-Unity-Version": "2018.4.11f1",
             "X-GA": "v1 1",
-            "ReleaseVersion": "OB54",
+            "ReleaseVersion": "OB56",
             "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Dalvik/2.1.0"
         }
         
-        print(f"📤 Sending friend request to {uid}...")
+        print(f" Sending friend request to {uid}...")
         response = requests.post(url, data=bytes.fromhex(encrypted_payload), headers=headers, timeout=10, verify=False)
         
         if response.status_code == 200:
-            print(f"✅ Success: Friend request sent to {uid}")
+            print(f" Success: Friend request sent to {uid}")
             return True
         else:
-            print(f"❌ Failed: Status {response.status_code}")
+            print(f" Failed: Status {response.status_code}")
             return False
             
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f" Error: {e}")
         return False    
     
 def start_autooo(self):    
@@ -856,14 +505,26 @@ def start_autooo(self):
     except exception as e:
         print(e)
 
+import sys
 
 def load_credentials_from_file(filename="bot.txt"):
     """
-    Load UID and password from _Apis.txt file
+    Load UID and password from CLI arguments or bot.txt file
     """
     try:
+        if len(sys.argv) >= 3:
+            uid = sys.argv[1]
+            password = sys.argv[2]
+            print(f"[SUCCESS] Loaded credentials from CLI arguments")
+            print(f"[UID] UID: {uid}")
+            
+            # Simple password masking for logs
+            masked_pwd = password[:4] + "..." + password[-4:] if len(password) > 8 else "***"
+            print(f"[PASS] Password: {masked_pwd}")
+            return uid, password
+            
         if not os.path.exists(filename):
-            print(f"❌ {filename} not found!")
+            print(f" {filename} not found!")
             create_credentials_template()
             return None, None
         
@@ -873,36 +534,47 @@ def load_credentials_from_file(filename="bot.txt"):
         uid = None
         password = None
         
-        # Try to find uid and password using regex
-        import re
-        
-        # Look for uid=value or uid: value
-        uid_match = re.search(r'(?:uid\s*[=:]\s*)(\d+)', content, re.IGNORECASE)
-        if uid_match:
-            uid = uid_match.group(1)
-        
-        # Look for password=value or password: value
-        pass_match = re.search(r'(?:password\s*[=:]\s*)([^\s\n\r]+)', content, re.IGNORECASE)
-        if pass_match:
-            password = pass_match.group(1)
+        # Try parsing as JSON first (Web UI format)
+        try:
+            import json
+            data = json.loads(content)
+            if isinstance(data, dict) and len(data) > 0:
+                # If it's a dict, take the first account
+                uid = list(data.keys())[0]
+                password = data[uid]
+                print(f" Loaded credentials from {filename} (JSON format)")
+        except:
+            pass
+            
+        if not uid or not password:
+            import re
+            # Look for uid=value or uid: value
+            uid_match = re.search(r'(?:uid\s*[=:]\s*)(\d+)', content, re.IGNORECASE)
+            if uid_match:
+                uid = uid_match.group(1)
+            
+            # Look for password=value or password: value
+            pass_match = re.search(r'(?:password\s*[=:]\s*)([^\s\n\r]+)', content, re.IGNORECASE)
+            if pass_match:
+                password = pass_match.group(1)
+            
+            if uid and password:
+                print(f" Loaded credentials from {filename} (Legacy format)")
         
         if not uid or not password:
-            print(f"❌ Could not find UID/password in {filename}")
-            print("📝 Please make sure the file contains:")
-            print("   uid=YOUR_UID,password=YOUR_PASSWORD")
-            print("   OR")
-            print("   uid: YOUR_UID")
-            print("   password: YOUR_PASSWORD")
+            print(f" Could not find UID/password in {filename}")
             return None, None
         
-        print(f"✅ Loaded credentials from {filename}")
-        print(f"👤 UID: {uid}")
-        print(f"🔑 Password: {'*' * len(password)}")
+        print(f" Loaded credentials from {filename}")
+        print(f" UID: {uid}")
+        
+        masked_pwd = password[:4] + "..." + password[-4:] if len(password) > 8 else "***"
+        print(f" Password: {masked_pwd}")
         
         return uid, password
         
     except Exception as e:
-        print(f"❌ Error loading credentials: {e}")
+        print(f" Error loading credentials: {e}")
         return None, None
 
 # Load emotes from JSON file (your format)
@@ -911,22 +583,11 @@ def load_emotes_from_json():
     emotes_file = "emotes.json"
     
     try:
-        with open(emotes_file, 'r') as f:
-            emotes_data = json.load(f)
-        
-        # Access using your structure: data["EMOTES"]["numbers"] and data["EMOTES"]["names"]
-        number_emotes = emotes_data.get("EMOTES", {}).get("numbers", {})
-        name_emotes = emotes_data.get("EMOTES", {}).get("names", {})
-        
-        print(f"✅ Loaded {len(number_emotes)} number emotes and {len(name_emotes)} named emotes")
-        return {
-            "numbers": number_emotes,
-            "names": name_emotes
-        }
-        
+        # User requested to disable emote loading to speed up startup
+        print("[SYSTEM] Emote loading disabled for faster startup")
+        return {"numbers": {}, "names": {}}
     except Exception as e:
-        print(f"❌ Error loading {emotes_file}: {e}")
-        # Return empty dictionaries as fallback
+        print(f"[ERROR] Error loading {emotes_file}: {e}")
         return {"numbers": {}, "names": {}}
 
 # Load emotes globally
@@ -979,83 +640,37 @@ def Encrypt(number):
             break
     
     return bytes(encoded_bytes).hex()
-    
 
-async def Room_Spam(Uid, Rm, Nm, K, V):
-   
-    same_value = random.choice([32768])  #you can add any badge value 
-    
-    fields = {
-        1: 78,
-        2: {
-            1: int(Rm),  
-            2: "iG:[C][B][FF0000] APON GMAING 71 ᅠ",  
-            3: {
-                2: 1,
-                3: 1
-            },
-            4: 330,      
-            5: 6000,     
-            6: 201,      
-            10: int(await get_random_avatar()),  
-            11: int(Uid), # Target UID
-            12: 1,       
-            15: {
-                1: 1,
-                2: same_value  
-            },
-            16: same_value,    
-            18: {
-                1: 11481904755,  
-                2: 8,
-                3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"
-            },
-            
-            31: {
-                1: 1,
-                2: same_value  
-            },
-            32: same_value,    
-            34: {
-                1: int(Uid),   
-                2: 8,
-                3: bytes([15,6,21,8,10,11,19,12,17,4,14,20,7,2,1,5,16,3,13,18])
-            }
-        }
-    }
-    
-    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), '0e15', K, V)
-    
-    
+
 async def send_working_join_request(target_uid, key, iv, region, LoGinDaTaUncRypTinG):
     """Send join request that actually works"""
     
     try:
         # Step 1: Reset bot to solo mode
-        print("🔄 Resetting bot to solo mode...")
+        print(" Resetting bot to solo mode...")
         await reset_bot_state(key, iv, region)
         await asyncio.sleep(1)
         
         # Step 2: Create bot's own squad (so it has context)
-        print("🏠 Creating bot squad...")
+        print(" Creating bot squad...")
         squad_packet = await OpEnSq(key, iv, region)
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', squad_packet)
         await asyncio.sleep(1)
         
         # Step 3: Send join request
-        print(f"📨 Sending join request to {target_uid}...")
+        print(f" Sending join request to {xMsGFixinG(target_uid)}...")
         join_packet = await create_working_join_request(target_uid, key, iv, region, LoGinDaTaUncRypTinG)
         
         if join_packet:
             await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
-            print(f"✅ Bot join request sent! Player can now accept.")
+            print(f" Bot join request sent! Player can now accept.")
             return True
         else:
-            print(f"❌ Failed to create join packet")
+            print(f" Failed to create join packet")
             return False
             
     except Exception as e:
-        print(f"❌ Error in working join request: {e}")
+        print(f" Error in working join request: {e}")
         return False
         
 async def handle_join_req_command(inPuTMsG, uid, chat_id, key, iv, region, chat_type, LoGinDaTaUncRypTinG):
@@ -1064,7 +679,7 @@ async def handle_join_req_command(inPuTMsG, uid, chat_id, key, iv, region, chat_
     parts = inPuTMsG.strip().split()
     
     if len(parts) < 2:
-        error_msg = f"""[B][C][FF0000]❌ Usage: /join_req (player_uid)
+        error_msg = f"""[B][C][FF0000] Usage: /join_req (player_uid)
 Example: /join_req 123456789
 
 What happens:
@@ -1072,7 +687,7 @@ What happens:
 2. Bot creates its own squad  
 3. Bot sends join request to player
 4. Player sees: "BotName wants to join your team"
-5. Player clicks Accept → Bot joins player's team
+5. Player clicks Accept  Bot joins player's team
 """
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         return
@@ -1080,20 +695,20 @@ What happens:
     target_uid = parts[1]
     
     if not target_uid.isdigit():
-        error_msg = f"[B][C][FF0000]❌ Invalid UID! Must be numbers only.\n"
+        error_msg = f"[B][C][FF0000] Invalid UID! Must be numbers only.\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         return
     
     # Send initial message
-    initial_msg = f"""[B][C][FFFF00]🤖 BOT JOIN REQUEST INITIATED
+    initial_msg = f"""[B][C][00FF00] BOT JOIN REQUEST INITIATED
 
-👤 Target Player: {target_uid}
-⚙️ Steps:
+ Target Player: {xMsGFixinG(target_uid)}
+ Steps:
 1. Bot resetting to solo mode...
 2. Bot creating squad...
 3. Sending join request...
 
-⏳ Please wait...
+ Please wait...
 """
     await safe_send_message(chat_type, initial_msg, uid, chat_id, key, iv)
     
@@ -1101,20 +716,20 @@ What happens:
         success = await send_working_join_request(target_uid, key, iv, region, LoGinDaTaUncRypTinG)
         
         if success:
-            success_msg = f"""[B][C][FFFF00]✅ BOT JOIN REQUEST SENT!
+            success_msg = f"""[B][C][00FF00] BOT JOIN REQUEST SENT!
 
-🎯 Target: {target_uid}
-🤖 Bot Name: —͞APON GMAING 71 ᅠ
-✅ Status: Ready to join
+ Target: {xMsGFixinG(target_uid)}
+ Bot Name: NAJMI-M24
+ Status: Ready to join
 
-📱 Player will see:
-"—͞APON GMAING 71 ᅠ wants to join your team"
+ Player will see:
+"NAJMI-M24 wants to join your team"
 
-✅ When player clicks ACCEPT:
+ When player clicks ACCEPT:
 Bot will automatically join player's team!
 """
         else:
-            success_msg = f"""[B][C][FF0000]❌ FAILED!
+            success_msg = f"""[B][C][FF0000] FAILED!
 
 Possible reasons:
 1. Bot not connected properly
@@ -1130,10 +745,10 @@ Try again in 10 seconds.
         await asyncio.sleep(3)
         leave_packet = await ExiT(None, key, iv)
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
-        print("🧹 Bot cleaned up (left squad)")
+        print(" Bot cleaned up (left squad)")
         
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Error: {str(e)[:50]}\n"
+        error_msg = f"[B][C][FF0000] Error: {str(e)[:50]}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)        
         
 async def create_simple_start_packet(key, iv):
@@ -1155,7 +770,7 @@ async def create_simple_start_packet(key, iv):
     # Generate final packet
     final_packet = await GeneRaTePk(packet_hex, '0514', key, iv)  # Use appropriate packet type
     
-    print(f"✅ Simple start match packet created")
+    print(f" Simple start match packet created")
     return final_packet
     
 async def create_detailed_start_packet(key, iv, region="IND"):
@@ -1197,7 +812,7 @@ async def create_detailed_start_packet(key, iv, region="IND"):
         
     final_packet = await GeneRaTePk(packet_hex, packet_type, key, iv)
     
-    print(f"✅ Detailed start match packet created")
+    print(f" Detailed start match packet created")
     return final_packet
         
 async def generate_guest_accounts(count=1, name="BlackApis", password_prefix="FF"):
@@ -1208,7 +823,7 @@ async def generate_guest_accounts(count=1, name="BlackApis", password_prefix="FF
     failed_attempts = 0
     max_retries = 10
     
-    print(f"📡 Generating {count} guest accounts...")
+    print(f" Generating {count} guest accounts...")
     
     for i in range(count):
         retry_count = 0
@@ -1216,7 +831,7 @@ async def generate_guest_accounts(count=1, name="BlackApis", password_prefix="FF
         
         while retry_count < max_retries and not success:
             try:
-                print(f"🔄 Attempt {retry_count + 1}/{max_retries} for account {i + 1}/{count}...")
+                print(f" Attempt {retry_count + 1}/{max_retries} for account {i + 1}/{count}...")
                 
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
                     async with session.get(api_url) as response:
@@ -1232,42 +847,42 @@ async def generate_guest_accounts(count=1, name="BlackApis", password_prefix="FF
                                     'timestamp': time.time()
                                 }
                                 accounts.append(account)
-                                print(f"✅ Account {i + 1}: {account['uid']}")
+                                print(f" Account {i + 1}: {account['uid']}")
                                 success = True
                                 failed_attempts = 0  # Reset failed attempts counter
                                 
                             else:
-                                print(f"❌ API error: {data.get('message', 'Unknown error')}")
+                                print(f" API error: {data.get('message', 'Unknown error')}")
                                 retry_count += 1
                                 await asyncio.sleep(2)
                                 
                         elif response.status == 503:
-                            print(f"⚠️ Server busy (503), retrying in 3 seconds...")
+                            print(f" Server busy (503), retrying in 3 seconds...")
                             retry_count += 1
                             await asyncio.sleep(3)
                             
                         else:
-                            print(f"❌ HTTP {response.status}, retrying...")
+                            print(f" HTTP {response.status}, retrying...")
                             retry_count += 1
                             await asyncio.sleep(2)
                             
             except asyncio.TimeoutError:
-                print(f"⏰ Timeout, retrying...")
+                print(f" Timeout, retrying...")
                 retry_count += 1
                 await asyncio.sleep(2)
                 
             except Exception as e:
-                print(f"❌ Error: {str(e)[:50]}...")
+                print(f" Error: {str(e)[:50]}...")
                 retry_count += 1
                 await asyncio.sleep(2)
         
         if not success:
-            print(f"❌ Failed to generate account {i + 1} after {max_retries} attempts")
+            print(f" Failed to generate account {i + 1} after {max_retries} attempts")
             failed_attempts += 1
             
             # If too many failures in a row, stop
             if failed_attempts >= 3:
-                print("🛑 Too many failures, stopping...")
+                print(" Too many failures, stopping...")
                 break
         
         # Small delay between accounts to avoid rate limiting
@@ -1292,19 +907,19 @@ def save_guest_accounts(accounts, filename="guest_accounts.json"):
         with open(filename, 'w') as f:
             json.dump(all_accounts, f, indent=2)
         
-        print(f"💾 Saved {len(accounts)} accounts to {filename}")
-        print(f"📊 Total accounts: {len(all_accounts)}")
+        print(f" Saved {len(accounts)} accounts to {filename}")
+        print(f" Total accounts: {len(all_accounts)}")
         
         return True
     except Exception as e:
-        print(f"❌ Error saving accounts: {e}")
+        print(f" Error saving accounts: {e}")
         return False
 
 async def generate_and_save_accounts(count, name="BlackApis", password_prefix="FF"):
     """Generate and save accounts with progress updates"""
     start_time = time.time()
     
-    print(f"\n🎯 GENERATING {count} GUEST ACCOUNTS")
+    print(f"\n GENERATING {count} GUEST ACCOUNTS")
     print("="*50)
     
     accounts = await generate_guest_accounts(count, name, password_prefix)
@@ -1316,14 +931,14 @@ async def generate_and_save_accounts(count, name="BlackApis", password_prefix="F
         # Display results
         elapsed = time.time() - start_time
         print("\n" + "="*50)
-        print("📊 GENERATION COMPLETE")
+        print(" GENERATION COMPLETE")
         print("="*50)
-        print(f"✅ Success: {len(accounts)}/{count} accounts")
-        print(f"⏱️ Time: {elapsed:.1f} seconds")
-        print(f"📁 Saved to: guest_accounts.json")
+        print(f" Success: {len(accounts)}/{count} accounts")
+        print(f" Time: {elapsed:.1f} seconds")
+        print(f" Saved to: guest_accounts.json")
         
         # Show first 3 accounts as preview
-        print("\n📋 FIRST 3 ACCOUNTS:")
+        print("\n FIRST 3 ACCOUNTS:")
         for i, acc in enumerate(accounts[:3]):
             print(f"  {i+1}. UID: {acc['uid']} | Pass: {acc['password']}")
         
@@ -1344,14 +959,14 @@ async def start_match(key, iv, region, detailed=False):
         if start_packet:
             # Send via Online connection
             await SEndPacKeT(whisper_writer, online_writer, 'OnLine', start_packet)
-            print("🎮 Start match packet sent!")
+            print(" Start match packet sent!")
             return True
         else:
-            print("❌ Failed to create start packet")
+            print(" Failed to create start packet")
             return False
             
     except Exception as e:
-        print(f"❌ Error starting match: {e}")
+        print(f" Error starting match: {e}")
         return False       
         
 async def handle_start_match_command(inPuTMsG, uid, chat_id, key, iv, region, chat_type):
@@ -1365,11 +980,11 @@ async def handle_start_match_command(inPuTMsG, uid, chat_id, key, iv, region, ch
         detailed = True
     
     # Send initial message
-    initial_msg = f"""[B][C][FFFF00]🎮 STARTING MATCH...
+    initial_msg = f"""[B][C][00FF00] STARTING MATCH...
 
-⚙️ Mode: {'Detailed' if detailed else 'Simple'}
-🤖 Bot must be in a squad!
-⏳ Please wait...
+ Mode: {'Detailed' if detailed else 'Simple'}
+ Bot must be in a squad!
+ Please wait...
 """
     await safe_send_message(chat_type, initial_msg, uid, chat_id, key, iv)
     
@@ -1377,17 +992,17 @@ async def handle_start_match_command(inPuTMsG, uid, chat_id, key, iv, region, ch
         success = await start_match(key, iv, region, detailed)
         
         if success:
-            success_msg = f"""[B][C][FFFF00]✅ MATCH START COMMAND SENT!
+            success_msg = f"""[B][C][00FF00] MATCH START COMMAND SENT!
 
-📋 Details:
-• Type: {'Detailed device info' if detailed else 'Simple start'}
-• Status: Match starting...
-• Requirement: Bot must be squad leader
+ Details:
+ Type: {'Detailed device info' if detailed else 'Simple start'}
+ Status: Match starting...
+ Requirement: Bot must be squad leader
 
-🎯 If bot is squad leader, match will begin!
+ If bot is squad leader, match will begin!
 """
         else:
-            success_msg = f"""[B][C][FF0000]❌ FAILED TO START MATCH!
+            success_msg = f"""[B][C][FF0000] FAILED TO START MATCH!
 
 Possible reasons:
 1. Bot not in a squad
@@ -1395,36 +1010,36 @@ Possible reasons:
 3. Invalid packet structure
 4. Server connection issue
 
-💡 Make sure bot is in a squad as leader!
+ Make sure bot is in a squad as leader!
 """
         
         await safe_send_message(chat_type, success_msg, uid, chat_id, key, iv)
         
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Error: {str(e)[:50]}\n"
+        error_msg = f"[B][C][FF0000] Error: {str(e)[:50]}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         
 async def debug_start_match():
     """Debug function to test start packets"""
     
-    print("🔍 Analyzing start packets...")
+    print(" Analyzing start packets...")
     print(f"Simple packet hex: 00 00 00 d6")
     print(f"Decimal value: {int('d6', 16)} = 214")
     
     # Try to decode the detailed packet
     detailed_hex = "0a8d010808100b180122047669766f2a02313330f6a8858c023a0961726d36342d76386142004a2466353338646339622d636563392d343363642d383132352d393566376634663166376533522a4646443538464234463736463634384332413545323145424346413341414538314234433942374439375a05766f69636562055632303539680172066d74363738351241464644353846423446373646363438433241354532314542434641334141453831423443394237443937494e445f31393939313230373532363130393739383430188d01"
     
-    print(f"\n📊 Detailed packet length: {len(detailed_hex)//2} bytes")
+    print(f"\n Detailed packet length: {len(detailed_hex)//2} bytes")
     print(f"First bytes: {detailed_hex[:20]}...")
     
     # Try to parse as protobuf
     try:
         from protobuf_decoder.protobuf_decoder import Parser
         parsed = Parser().parse(bytes.fromhex(detailed_hex))
-        print(f"\n✅ Parsed detailed packet:")
+        print(f"\n Parsed detailed packet:")
         print(parsed)
     except Exception as e:
-        print(f"❌ Could not parse: {e}")
+        print(f" Could not parse: {e}")
         
 
 
@@ -1441,7 +1056,7 @@ async def check_player_status(target_uid, key, iv, max_wait=3):
             return None, "Failed to create packet"
         
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', status_packet)
-        print(f"📤 Sent status request for {target_uid}")
+        print(f" Sent status request for {xMsGFixinG(target_uid)}")
         
         # Wait for response with polling
         start_time = time.time()
@@ -1525,53 +1140,83 @@ def parse_results(parsed_results):
         elif result.wire_type == "length_delimited":
             field_data["data"] = parse_results(result.data.results)
         result_dict[result.field] = field_data
-    return result_dict  # ← ADD THIS LINE
+    return result_dict  #  ADD THIS LINE
 
 def get_player_status(packet):
-    """Get player status from packet"""
+    """Get player full info from packet"""
     json_result = get_available_room(packet)
     if not json_result:
-        return "OFFLINE"
+        return {"status": "OFFLINE"}
     
     parsed_data = json.loads(json_result)
     
     if "5" not in parsed_data or "data" not in parsed_data["5"]:
-        return "OFFLINE"
+        return {"status": "OFFLINE"}
     
     json_data = parsed_data["5"]["data"]
     
     if "1" not in json_data or "data" not in json_data["1"]:
-        return "OFFLINE"
+        return {"status": "OFFLINE"}
     
     data = json_data["1"]["data"]
     
-    if "3" not in data:
-        return "OFFLINE"
+    info = {
+        "nickname": "Unknown",
+        "level": "---",
+        "region": "---",
+        "likes": "---",
+        "status": "OFFLINE",
+        "last_online": None,
+        "create_time": None
+    }
+
+    # Extract nickname (Field 2)
+    if "2" in data and "data" in data["2"]:
+        info["nickname"] = data["2"]["data"]
     
-    status_data = data["3"]
-    
-    if "data" not in status_data:
-        return "OFFLINE"
-    
-    status = status_data["data"]
-    
-    if status == 1:
-        return "SOLO"
-    if status == 2:
-        if "9" in data and "data" in data["9"]:
-            group_count = data["9"]["data"]
-            countmax1 = data["10"]["data"]
-            countmax = countmax1 + 1
-            return f"INSQUAD ({group_count}/{countmax})"
-        return "INSQUAD"
-    if status in [3, 5]:
-        return "INGAME"
-    if status == 4:
-        return "IN ROOM"
-    if status in [6, 7]:
-        return "IN SOCIAL ISLAND MODE"
-    
-    return "NOTFOUND"
+    # Extract level (Field 4)
+    if "4" in data and "data" in data["4"]:
+        info["level"] = data["4"]["data"]
+        
+    # Extract region (Field 5)
+    if "5" in data and "data" in data["5"]:
+        info["region"] = data["5"]["data"]
+
+    # Extract likes (Field 6)
+    if "6" in data and "data" in data["6"]:
+        info["likes"] = data["6"]["data"]
+
+    # Extract last online (Field 11) - sometimes timestamp
+    if "11" in data and "data" in data["11"]:
+        info["last_online"] = data["11"]["data"]
+
+    # Extract status (Field 3)
+    if "3" in data and "data" in data["3"]:
+        status = data["3"]["data"]
+        if status == 1:
+            info["status"] = "SOLO"
+        elif status == 2:
+            if "9" in data and "data" in data["9"]:
+                group_count = data["9"]["data"]
+                countmax1 = data["10"]["data"]
+                countmax = countmax1 + 1
+                info["status"] = f"INSQUAD ({group_count}/{countmax})"
+            else:
+                info["status"] = "INSQUAD"
+        elif status in [3, 5]:
+            info["status"] = "INGAME"
+        elif status == 4:
+            info["status"] = "IN ROOM"
+        elif status in [6, 7]:
+            info["status"] = "IN SOCIAL ISLAND MODE"
+        else:
+            info["status"] = "ONLINE"
+
+    # Extract Room ID (Field 15)
+    if "15" in data and "data" in data["15"]:
+        info["room_id"] = data["15"]["data"]
+
+    return info
 
 def get_idroom_by_idplayer(packet):
     """Extract room ID from player info packet"""
@@ -1619,10 +1264,311 @@ async def handle_status_response(hex_data):
             'data': cache_entry
         })
         
-        print(f"📤 Queued status for {player_id}")
+        print(f" Queued status for {xMsGFixinG(target_uid)}")
         
     except Exception as e:
-        print(f"❌ Queue error: {e}")
+        print(f" Queue error: {e}")
+
+async def reset_bot_state(key, iv, region):
+    """Ensure bot is not in any squad before continuing"""
+    try:
+        leave_packet = await ExiT(0, key, iv)
+        if leave_packet and online_writer:
+            online_writer.write(leave_packet)
+            await online_writer.drain()
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        print(f" Could not reset bot state: {e}")
+
+async def handle_ipc(reader, writer, key, iv, region):
+    while True:
+        try:
+            data = await reader.read(1024)
+            if not data:
+                break
+                
+            command = data.decode('utf-8').strip()
+            print(f" Received Web Command: {command}")
+            global TOTAL_IPC_COMMANDS
+            TOTAL_IPC_COMMANDS += 1
+            
+            if command == "START_CS":
+                packet = await create_simple_start_packet(key, iv)
+                if packet:
+                    if online_writer:
+                        online_writer.write(packet)
+                        await online_writer.drain()
+                    writer.write(b"OK\n")
+                else:
+                    writer.write(b"ERROR\n")
+            elif command == "CREATE_SQUAD":
+                is_locked, lock_sid = is_bot_locked()
+                if is_locked:
+                    writer.write(f"ERROR: Bot is currently locked in session {lock_sid}\n".encode())
+                    continue
+                try:
+                    await reset_bot_state(key, iv, region)
+                    squad_packet = await OpEnSq(key, iv, region)
+                    if squad_packet and online_writer:
+                        online_writer.write(squad_packet)
+                        await online_writer.drain()
+                        
+                        try:
+                            # Set to 4-player squad configuration like in /4
+                            c_packet = await cHSq(4, 0, key, iv, region) # 0 can be replaced if UID needed
+                            if c_packet:
+                                online_writer.write(c_packet)
+                                await online_writer.drain()
+                        except Exception as e:
+                            print(f" Warning: cHSq failed: {e}")
+                                
+                        writer.write(b"OK\n")
+                    else:
+                        writer.write(b"ERROR\n")
+                except Exception as e:
+                    print(f" CREATE_SQUAD Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    writer.write(b"ERROR\n")
+            elif command.startswith("JOIN_SQUAD"):
+                is_locked, lock_sid = is_bot_locked()
+                if is_locked:
+                    writer.write(f"ERROR: Bot is currently locked in session {lock_sid}\n".encode())
+                    continue
+                parts = command.split()
+                if len(parts) >= 2:
+                    team_code = parts[1]
+                    print(f" Joining squad with team code: {team_code}")
+                    try:
+                        join_packet = await GenJoinSquadsPacket(team_code, key, iv)
+                        if join_packet and online_writer:
+                            online_writer.write(join_packet)
+                            await online_writer.drain()
+                            print(f" Sent join squad packet for code: {team_code}")
+                            writer.write(b"OK\n")
+                        else:
+                            print(f" Failed to generate join packet or online_writer missing!")
+                            writer.write(b"ERROR\n")
+                    except Exception as e:
+                        print(f" JOIN_SQUAD Error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        writer.write(b"ERROR\n")
+                else:
+                    writer.write(b"ERROR\n")
+            elif command.startswith("GROUP_EXPLOIT"):
+                is_locked, lock_sid = is_bot_locked()
+                if is_locked:
+                    writer.write(f"ERROR: Bot is currently locked in session {lock_sid}\n".encode())
+                    continue
+                parts = command.split()
+                if len(parts) >= 2:
+                    target_uid = parts[1]
+                    slot = int(parts[2]) if len(parts) > 2 else 5
+                    print(f" [EXPLOIT] Web requested {slot}-player exploit for: {target_uid}")
+                    try:
+                        # Step 1: Open Squad
+                        PAc = await OpEnSq(key, iv, region)
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', PAc)
+                        
+                        # Step 2: Change Squad Slot
+                        C = await cHSq(slot, target_uid, key, iv, region)
+                        await asyncio.sleep(0.3)
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', C)
+                        
+                        # Step 3: Send Invitation for slot
+                        V = await SEnd_InV(slot, target_uid, key, iv, region)
+                        await asyncio.sleep(0.3)
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', V)
+                        
+                        # Step 4: Exit after delay
+                        async def delayed_exit():
+                            await asyncio.sleep(3.5)
+                            E = await ExiT(None, key, iv)
+                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', E)
+                            print(f" [EXPLOIT] Sequence finished for {target_uid} (Slot {slot})")
+                        
+                        asyncio.create_task(delayed_exit())
+                        
+                        writer.write(f"SUCCESS: {slot}-Player sequence triggered\n".encode())
+                    except Exception as e:
+                        print(f" GROUP_EXPLOIT Error: {e}")
+                        writer.write(f"ERROR: {str(e)}\n".encode())
+                else:
+                    writer.write(b"ERROR\n")
+            elif command.startswith("INVITE"):
+                parts = command.split()
+                if len(parts) >= 2:
+                    target_uid = parts[1]
+                    slot = parts[2] if len(parts) > 2 else "4"
+                    print(f" [IPC] Web requested invite for {target_uid} in slot {slot}")
+                    try:
+                        V = await SEnd_InV(int(slot), int(target_uid), key, iv, region)
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', V)
+                        writer.write(b"SUCCESS: Invite sent\n")
+                    except Exception as e:
+                        writer.write(f"ERROR: {str(e)}\n".encode())
+                else:
+                    writer.write(b"ERROR: UID required\n")
+
+            elif command.startswith("LIKE"):
+                parts = command.split()
+                if len(parts) >= 2:
+                    target_uid = parts[1]
+                    print(f" [IPC] Web requested likes for {target_uid}")
+                    try:
+                        result = send_likes(target_uid)
+                        writer.write(f"SUCCESS: {result}\n".encode())
+                    except Exception as e:
+                        writer.write(f"ERROR: {str(e)}\n".encode())
+                else:
+                    writer.write(b"ERROR: UID required\n")
+
+            elif command.startswith("CHECK_BAN"):
+                parts = command.split()
+                if len(parts) >= 2:
+                    target_uid = parts[1]
+                    print(f" [IPC] Web requested ban check for {target_uid}")
+                    try:
+                        result = check_ban(target_uid)
+                        writer.write(f"SUCCESS: {result}\n".encode())
+                    except Exception as e:
+                        writer.write(f"ERROR: {str(e)}\n".encode())
+                else:
+                    writer.write(b"ERROR: UID required\n")
+
+            elif command.startswith("KICK"):
+                parts = command.split()
+                if len(parts) >= 2:
+                    target_uid = parts[1]
+                    print(f" [IPC] Web requested kick for {target_uid}")
+                    try:
+                        PAc = await KickTarget(target_uid, key, iv)
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', PAc)
+                        writer.write(b"SUCCESS: Kick packet sent\n")
+                    except Exception as e:
+                        writer.write(f"ERROR: {str(e)}\n".encode())
+                else:
+                    writer.write(b"ERROR: UID required\n")
+
+            elif command.startswith("ROOM_MSG"):
+                msg = command[9:].strip()
+                print(f" [IPC] Web requested room message: {msg}")
+                try:
+                    await handle_room_message_command(f"/roommsg {msg}", "WEB", "WEB", key, iv, region, 1)
+                    writer.write(b"SUCCESS: Room message sent\n")
+                except Exception as e:
+                    writer.write(f"ERROR: {str(e)}\n".encode())
+
+            elif command.startswith("FAST_EMOTE"):
+                parts = command.split()
+                if len(parts) >= 4:
+                    target_identifier = parts[1]
+                    target_uids = parts[2]
+                    emote_id = parts[3]
+                    mode = parts[4] if len(parts) > 4 else "quit"
+                    # Ensure bot's TCP connection to Free Fire is ready
+                    if online_writer is None:
+                        for _ in range(20):
+                            await asyncio.sleep(0.2)
+                            if online_writer is not None:
+                                break
+
+                    if online_writer is None:
+                        writer.write(b"ERROR: Bot online socket is connecting. Try next bot.\n")
+                    else:
+                        print(f"⚡ [IPC] Fast Emote requested: Target={target_identifier}, UIDs={target_uids}, Emote={emote_id}, Mode={mode}")
+                        try:
+                            success, result_dict = await fast_squad_emote_attack(target_identifier, target_uids, emote_id, key, iv, region, mode=mode)
+                            if success:
+                                res_str = json.dumps(result_dict)
+                                writer.write(f"SUCCESS: {res_str}\n".encode())
+                            else:
+                                writer.write(f"ERROR: {result_dict.get('message', 'Failed')}\n".encode())
+                        except Exception as e:
+                            writer.write(f"ERROR: {str(e)}\n".encode())
+                else:
+                    writer.write(b"ERROR: Usage: FAST_EMOTE target uids emote_id [mode]\n")
+            
+            elif command.startswith("GET_STATS"):
+                parts = command.split()
+                if len(parts) >= 2:
+                    target_uid = parts[1]
+                    print(f" Web requested stats for: {target_uid}")
+                    try:
+                        # 1. Clear old cache
+                        clear_cache_entry(target_uid)
+                        
+                        # 2. Create and send packet
+                        status_packet = await createpacketinfo(target_uid, key, iv)
+                        if status_packet and online_writer:
+                            online_writer.write(status_packet)
+                            await online_writer.drain()
+                            
+                            # 3. Wait for response in cache
+                            max_retries = 10
+                            response_received = False
+                            for attempt in range(max_retries):
+                                cache_data = load_from_cache(target_uid)
+                                if cache_data:
+                                    # Return the cache data as JSON
+                                    writer.write(json.dumps(cache_data).encode('utf-8') + b"\n")
+                                    response_received = True
+                                    break
+                                await asyncio.sleep(0.5)
+                            
+                            if not response_received:
+                                writer.write(json.dumps({"status": "OFFLINE", "error": "No response from server"}).encode('utf-8') + b"\n")
+                        else:
+                            writer.write(json.dumps({"error": "Failed to send request"}).encode('utf-8') + b"\n")
+                    except Exception as e:
+                        print(f" GET_STATS Error: {e}")
+                        writer.write(json.dumps({"error": str(e)}).encode('utf-8') + b"\n")
+                else:
+                    writer.write(b"ERROR\n")
+
+            elif command == "GET_BOT_STATUS":
+                try:
+                    cleanup_expired_sessions()
+                    current_uid = sys.argv[1] if len(sys.argv) > 1 else "14010319252"
+                    is_locked_flag, lock_sid = is_bot_locked()
+                    lock_info = None
+                    if ACTIVE_LOCK_SESSIONS:
+                        first_sid = list(ACTIVE_LOCK_SESSIONS.keys())[0]
+                        session_data = ACTIVE_LOCK_SESSIONS[first_sid]
+                        elapsed = int(time.time() - session_data.get("created_at", time.time()))
+                        rem = max(0, LOCK_SESSION_MAX_TIMEOUT - elapsed)
+                        lock_info = {
+                            "session_id": first_sid,
+                            "team_code": session_data.get("team_code"),
+                            "elapsed_seconds": elapsed,
+                            "remaining_seconds": rem
+                        }
+                    
+                    status_dict = {
+                        "bot_uid": str(current_uid),
+                        "online": online_writer is not None,
+                        "insquad": insquad is not None and insquad != False,
+                        "insquad_detail": str(insquad) if insquad else None,
+                        "squad_member_count": SQUAD_MEMBER_COUNT,
+                        "is_locked": is_locked_flag,
+                        "lock_session_id": lock_sid,
+                        "lock_info": lock_info,
+                        "uptime_seconds": int(time.time() - BOT_START_TIME),
+                        "total_ipc_commands": TOTAL_IPC_COMMANDS
+                    }
+                    writer.write(f"SUCCESS: {json.dumps(status_dict)}\n".encode())
+                except Exception as e:
+                    writer.write(f"ERROR: {str(e)}\n".encode())
+
+            await writer.drain()
+
+        except Exception as e:
+            print(f" IPC Error: {e}")
+            break
+            
+    writer.close()
+    await writer.wait_closed()
 
 # In TcPChaT, add a queue consumer
 async def cache_consumer():
@@ -1632,10 +1578,10 @@ async def cache_consumer():
             item = await status_queue.get()
             player_id = item['player_id']
             cache_dict[player_id] = item['data']
-            print(f"📥 Cache updated for {player_id}")
+            print(f"[CACHE] Cache updated for {xMsGFixinG(player_id)}")
             status_queue.task_done()
         except Exception as e:
-            print(f"❌ Consumer error: {e}")
+            print(f"[ERROR] Consumer error: {e}")
         await asyncio.sleep(0.1)
 
 
@@ -1647,7 +1593,11 @@ async def StarTinG():
     
     while True:
         try:
-            await asyncio.wait_for(MaiiiinE(), timeout = 7 * 60 * 60)
+            result = await asyncio.wait_for(MaiiiinE(), timeout = 7 * 60 * 60)
+            if result is None:
+                print("[ERROR] Bot encountered a fatal error (e.g., bad login) and will stop.")
+                consumer_task.cancel()
+                break
         except KeyboardInterrupt:
             consumer_task.cancel()
             break
@@ -1686,10 +1636,10 @@ def save_to_cache(player_id, data):
         with open(CACHE_FILE, 'wb') as f:
             pickle.dump(cache, f)
         
-        print(f"💾 Saved to file cache: {player_id}")
+        print(f"[SAVE] Saved to file cache: {xMsGFixinG(player_id)}")
         return True
     except Exception as e:
-        print(f"❌ Cache save error: {e}")
+        print(f"[ERROR] Cache save error: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -1710,18 +1660,18 @@ def load_from_cache(player_id):
             # Check if cache is expired
             if 'saved_at' in data:
                 if time.time() - data['saved_at'] > CACHE_TIMEOUT:
-                    print(f"⏰ Cache expired for {player_id}")
+                    print(f"[EXPIRED] Cache expired for {xMsGFixinG(player_key)}")
                     del cache[player_key]
                     with open(CACHE_FILE, 'wb') as f:
                         pickle.dump(cache, f)
                     return None
             
-            print(f"📥 Loaded from cache: {player_id}")
+            print(f"[CACHE] Loaded from cache: {xMsGFixinG(player_key)}")
             return data
         
         return None
     except Exception as e:
-        print(f"❌ Cache load error: {e}")
+        print(f"[ERROR] Cache load error: {e}")
         return None
 
 def clear_cache_entry(player_id):
@@ -1737,9 +1687,9 @@ def clear_cache_entry(player_id):
                 
             with open(CACHE_FILE, 'wb') as f:
                 pickle.dump(cache, f)
-            print(f"🗑️ Cleared cache for {player_id}")
+            print(f"[CLEARED] Cleared cache for {xMsGFixinG(player_key)}")
     except Exception as e:
-        print(f"❌ Clear cache error: {e}")
+        print(f"[ERROR] Clear cache error: {e}")
 
 def debug_file_cache():
     """Debug the file cache"""
@@ -1747,7 +1697,7 @@ def debug_file_cache():
         if os.path.exists(CACHE_FILE):
             with open(CACHE_FILE, 'rb') as f:
                 cache = pickle.load(f)
-            print(f"\n📁 FILE CACHE DEBUG:")
+            print(f"\n[FILE_CACHE] FILE CACHE DEBUG:")
             print(f"Size: {len(cache)} entries")
             for uid, data in cache.items():
                 age = time.time() - data.get('saved_at', 0)
@@ -1756,10 +1706,10 @@ def debug_file_cache():
             print("---\n")
             return cache
         else:
-            print("📁 No cache file exists")
+            print(" No cache file exists")
             return {}
     except Exception as e:
-        print(f"❌ Cache debug error: {e}")
+        print(f"[ERROR] Cache debug error: {e}")
         return {}
 
 def load_from_cache(player_id):
@@ -1775,7 +1725,7 @@ def load_from_cache(player_id):
             return cache[player_id]
         return None
     except Exception as e:
-        print(f"❌ Cache load error: {e}")
+        print(f"[ERROR] Cache load error: {e}")
         return None
 
 def clear_cache_entry(player_id):
@@ -1825,7 +1775,7 @@ def clear_cache_entry(player_id):
                         return open_id, access_token
             return None, None
         except Exception as e:
-            print(f"❌ Error getting token for {uid}: {e}")
+            print(f" Error getting token for {uid}: {e}")
             return None, None
     
     async def send_join_from_account(self, target_uid, account_uid, password, key, iv, region):
@@ -1844,7 +1794,7 @@ def clear_cache_entry(player_id):
             return False
             
         except Exception as e:
-            print(f"❌ Error sending join from {account_uid}: {e}")
+            print(f" Error sending join from {account_uid}: {e}")
             return False
 
 async def join_custom_room(room_id, room_password, key, iv, region):
@@ -1899,65 +1849,90 @@ async def leave_squad(key, iv, region):
         
     return await GeneRaTePk(packet, packet_type, key, iv)    
     
-async def request_join_with_badge(target_uid, badge_value, key, iv, region):
-    """Send join request with specific badge - converted from your old TCP"""
-    fields = {
-        1: 33,
-        2: {
-            1: int(target_uid),
-            2: region.upper(),
-            3: 1,
-            4: 1,
-            5: bytes([1, 7, 9, 10, 11, 18, 25, 26, 32]),
-            6: "iG:[C][B][FF0000] —͞APON GMAING 71 ᅠ",
-            7: 330,
-            8: 1000,
-            10: region.upper(),
-            11: bytes([49, 97, 99, 52, 98, 56, 48, 101, 99, 102, 48, 52, 55, 56,
-                       97, 52, 52, 50, 48, 51, 98, 102, 56, 102, 97, 99, 54, 49, 50, 48, 102, 53]),
-            12: 1,
-            13: int(target_uid),
-            14: {
-                1: 2203434355,
-                2: 8,
-                3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"
-            },
-            16: 1,
-            17: 1,
-            18: 312,
-            19: 46,
-            23: bytes([16, 1, 24, 1]),
-            24: int(await get_random_avatar()),
-            26: "",
-            28: "",
-            31: {
-                1: 1,
-                2: badge_value  # Dynamic badge value
-            },
-            32: badge_value,    # Dynamic badge value
-            34: {
-                1: int(target_uid),
-                2: 8,
-                3: bytes([15,6,21,8,10,11,19,12,17,4,14,20,7,2,1,5,16,3,13,18])
-            }
-        },
-        10: "en",
-        13: {
-            2: 1,
-            3: 1
-        }
-    }
-    
-    packet = (await CrEaTe_ProTo(fields)).hex()
-    
-    if region.lower() == "ind":
-        packet_type = '0514'
-    elif region.lower() == "bd":
-        packet_type = "0519"
-    else:
-        packet_type = "0515"
+async def request_join_with_badge(target_uid, badge_value, key, iv, region="IND"):
+    """Fixed badge spam function matching craftland_badge structure"""
+    try:
+        # Get random avatar
+        avatar_id = int(await xBunnEr())
         
-    return await GeneRaTePk(packet, packet_type, key, iv)    
+        fields = {
+            1: 33,  # Packet type
+            2: {
+                1: int(target_uid),        # Target UID
+                2: region.upper(),        # Country code
+                3: 1,                     # Status 1
+                4: 1,                     # Status 2
+                5: bytes([1, 7, 9, 10, 11, 18, 25, 26, 32]),  # Numbers field
+                6: "iG:[C][B][FF0000] @hn_gaming99",  # Nickname
+                7: 330,                   # Rank
+                8: 1000,                  # Field 8
+                10: region.upper(),       # Region code
+                11: bytes([              # UUID
+                    49, 97, 99, 52, 98, 56, 48, 101, 99, 102, 48, 52, 55, 56,
+                    97, 52, 52, 50, 48, 51, 98, 102, 56, 102, 97, 99, 54, 49,
+                    50, 48, 102, 53
+                ]),
+                12: 1,                    # Field 12
+                13: int(target_uid),      # Repeated UID
+                14: {                    # Field 14 (nested)
+                    1: 2203434355,
+                    2: 8,
+                    3: b"\x10\x15\x08\x0A\x0B\x13\x0C\x0F\x11\x04\x07\x02\x03\x0D\x0E\x12\x01\x05\x06"
+                },
+                16: 1,                    # Field 16
+                17: 1,                    # Field 17
+                18: 312,                  # Field 18
+                19: 46,                   # Field 19
+                23: bytes([16, 1, 24, 1]), # Field 23
+                24: avatar_id,            # Avatar ID
+                26: {},                   # Empty field 26
+                27: {                    # Field 27 (critical for badge!)
+                    1: 11,               # Field 27.1
+                    2: 13777711848,      # Field 27.2 (your bot UID)
+                    3: 9999              # Field 27.3
+                },
+                28: {},                   # Empty field 28
+                31: {                    # Field 31 (badge value here too)
+                    1: 1,
+                    2: int(badge_value)  # BADGE VALUE
+                },
+                32: int(badge_value),     # Field 32 (badge value again)
+                34: {                    # Field 34
+                    1: int(target_uid),  # Target UID again
+                    2: 8,
+                    3: b"\x0F\x06\x15\x08\x0A\x0B\x13\x0C\x11\x04\x0E\x14\x07\x02\x01\x05\x10\x03\x0D\x12"
+                }
+            },
+            10: "en",                     # Language
+            13: {                        # Field 13
+                2: 1,
+                3: 1
+            }
+        }
+        
+        # Convert to protobuf
+        proto_bytes = await CrEaTe_ProTo(fields)
+        packet_hex = proto_bytes.hex()
+        
+        # Determine packet type based on region
+        if region.lower() == "ind":
+            packet_type = '0514'
+        elif region.lower() == "bd":
+            packet_type = "0519"
+        else:
+            packet_type = "0515"
+            
+        # Generate final encrypted packet
+        final_packet = await GeneRaTePk(packet_hex, packet_type, key, iv)
+        
+        print(f" Created badge packet with value {badge_value} for UID {xMsGFixinG(target_uid)}")
+        return final_packet
+        
+    except Exception as e:
+        print(f" Error creating badge packet: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
     
 async def reset_bot_state(key, iv, region):
     """Reset bot to solo mode before spam - Critical step from your old TCP"""
@@ -1967,11 +1942,11 @@ async def reset_bot_state(key, iv, region):
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
         await asyncio.sleep(0.5)
         
-        print("✅ Bot state reset - left squad")
+        print(" Bot state reset - left squad")
         return True
         
     except Exception as e:
-        print(f"❌ Error resetting bot: {e}")
+        print(f" Error resetting bot: {e}")
         return False    
     
 async def create_custom_room(room_name, room_password, max_players, key, iv, region):
@@ -2011,7 +1986,7 @@ async def handle_badge_command(cmd, inPuTMsG, uid, chat_id, key, iv, region, cha
     """Handle individual badge commands"""
     parts = inPuTMsG.strip().split()
     if len(parts) < 2:
-        error_msg = f"[B][C][FF0000]❌ Usage: /{cmd} (uid)\nExample: /{cmd} 123456789\n"
+        error_msg = f"[B][C][FF0000] Usage: /{cmd} (uid)\nExample: /{cmd} 123456789\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         return
     
@@ -2019,46 +1994,49 @@ async def handle_badge_command(cmd, inPuTMsG, uid, chat_id, key, iv, region, cha
     badge_value = BADGE_VALUES.get(cmd, 1048576)
     
     if not target_uid.isdigit():
-        error_msg = f"[B][C][FF0000]❌ Please write a valid player ID!\n"
+        error_msg = f"[B][C][FF0000] Please write a valid player ID!\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         return
     
     # Send initial message
-    initial_msg = f"[B][C][1E90FF]🌀 Request received! Preparing to spam {target_uid}...\n"
+    initial_msg = f"[B][C][1E90FF] Request received! Preparing to send {cmd} ({badge_value}) to {xMsGFixinG(target_uid)}...\n"
     await safe_send_message(chat_type, initial_msg, uid, chat_id, key, iv)
     
     try:
-        # Reset bot state
-        await reset_bot_state(key, iv, region)
+        # Create badge packet
+        badge_packet = await request_join_with_badge(target_uid, badge_value, key, iv, region)
         
-        # Create and send join packets
-        join_packet = await request_join_with_badge(target_uid, badge_value, key, iv, region)
-        spam_count = 3
+        if badge_packet:
+            # Send packet 5 times for spam effect
+            for i in range(5):
+                await SEndPacKeT(whisper_writer, online_writer, 'OnLine', badge_packet)
+                print(f" Sent /{cmd} badge #{i+1} with value {badge_value}")
+                await asyncio.sleep(0.2)  # Slight delay
+            
+            success_msg = f"[B][C][00FF00] Successfully Sent {cmd} Badge!\n Target: {xMsGFixinG(target_uid)}\n Badge Value: {badge_value}\n Packets Sent: 5\n"
+        else:
+            success_msg = f"[B][C][FF0000] Failed to create badge packet!\n"
         
-        for i in range(spam_count):
-            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
-            print(f"✅ Sent /{cmd} request #{i+1} with badge {badge_value}")
-            await asyncio.sleep(0.1)
-        
-        success_msg = f"[B][C][00FF00]✅ Successfully Sent {spam_count} Join Requests!\n🎯 Target: {target_uid}\n🏷️ Badge: {badge_value}\n"
         await safe_send_message(chat_type, success_msg, uid, chat_id, key, iv)
         
-        # Cleanup
-        await asyncio.sleep(1)
-        await reset_bot_state(key, iv, region)
-        
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Error in /{cmd}: {str(e)}\n"
+        error_msg = f"[B][C][FF0000] Error in /{cmd}: {str(e)}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
+
+
+
+
+    
+    
     
 async def auto_rings_emote_dual(uid, key, iv, region):
     """Send The Rings emote to both sender and bot for dual emote effect"""
     try:
         # The Rings emote ID
-        rings_emote_id = 909042007
+        rings_emote_id = 909050009
         
         # Get bot's UID
-        bot_uid = 14619134248
+        bot_uid = 13601801571
         
         # Send emote to SENDER (person who invited)
         emote_to_sender = await Emote_k(int(uid), rings_emote_id, key, iv, region)
@@ -2071,7 +2049,7 @@ async def auto_rings_emote_dual(uid, key, iv, region):
         emote_to_bot = await Emote_k(int(bot_uid), rings_emote_id, key, iv, region)
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_to_bot)
         
-        print(f"🤖 Bot performed dual Rings emote with sender {uid} and bot {bot_uid}!")
+        print(f" Bot performed dual Rings emote with sender {uid} and bot {bot_uid}!")
         
     except Exception as e:
         print(f"Error sending dual rings emote: {e}")    
@@ -2082,7 +2060,7 @@ async def Room_Spam(Uid, Rm, Nm, K, V):
         1: 78,
         2: {
             1: int(Rm),  
-            2: "iG:[C][B][FF0000] APON GMAING 71",  
+            2: "iG:[C][B][FF0000]Black_Apis",  
             3: {
                 2: 1,
                 3: 1
@@ -2127,11 +2105,11 @@ async def evo_cycle_spam(uids, key, iv, region, LoGinDaTaUncRypTinG):
     try:
         # Try to get from login data (passed as parameter)
         bot_uid = LoGinDaTaUncRypTinG.AccountUID
-        print(f"🤖 Using bot UID from login: {bot_uid}")
+        print(f" Using bot UID from login: {bot_uid}")
     except:
         # Fallback to your hardcoded UID
-        bot_uid = 14619134248
-        print(f"🤖 Using hardcoded bot UID: {bot_uid}")
+        bot_uid = 13777711848
+        print(f" Using hardcoded bot UID: {bot_uid}")
     
     cycle_count = 0
     while evo_cycle_running:
@@ -2151,7 +2129,7 @@ async def evo_cycle_spam(uids, key, iv, region, LoGinDaTaUncRypTinG):
                     uid_int = int(uid)
                     user_emote = await Emote_k(uid_int, int(emote_id), key, iv, region)
                     await SEndPacKeT(whisper_writer, online_writer, 'OnLine', user_emote)
-                    print(f"👤 User emote #{emote_number}")
+                    print(f" User emote #{emote_number}")
                 except Exception as e:
                     print(f"Error: {e}")
             
@@ -2174,7 +2152,7 @@ async def evo_cycle_spam(uids, key, iv, region, LoGinDaTaUncRypTinG):
                     bot_to_user = await Emote_k(first_uid, int(opposite_id), key, iv, region)
                     await SEndPacKeT(whisper_writer, online_writer, 'OnLine', bot_to_user)
                 
-                print(f"🤖 Bot OPPOSITE emote #{opposite_number} (sent to self + user)")
+                print(f" Bot OPPOSITE emote #{opposite_number} (sent to self + user)")
             except Exception as e:
                 print(f"Bot error: {e}")
             
@@ -2208,7 +2186,7 @@ async def reject_spam_loop(target_uid, key, iv):
             await SEndPacKeT(whisper_writer, online_writer, 'OnLine', packet2)
             
             count += 1
-            print(f"Sent reject spam #{count} to {target_uid}")
+            print(f"Sent reject spam #{count} to {xMsGFixinG(target_uid)}")
             
             # 0.2 second delay between spam cycles
             await asyncio.sleep(0.2)
@@ -2226,16 +2204,16 @@ async def handle_reject_completion(spam_task, target_uid, sender_uid, chat_id, c
         
         # Send completion message
         if spam_count >= 150:
-            completion_msg = f"[B][C][FFFF00]✅ Reject Spam Completed Successfully for ID {target_uid}\n✅ Total packets sent: {spam_count * 2}\n"
+            completion_msg = f"[B][C][00FF00] Reject Spam Completed Successfully for ID {xMsGFixinG(target_uid)}\n Total packets sent: {spam_count * 2}\n"
         else:
-            completion_msg = f"[B][C][FFFF00]⚠️ Reject Spam Partially Completed for ID {target_uid}\n⚠️ Total packets sent: {spam_count * 2}\n"
+            completion_msg = f"[B][C][FFFF00] Reject Spam Partially Completed for ID {xMsGFixinG(target_uid)}\n Total packets sent: {spam_count * 2}\n"
         
         await safe_send_message(chat_type, completion_msg, sender_uid, chat_id, key, iv)
         
     except asyncio.CancelledError:
         print("Reject spam was cancelled")
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ ERROR in reject spam: {str(e)}\n"
+        error_msg = f"[B][C][FF0000] ERROR in reject spam: {str(e)}\n"
         await safe_send_message(chat_type, error_msg, sender_uid, chat_id, key, iv)    
     
     
@@ -2263,42 +2241,42 @@ async def banecipher(target_uid, key, iv):
 .
 .
 .
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
 [b][0000FF]======================================================================================================================================================================================================================================================
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
 
 
 
@@ -2340,7 +2318,7 @@ async def banecipher(target_uid, key, iv):
     return bytes.fromhex(final_packet)
 
 async def black666(client_id, key, iv):
-    banner_text = "[FF0000][B][C] ERROR , WELCOME TO [FFFFFF] [FFFF00]___X³____ BOT ! \n[FFFF00]NEW VERSION NEW FUNCTION !\n[FF0000]TELEGRAM : @classic_aruhi\n\n"     
+    banner_text = "[FF0000][B][C] ERROR , WELCOME TO [FFFFFF]NAJMI-M24 [00FF00]___ NAJMI-M24____ BOT ! \n[FFFF00]NEW VERSION NEW FUNCTION !\n[FF0000]TELEGRAM : @NAJMI-M24\n\n"     
     fields = {
         1: 5,
         2: {
@@ -2400,42 +2378,42 @@ async def banecipher1(client_id, key, iv):
 .
 .
 .
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
 [b][0000FF]======================================================================================================================================================================================================================================================
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
-[b][000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███[000000]███
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
+[b][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000][000000]
 
 
 
@@ -2478,7 +2456,7 @@ async def banecipher1(client_id, key, iv):
     
 async def get_colorful_message(message_text, message_number):
     """Generate message with different colors"""
-    color_palette = ["FF0000", "FFFF00", "0000FF", "FFFF00", "FF00FF", 
+    color_palette = ["FF0000", "00FF00", "0000FF", "FFFF00", "FF00FF", 
                      "00FFFF", "FFA500", "FF1493", "00FF7F", "7B68EE",
                      "FFD700", "00CED1", "FF69B4", "32CD32", "9370DB",
                      "FF4500", "1E90FF", "ADFF2F", "FF6347", "8A2BE2"]
@@ -2486,25 +2464,16 @@ async def get_colorful_message(message_text, message_number):
     color_index = (message_number - 1) % len(color_palette)
     return f"[C][B][{color_palette[color_index]}]{message_text}"    
 
-def get_random_avatar1():
+def get_random_avatar():
 	avatar_list = [
          '902050001', '902050002', '902050003', '902039016', '902050004', 
-        '902047011', '902047010', '902049015', '902050006', '902049020','902000065','902000065','902000064','902000127','902000210', '902000178', '902000072', '902000067', '902000212', '902000206', '902000204', '902000064', '902000086','902000063','902000165','902000236','902000231', '902000191', '902000193','902000195', '902000338', '902033026','902000067', '902000093', '902000098'
+        '902047011', '902047010', '902049015', '902050006', '902049020'
     ]
 	random_avatar = random.choice(avatar_list)
 	return  random_avatar
-	
-async def get_random_avatar():
-    await asyncio.sleep(0)  # makes it async but instant
-    avatar_list = [
-       '902000065','902000065','902000064','902000127','902000210', '902000178', '902000072', '902000067', '902000212', '902000206', '902000204', '902000064', '902000086','902000063','902000165','902000236','902000231', '902000191', '902000193','902000195', '902000338', '902033026','902000067', '902000093', '902000098'
-    ]
-    return random.choice(avatar_list)
-    
-
 
 async def xSEndMsgsQQ(Msg , id , K , V):
-    fields = {1: id , 2: id , 4: Msg , 5: 1756580149, 7: 2, 8: 904990072, 9: {1: "xBe4!sTo - C4", 2: int(get_random_avatar1()), 4: 330, 5: 1001000001, 8: "xBe4!sTo - C4", 10: 1, 11: 1, 13: {1: 2}, 14: {1: 1158053040, 2: 8, 3: "\u0010\u0015\b\n\u000b\u0015\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"}}, 10: "en", 13: {2: 2, 3: 1}}
+    fields = {1: id , 2: id , 4: Msg , 5: 1756580149, 7: 2, 8: 904990072, 9: {1: "xBe4!sTo - C4", 2: int(get_random_avatar()), 4: 330, 5: 1001000001, 8: "xBe4!sTo - C4", 10: 1, 11: 1, 13: {1: 2}, 14: {1: 1158053040, 2: 8, 3: "\u0010\u0015\b\n\u000b\u0015\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"}}, 10: "en", 13: {2: 2, 3: 1}}
     Pk = (await CrEaTe_ProTo(fields)).hex()
     Pk = "080112" + await EnC_Uid(len(Pk) // 2, Tp='Uid') + Pk
     return await GeneRaTePk(Pk, '1201', K, V)     
@@ -2516,7 +2485,7 @@ async def Create_xr_room_packet_fixed__(room_id, key, iv):
     fields = {
         1: 1,
         2: {
-            1: 9280892890,  # Bot UID
+            1: 13777711848,  # Bot UID
             2: int(room_id),
             3: 3,  # Chat type 3 = room chat
             4: f"[FFFFFF]Hello",
@@ -2539,7 +2508,7 @@ async def Create_xr_room_packet_fixed__(room_id, key, iv):
     # Convert to protobuf hex
     proto_hex = (await CrEaTe_ProTo(fields)).hex()
     
-    print(f"📦 Room chat proto: {len(proto_hex)//2} bytes")
+    print(f" Room chat proto: {len(proto_hex)//2} bytes")
     print(f"Hex start: {proto_hex[:50]}...")
     
     # CRITICAL FIX: Room chat uses Whisper connection (12xx headers)
@@ -2572,7 +2541,7 @@ async def send_wave_messages(message_text, repeats, chat_id, key, iv, region):
                 if msg_packet and whisper_writer:
                     await SEndPacKeT(whisper_writer, online_writer, 'ChaT', msg_packet)
                     count += 1
-                    print(f"✅ Wave #{total_cycles+1} - Expanding: '{partial_msg}'")
+                    print(f" Wave #{total_cycles+1} - Expanding: '{partial_msg}'")
                     await asyncio.sleep(0.1)
             
             # SHRINKING phase (hell, hel, he, h)
@@ -2587,14 +2556,14 @@ async def send_wave_messages(message_text, repeats, chat_id, key, iv, region):
                 if msg_packet and whisper_writer:
                     await SEndPacKeT(whisper_writer, online_writer, 'ChaT', msg_packet)
                     count += 1
-                    print(f"✅ Wave #{total_cycles+1} - Shrinking: '{partial_msg}'")
+                    print(f" Wave #{total_cycles+1} - Shrinking: '{partial_msg}'")
                     await asyncio.sleep(0.1)
             
             total_cycles += 1
-            print(f"🌀 Completed wave cycle {total_cycles}/{repeats}")
+            print(f" Completed wave cycle {total_cycles}/{repeats}")
             
         except Exception as e:
-            print(f"❌ Error in wave messages: {e}")
+            print(f" Error in wave messages: {e}")
             break
     
     return count, total_cycles
@@ -2610,7 +2579,7 @@ async def handle_wave_completion(spam_task, message_text, repeats, sender_uid, c
 
         
     except asyncio.CancelledError:
-        cancel_msg = f"[B][C][FFFF00]🛑 WAVE CANCELLED!\n"
+        cancel_msg = f"[B][C][00FF00] WAVE CANCELLED!\n"
         await safe_send_message(chat_type, cancel_msg, sender_uid, chat_id, key, iv)
 
 # Replace the msg_spam_loop function with this simpler version:
@@ -2630,20 +2599,20 @@ async def msg_spam_loop(message_text, times, chat_id, key, iv, region):
             msg_packet = await xSEndMsgsQQ(colorful_message, int(chat_id), key, iv)
             
             if not msg_packet:
-                print("❌ Failed to create message packet")
+                print(" Failed to create message packet")
                 break
                 
             # Send the packet - use ChaT connection type for squad messages
             if whisper_writer:
                 await SEndPacKeT(whisper_writer, online_writer, 'ChaT', msg_packet)
                 count += 1
-                print(f"✅ Sent message #{count}/{times} to squad chat: '{message_text}'")
+                print(f" Sent message #{count}/{times} to squad chat: '{message_text}'")
                 
                 # Adjust delay to avoid rate limiting
                 await asyncio.sleep(0.1)
                 
         except Exception as e:
-            print(f"❌ Error in msg spam loop: {e}")
+            print(f" Error in msg spam loop: {e}")
             import traceback
             traceback.print_exc()
             break
@@ -2663,26 +2632,26 @@ async def handle_msg_spam_completion(spam_task, message_text, times, sender_uid,
         
         # Send completion message
         if actual_times >= times:
-            completion_msg = f"[B][C][FFFF00]✅ MESSAGE SPAM COMPLETED!\n"
-            completion_msg += f"[FFFFFF]📝 Message: {message_text}\n"
-            completion_msg += f"[FFFFFF]📊 Requested: {times} times\n"
-            completion_msg += f"[FFFFFF]✅ Sent: {actual_times} times\n"
-            completion_msg += f"[FFFF00]✓ Success rate: 100%\n"
-            completion_msg += f"[FFFFFF]💬 Check squad chat to see messages!\n"
+            completion_msg = f"[B][C][00FF00] MESSAGE SPAM COMPLETED!\n"
+            completion_msg += f"[FFFFFF] Message: {message_text}\n"
+            completion_msg += f"[FFFFFF] Requested: {times} times\n"
+            completion_msg += f"[FFFFFF] Sent: {actual_times} times\n"
+            completion_msg += f"[00FF00] Success rate: 100%\n"
+            completion_msg += f"[FFFFFF] Check squad chat to see messages!\n"
         elif actual_times > 0:
-            completion_msg = f"[B][C][FFFF00]⚠️ MESSAGE SPAM PARTIALLY COMPLETED!\n"
-            completion_msg += f"[FFFFFF]📝 Message: {message_text}\n"
-            completion_msg += f"[FFFFFF]📊 Requested: {times} times\n"
-            completion_msg += f"[FFFFFF]⚠️ Sent: {actual_times} times\n"
-            completion_msg += f"[FFFF00]↯ Success rate: {(actual_times/times)*100:.1f}%\n"
-            completion_msg += f"[FFFFFF]💬 Check squad chat to see messages!\n"
+            completion_msg = f"[B][C][FFFF00] MESSAGE SPAM PARTIALLY COMPLETED!\n"
+            completion_msg += f"[FFFFFF] Message: {message_text}\n"
+            completion_msg += f"[FFFFFF] Requested: {times} times\n"
+            completion_msg += f"[FFFFFF] Sent: {actual_times} times\n"
+            completion_msg += f"[FFFF00] Success rate: {(actual_times/times)*100:.1f}%\n"
+            completion_msg += f"[FFFFFF] Check squad chat to see messages!\n"
         else:
-            completion_msg = f"[B][C][FF0000]❌ MESSAGE SPAM FAILED!\n"
-            completion_msg += f"[FFFFFF]📝 Message: {message_text}\n"
-            completion_msg += f"[FFFFFF]📊 Requested: {times} times\n"
-            completion_msg += f"[FFFFFF]❌ Sent: 0 times\n"
-            completion_msg += f"[FF0000]✗ Failed to send any messages\n"
-            completion_msg += f"[FFFFFF]🔧 Possible issues:\n"
+            completion_msg = f"[B][C][FF0000] MESSAGE SPAM FAILED!\n"
+            completion_msg += f"[FFFFFF] Message: {message_text}\n"
+            completion_msg += f"[FFFFFF] Requested: {times} times\n"
+            completion_msg += f"[FFFFFF] Sent: 0 times\n"
+            completion_msg += f"[FF0000] Failed to send any messages\n"
+            completion_msg += f"[FFFFFF] Possible issues:\n"
             completion_msg += f"[FFFFFF]1. Bot not in a squad\n"
             completion_msg += f"[FFFFFF]2. Invalid chat_id\n"
             completion_msg += f"[FFFFFF]3. Connection error\n"
@@ -2691,10 +2660,10 @@ async def handle_msg_spam_completion(spam_task, message_text, times, sender_uid,
         
     except asyncio.CancelledError:
         print("Message spam was cancelled by user")
-        cancel_msg = f"[B][C][FFFF00]🛑 MESSAGE SPAM CANCELLED!\n[FFFFFF]Message spam was stopped by user command.\n"
+        cancel_msg = f"[B][C][00FF00] MESSAGE SPAM CANCELLED!\n[FFFFFF]Message spam was stopped by user command.\n"
         await safe_send_message(chat_type, cancel_msg, sender_uid, chat_id, key, iv)
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ ERROR in message spam completion: {str(e)}\n"
+        error_msg = f"[B][C][FF0000] ERROR in message spam completion: {str(e)}\n"
         await safe_send_message(chat_type, error_msg, sender_uid, chat_id, key, iv)
         
 async def send_msg_in_room_async(Msg, room_id, key, iv):
@@ -2761,9 +2730,9 @@ async def handle_room_message_command(inPuTMsG, uid, chat_id, key, iv, region, c
     parts = inPuTMsG.strip().split()
     
     if len(parts) < 3:
-        error_msg = f"""[B][C][FF0000]❌ Usage: /roommsg (room_id) (message)
+        error_msg = f"""[B][C][FF0000] Usage: /roommsg (room_id) (message)
         
-📝 Examples:
+ Examples:
 /roommsg 123456 Hello everyone!
 /roommsg 987654 Welcome to my
 """
@@ -2775,14 +2744,14 @@ async def handle_room_message_command(inPuTMsG, uid, chat_id, key, iv, region, c
     Msg = message 
     # Validate room ID
     if not room_id.isdigit():
-        error_msg = f"[B][C][FF0000]❌ Room ID must be numbers only!\n"
+        error_msg = f"[B][C][FF0000] Room ID must be numbers only!\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         print(error_msg)
         return
     
     # Send initial message
-    initial_msg = f"[B][C][FFFF00]📤 Sending room message...\n"
-    initial_msg += f"🏠 Room: {room_id}\n"
+    initial_msg = f"[B][C][00FF00] Sending room message...\n"
+    initial_msg += f" Room: {room_id}\n"
     
     
     await safe_send_message(chat_type, initial_msg, uid, chat_id, key, iv)
@@ -2797,19 +2766,19 @@ async def handle_room_message_command(inPuTMsG, uid, chat_id, key, iv, region, c
             whisper_writer.write(room_packet)
             await whisper_writer.drain()
             
-            success_msg = f"""[B][C][FFFF00]✅ ROOM MESSAGE SENT!
+            success_msg = f"""[B][C][00FF00] ROOM MESSAGE SENT!
 
-🏠 Room: {room_id}
-📝 Message: {message}
+ Room: {room_id}
+ Message: {message}
 """
         else:
-            success_msg = f"[B][C][FF0000]❌ Failed to create room packet!\n"
+            success_msg = f"[B][C][FF0000] Failed to create room packet!\n"
         
         await safe_send_message(chat_type, success_msg, uid, chat_id, key, iv)
         print(success_msg)
         
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Error: {str(e)[:50]}\n"
+        error_msg = f"[B][C][FF0000] Error: {str(e)[:50]}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         print(error_msg)
 
@@ -2861,7 +2830,7 @@ async def create_training_start_packet(key, iv, region):
         packet = await CrEaTe_ProTo(fields_simple)
         packet_hex = packet.hex()
         
-        print(f"📦 Created training packet: {packet_hex[:50]}...")
+        print(f" Created training packet: {packet_hex[:50]}...")
         
         # Determine packet header based on region
         if region.lower() == "ind":
@@ -2874,11 +2843,11 @@ async def create_training_start_packet(key, iv, region):
         # Generate final encrypted packet
         final_packet = await GeneRaTePk(packet_hex, packet_type, key, iv)
         
-        print(f"✅ Training start packet created")
+        print(f" Training start packet created")
         return final_packet
         
     except Exception as e:
-        print(f"❌ Error creating training packet: {e}")
+        print(f" Error creating training packet: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -2893,14 +2862,14 @@ async def start_training_mode(key, iv, region):
         if training_packet:
             # Send to Online connection
             await SEndPacKeT(whisper_writer, online_writer, 'OnLine', training_packet)
-            print("🎮 Training mode start packet sent!")
+            print(" Training mode start packet sent!")
             return True
         else:
-            print("❌ Failed to create training packet")
+            print(" Failed to create training packet")
             return False
             
     except Exception as e:
-        print(f"❌ Error starting training: {e}")
+        print(f" Error starting training: {e}")
         return False
 
 
@@ -2912,35 +2881,35 @@ async def handle_training_command(inPuTMsG, uid, chat_id, key, iv, region, chat_
     
     if len(parts) == 1:
         # Just /train - start default training
-        initial_msg = f"[B][C][FFFF00]🎮 Starting training mode...\n"
+        initial_msg = f"[B][C][00FF00] Starting training mode...\n"
         await safe_send_message(chat_type, initial_msg, uid, chat_id, key, iv)
         
         success = await start_training_mode(key, iv, region)
         
         if success:
-            success_msg = f"[B][C][FFFF00]✅ Training mode started!\n🏋️ Enter training ground to practice!\n"
+            success_msg = f"[B][C][00FF00] Training mode started!\n Enter training ground to practice!\n"
         else:
-            success_msg = f"[B][C][FF0000]❌ Failed to start training!\n"
+            success_msg = f"[B][C][FF0000] Failed to start training!\n"
             
         await safe_send_message(chat_type, success_msg, uid, chat_id, key, iv)
         
     elif len(parts) == 2 and parts[1] == "custom":
         # /train custom - custom training settings
-        initial_msg = f"[B][C][FFFF00]🎮 Starting custom training...\n"
+        initial_msg = f"[B][C][00FF00] Starting custom training...\n"
         await safe_send_message(chat_type, initial_msg, uid, chat_id, key, iv)
         
         # You can add custom training settings here
         success = await start_training_mode(key, iv, region)
         
         if success:
-            success_msg = f"[B][C][FFFF00]✅ Custom training started!\n⚙️ Custom settings applied!\n"
+            success_msg = f"[B][C][00FF00] Custom training started!\n Custom settings applied!\n"
         else:
-            success_msg = f"[B][C][FF0000]❌ Failed to start custom training!\n"
+            success_msg = f"[B][C][FF0000] Failed to start custom training!\n"
             
         await safe_send_message(chat_type, success_msg, uid, chat_id, key, iv)
         
     else:
-        error_msg = f"[B][C][FF0000]❌ Usage: /train [custom]\nExamples:\n/train - Start default training\n/train custom - Custom training\n"
+        error_msg = f"[B][C][FF0000] Usage: /train [custom]\nExamples:\n/train - Start default training\n/train custom - Custom training\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
 
 async def lag_team_loop(team_code, key, iv, region):
@@ -2973,163 +2942,497 @@ async def lag_team_loop(team_code, key, iv, region):
             await asyncio.sleep(0.1)
  
 ####################################
-
-#Clan-info-by-clan-id
-import requests
-
-def get_clan_info(clan_id):
-    try:
-        url = f"https://guild-info-danger.vercel.app/guild?guild_id={clan_id}&region={all}"
-        res = requests.get(url, timeout=10)
-
-        if res.status_code == 200:
-            data = res.json()
-            
-            # Check if API returned success
-            if data.get("status") != "success":
-                return "❌ Failed to fetch guild info. API returned an error."
-            
-            # Extract guild info
-            guild_name = data.get("guild_name", "Unknown")
-            guild_level = data.get("guild_level", "N/A")
-            current_members = data.get("current_members", "N/A")
-            max_members = data.get("max_members", "N/A")
-            guild_region = data.get("guild_region", "Unknown")
-            guild_slogan = data.get("guild_slogan", "N/A")
-            creation_time = data.get("creation_time", "N/A")
-            last_notice_change = data.get("last_notice_change", "N/A")
-            last_slogan_change = data.get("last_slogan_change", "N/A")
-            last_updated = data.get("last_updated", "N/A")
-            total_activity_points = data.get("total_activity_points", "N/A")
-            weekly_activity_points = data.get("weekly_activity_points", "N/A")
-            officers = data.get("officers", [])
-            
-            # Guild Leader info
-            leader_info = data.get("guild_leader", {})
-            leader_name = leader_info.get("name", "Unknown")
-            leader_uid = leader_info.get("uid", "N/A")
-            leader_level = leader_info.get("level", "N/A")
-            leader_likes = leader_info.get("likes", "N/A")
-            
-            # Format officers list
-            officers_str = ", ".join(officers) if officers else "No officers"
-
-            # Format output
-            return f"""
-[FFDD00][b][c]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[00D1FF]Guild Name           : {guild_name}
-Level                   : {guild_level}
-Region                  : {guild_region}
-Members                 : {current_members}/{max_members}
-Slogan                  : {guild_slogan}
-Creation Time           : {creation_time}
-Last Notice Change      : {last_notice_change}
-Last Slogan Change      : {last_slogan_change}
-Last Updated            : {last_updated}
-Total Activity Points   : {total_activity_points}
-Weekly Activity Points  : {weekly_activity_points}
-Officers                : {officers_str}
-[00D1FF]Guild Leader         : {leader_name} (UID: {leader_uid})
-[FFDD00]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[00FF00][b][c] APON GMAING 71
-"""
-        else:
-            return f"❌ Failed to fetch guild info. HTTP Status: {res.status_code}"
-
-    except Exception as e:
-        return f"Error occurred: {e}"
-
-
-
-
-def get_level_info(uid):
-    try:
-        url = f"https://danger-level-info.vercel.app/level/{uid}"
-        res = requests.get(url, timeout=10)
-
-        if res.status_code == 200:
-            data = res.json()
-
-            if not data.get("success"):
-                return "❌ Failed to fetch level info."
-
-            nickname = data.get("nickname", "Unknown")
-            level = data.get("current_level", "N/A")
-            current_exp = data.get("current_exp", 0)
-            exp_needed = data.get("exp_needed", 0)
-            progress = data.get("progress_percentage", 0)
-            level_100_exp = data.get("level_100_exp", 0)
-            exp_to_100 = data.get("exp_needed_for_100", 0)
-
-            return f"""
-[FFDD00][b][c]
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        ✦ EXP DETAILS ✦
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[00D1FF]👤 Name        : [FFFFFF]{nickname}
-[00D1FF]🆔 Player ID  : [FFFFFF]{xMsGFixinG(uid)}
-[00D1FF]🎚 Level       : [FFFFFF]{level}
-[00D1FF]🔹 Current EXP : [FFFFFF]{fix_num(current_exp)}
-[00D1FF]🔹 EXP Needed  : [FFFFFF]{fix_num(exp_needed)}
-[00D1FF]🔹 Progress    : [FFFFFF]{progress}%
-[00D1FF]🔸 EXP to Lv100: [FFFFFF]{fix_num(exp_to_100)}
-[00D1FF]🔸 Lv100 EXP   : [FFFFFF]{fix_num(level_100_exp)}
-[FFDD00]━━━━━━━━━━━━━━━━━━━━━━
-[00FF00][b][c]⚡ APON GMAING 71
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
-        else:
-            return f"❌ Failed to fetch level info. HTTP Status: {res.status_code}"
-
-    except Exception as e:
-        return f"Error occurred: {e}"
-
-        
-
+#GET PLAYER BAN STATUS
 def get_player_ban_status(uid):
     try:
-        url = f"https://banchack.vercel.app/bancheck?key=saeed&uid={uid}"
-        res = requests.get(url, timeout=10)
-
+        url = f"https://mg24-check-ban.vercel.app/ban?uid={uid}"
+        res = requests.get(url)
         if res.status_code == 200:
             data = res.json()
-
+            # status is inside socialInfo -> signature
+            player_id = data.get('account_id', 'Unknown')
+            period = data.get('ban_period', 'Unknown')
             status = data.get('ban_status', 'Unknown')
-            ban_period = data.get('ban_period', 'N/A')
             player_name = data.get('nickname', 'Unknown')
-            region = data.get('region', 'Unknown')
+            server_name = data.get('region', 'Unknown')
 
-            return f"""
-[FFDD00][b][c]
-°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°
+            player_name = data.get('player_name', 'Unknown')
+            if status:
+                return f"""
+ [FFDD00][b][c]
+
 [00D1FF]Player Name: {player_name}
-Player ID : {xMsGFixinG(uid)}
-Region    : {region}
-Status    : {status}
-Ban Period: {ban_period}
-[FFDD00]°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°°
-[00FF00][b][c]BOT MADE BY Apon 
+Player ID: account_id
+Status: {status}
+Period: {period}
+Region: {server_name}
+[FFDD00]
+[00FF00][b][c]BOT MADE BY NAJMI-M24 
 """
+            else:
+                return "No ban_status available"
         else:
-            return f"❌ Failed to fetch ban status. HTTP Status: {res.status_code}"
-
+            return f"Failed to fetch ban_status. Status code: {res.status_code}"
     except Exception as e:
         return f"Error occurred: {e}"
+# ADD FRIEND 
+def add_friend(uid, pw, target_uid):
+    try:
+        url = (
+            "https://danger-friend-manager.vercel.app/adding_friend"
+            f"?uid=4294754933&password=SBG_U3MZVZGTZU3&friend_uid={target_uid}"
+        )
+
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            return "[C][B][FF5C8A]API ERROR"
+
+        data = res.json()
+
+        success = data.get("success", False)
+        name = data.get("nickname", "Unknown")
+        region = data.get("region", "N/A")
+        friend_uid = data.get("friend_uid", target_uid)
+
+        if success:
+            status_color = "4CFFB0"
+            status_text = "FRIEND ADDED"
+        else:
+            status_color = "FF5C8A"
+            status_text = "FAILED"
+
+        return f"""
+[C][B][5DA9FF]
+[C][B][FF6EC7]FRIEND MANAGER
+[C][5DA9FF]
+[C][E6E6FA]Action   : [{status_color}]{status_text}
+[C][E6E6FA]Bot Name     : [9AD0FF]{name}
+[C][E6E6FA]Target Uid : [9AD0FF]{xMsGFixinG(friend_uid)}
+[C][E6E6FA]Region   : [9AD0FF]{region}
+[C][B][5DA9FF]
+"""
+
+    except Exception as e:
+        return f"[C][B][FF5C8A]ERROR: {e}"
+
+def remove_friend(uid, pw, target_uid):
+    try:
+        url = (
+            "https://danger-friend-manager.vercel.app/remove_friend"
+            f"?uid=4294754933&password=SBG_U3MZVZGTZU3&friend_uid={target_uid}"
+        )
+
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            return "[C][B][FF5C8A]API ERROR"
+
+        data = res.json()
+
+        success = data.get("success", False)
+        name = data.get("nickname", "Unknown")
+        region = data.get("region", "N/A")
+        friend_uid = data.get("friend_uid", target_uid)
+
+        if success:
+            status_color = "FF6EC7"
+            status_text = "FRIEND REMOVED"
+        else:
+            status_color = "FF5C8A"
+            status_text = "FAILED"
+
+        return f"""
+[C][B][5DA9FF]
+[C][B][FF6EC7]FRIEND MANAGER
+[C][5DA9FF]
+[C][E6E6FA]Action   : [{status_color}]{status_text}
+[C][E6E6FA]Bot Name     : [9AD0FF]{name}
+[C][E6E6FA]Target Uid : [9AD0FF]{xMsGFixinG(friend_uid)}
+[C][E6E6FA]Region   : [9AD0FF]{region}
+[C][B][5DA9FF]
+"""
+
+    except Exception as e:
+        return f"[C][B][FF5C8A]ERROR: {e}"
+
+
+# ADD FRIEND 
+def add_friend(uid, pw, target_uid):
+    try:
+        url = (
+            "https://danger-friend-manager.vercel.app/adding_friend"
+            f"?uid=4294754933&password=SBG_U3MZVZGTZU3&friend_uid={target_uid}"
+        )
+
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            return "[C][B][FF5C8A]API ERROR"
+
+        data = res.json()
+
+        success = data.get("success", False)
+        name = data.get("nickname", "Unknown")
+        region = data.get("region", "N/A")
+        friend_uid = data.get("friend_uid", target_uid)
+
+        if success:
+            status_color = "4CFFB0"
+            status_text = "FRIEND ADDED"
+        else:
+            status_color = "FF5C8A"
+            status_text = "FAILED"
+
+        return f"""
+[C][B][5DA9FF]
+[C][B][FF6EC7]FRIEND MANAGER
+[C][5DA9FF]
+[C][E6E6FA]Action   : [{status_color}]{status_text}
+[C][E6E6FA]Bot Name     : [9AD0FF]{name}
+[C][E6E6FA]Target Uid : [9AD0FF]{xMsGFixinG(friend_uid)}
+[C][E6E6FA]Region   : [9AD0FF]{region}
+[C][B][5DA9FF]
+"""
+
+    except Exception as e:
+        return f"[C][B][FF5C8A]ERROR: {e}"
+
+def remove_friend(uid, pw, target_uid):
+    try:
+        url = (
+            "https://danger-friend-manager.vercel.app/remove_friend"
+            f"?uid=4294754933&password=SBG_U3MZVZGTZU3&friend_uid={target_uid}"
+        )
+
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            return "[C][B][FF5C8A]API ERROR"
+
+        data = res.json()
+
+        success = data.get("success", False)
+        name = data.get("nickname", "Unknown")
+        region = data.get("region", "N/A")
+        friend_uid = data.get("friend_uid", target_uid)
+
+        if success:
+            status_color = "FF6EC7"
+            status_text = "FRIEND REMOVED"
+        else:
+            status_color = "FF5C8A"
+            status_text = "FAILED"
+
+        return f"""
+[C][B][5DA9FF]
+[C][B][FF6EC7]FRIEND MANAGER
+[C][5DA9FF]
+[C][E6E6FA]Action   : [{status_color}]{status_text}
+[C][E6E6FA]Bot Name     : [9AD0FF]{name}
+[C][E6E6FA]Target Uid : [9AD0FF]{xMsGFixinG(friend_uid)}
+[C][E6E6FA]Region   : [9AD0FF]{region}
+[C][B][5DA9FF]
+"""
+
+    except Exception as e:
+        return f"[C][B][FF5C8A]ERROR: {e}"
+
+async def send_full_player_info(data, chat_type, uid, chat_id, key, iv):
+
+    acc = data.get("AccountInfo", {})
+    guild = data.get("GuildInfo", {})
+    social = data.get("socialinfo", {})
+    captain = data.get("captainBasicInfo", {})
+
+    #  MESSAGE 1 : COMMON ACCOUNT INFO 
+    msg1 = f"""
+[C][B][FFAA00]
+[C][B][FFFFFF]COMMON ACCOUNT INFO
+[C][FFAA00]
+[C][FFFFFF]Name      : [66FF00]{acc.get('AccountName', 'N/A')}
+[C][FFFFFF]UID       : [66FF00]{ff_num(captain.get('accountId'))}
+[C][FFFFFF]Level     : [66FF00]{acc.get('AccountLevel', 'N/A')}
+[C][FFFFFF]EXP       : [66FF00]{ff_num(acc.get('AccountEXP'))}
+[C][FFFFFF]Likes     : [66FF00]{ff_num(acc.get('AccountLikes'))}
+[C][FFFFFF]Region    : [66FF00]{acc.get('AccountRegion', 'N/A')}
+[C][FFFFFF]BP Badge  : [66FF00]{ff_num(acc.get('AccountBPID'))}
+[C][FFFFFF]Version   : [66FF00]{acc.get('ReleaseVersion', 'N/A')}
+"""
+
+    await safe_send_message(chat_type, msg1, uid, chat_id, key, iv)
+    await asyncio.sleep(0.5)
+
+    #  MESSAGE 2 : DATE + RANK INFO 
+    lang = social.get("language", "N/A")
+    if "_" in lang:
+        lang = lang.split("_")[-1]   # ARABIC, ENGLISH
+    msg2 = f"""
+[C][B][FFAA00]
+[C][B][FFFFFF]ACCOUNT DETAILS
+[C][FFAA00]
+[C][FFFFFF]Create Date : [66FF00]{human_time(acc.get('AccountCreateTime'))[:16]}
+[C][FFFFFF]Last Login  : [66FF00]{human_time(acc.get('AccountLastLogin'))[:16]}
+[C][FFFFFF]BR Max Rank     : [66FF00]{ff_num(acc.get('BrMaxRank'))}
+[C][FFFFFF]BR Points   : [66FF00]{ff_num(acc.get('BrRankPoint'))}
+[C][FFFFFF]CS Max Rank     : [66FF00]{ff_num(acc.get('CsMaxRank'))}
+[C][FFFFFF]CS Points   : [66FF00]{ff_num(acc.get('CsRankPoint'))}
+[C][FFFFFF]Language    : [66FF00]{lang}
+"""
+
+    await safe_send_message(chat_type, msg2, uid, chat_id, key, iv)
+    await asyncio.sleep(0.5)
+
+    #  MESSAGE 3 : FULL GUILD INFO 
+    msg3 = f"""
+[C][B][FFAA00]
+[C][B][FFFFFF]GUILD INFORMATION
+[C][FFAA00]
+[C][FFFFFF]Guild Name   : [66FF00]{guild.get('GuildName', 'No Guild')}
+[C][FFFFFF]Guild ID     : [66FF00]{ff_num(guild.get('GuildID'))}
+[C][FFFFFF]Owner UID    : [66FF00]{ff_num(guild.get('GuildOwner'))}
+[C][FFFFFF]Guild Level  : [66FF00]{guild.get('GuildLevel', 'N/A')}
+[C][FFFFFF]Members      : [66FF00]{guild.get('GuildMember', '0')}/{guild.get('GuildCapacity', '0')}
+"""
+
+    await safe_send_message(chat_type, msg3, uid, chat_id, key, iv)
+
+#Clan-info-by-clan-id
+def Get_clan_info(clan_id):
+    try:
+        url = f"https://get-clan-info.vercel.app/get_clan_info?clan_id={clan_id}"
+        res = requests.get(url)
+        if res.status_code == 200:
+            data = res.json()
+            msg = f""" 
+[11EAFD][b][c]
+
+GUILD DETAILS
+Achievements: {data['achievements']}\n\n
+Balance : {fix_num(data['balance'])}\n\n
+Clan Name : {data['clan_name']}\n\n
+Expire Time : {fix_num(data['guild_details']['expire_time'])}\n\n
+Members Online : {fix_num(data['guild_details']['members_online'])}\n\n
+Regional : {data['guild_details']['regional']}\n\n
+Reward Time : {fix_num(data['guild_details']['reward_time'])}\n\n
+Total Members : {fix_num(data['guild_details']['total_members'])}\n\n
+ID : {fix_num(data['id'])}\n\n
+Last Active : {fix_num(data['last_active'])}\n\n
+Level : {fix_num(data['level'])}\n\n
+Rank : {fix_num(data['rank'])}\n\n
+Region : {data['region']}\n\n
+Score : {fix_num(data['score'])}\n\n
+Timestamp1 : {fix_num(data['timestamp1'])}\n\n
+Timestamp2 : {fix_num(data['timestamp2'])}\n\n
+Welcome Message: {data['welcome_message']}\n\n
+XP: {fix_num(data['xp'])}\n\n
+
+            """
+            return msg
+        else:
+            msg = """
+[11EAFD][b][c]
+
+Failed to get info, please try again later!!
+
+
+            """
+            return msg
+    except:
+        pass
+
+def check_ban(uid):
+    try:
+        url = f"https://mg24-check-ban.vercel.app/ban?uid={uid}"
+        res = requests.get(url, timeout=10)
+
+        if res.status_code != 200:
+            return "[B][C][FF0000] API ERROR"
+
+        data = res.json()
+
+        name = data.get("nickname", "Unknown")
+        account_id = data.get("account_id", uid)
+        region = data.get("region", "N/A")
+        status = data.get("ban_status", "Unknown")
+        period = data.get("ban_period") or "No Ban"
+
+        status_lower = status.lower()
+
+        #  SIMPLE + SAFE RULE
+        if "not" in status_lower:
+            status_color = "66FF00"
+            period_color = "66FF00"
+        else:
+            status_color = "FF4444"
+            period_color = "FF4444"
+
+        return f"""
+[C][B][5DA9FF]
+[C][B][FF6EC7]BAN STATUS CHECK
+[C][5DA9FF]
+[C][E6E6FA]Name    : [9AD0FF]{name}
+[C][E6E6FA]UID     : [9AD0FF]{xMsGFixinG(account_id)}
+[C][E6E6FA]Region  : [9AD0FF]{region}
+[C][E6E6FA]Status  : [{status_color}]{status}
+[C][E6E6FA]Period  : [{period_color}]{period}
+[C][B][5DA9FF]
+"""
+
+    except Exception as e:
+        return f"[B][C][FF0000] Error: {e}"
+
+async def send_full_player_info(data, chat_type, uid, chat_id, key, iv):
+
+    acc = data.get("AccountInfo", {})
+    guild = data.get("GuildInfo", {})
+    social = data.get("socialinfo", {})
+    captain = data.get("captainBasicInfo", {})
+
+    #  MESSAGE 1 : COMMON ACCOUNT INFO 
+    msg1 = f"""
+[C][B][FFAA00]
+[C][B][FFFFFF]COMMON ACCOUNT INFO
+[C][FFAA00]
+[C][FFFFFF]Name      : [66FF00]{acc.get('AccountName', 'N/A')}
+[C][FFFFFF]UID       : [66FF00]{ff_num(captain.get('accountId'))}
+[C][FFFFFF]Level     : [66FF00]{acc.get('AccountLevel', 'N/A')}
+[C][FFFFFF]EXP       : [66FF00]{ff_num(acc.get('AccountEXP'))}
+[C][FFFFFF]Likes     : [66FF00]{ff_num(acc.get('AccountLikes'))}
+[C][FFFFFF]Region    : [66FF00]{acc.get('AccountRegion', 'N/A')}
+[C][FFFFFF]BP Badge  : [66FF00]{ff_num(acc.get('AccountBPID'))}
+[C][FFFFFF]Version   : [66FF00]{acc.get('ReleaseVersion', 'N/A')}
+"""
+
+    await safe_send_message(chat_type, msg1, uid, chat_id, key, iv)
+    await asyncio.sleep(0.5)
+
+    #  MESSAGE 2 : DATE + RANK INFO 
+    lang = social.get("language", "N/A")
+    if "_" in lang:
+        lang = lang.split("_")[-1]   # ARABIC, ENGLISH
+    msg2 = f"""
+[C][B][FFAA00]
+[C][B][FFFFFF]ACCOUNT DETAILS
+[C][FFAA00]
+[C][FFFFFF]Create Date : [66FF00]{human_time(acc.get('AccountCreateTime'))[:16]}
+[C][FFFFFF]Last Login  : [66FF00]{human_time(acc.get('AccountLastLogin'))[:16]}
+[C][FFFFFF]BR Max Rank     : [66FF00]{ff_num(acc.get('BrMaxRank'))}
+[C][FFFFFF]BR Points   : [66FF00]{ff_num(acc.get('BrRankPoint'))}
+[C][FFFFFF]CS Max Rank     : [66FF00]{ff_num(acc.get('CsMaxRank'))}
+[C][FFFFFF]CS Points   : [66FF00]{ff_num(acc.get('CsRankPoint'))}
+[C][FFFFFF]Language    : [66FF00]{lang}
+"""
+
+    await safe_send_message(chat_type, msg2, uid, chat_id, key, iv)
+    await asyncio.sleep(0.5)
+
+    #  MESSAGE 3 : FULL GUILD INFO 
+    msg3 = f"""
+[C][B][FFAA00]
+[C][B][FFFFFF]GUILD INFORMATION
+[C][FFAA00]
+[C][FFFFFF]Guild Name   : [66FF00]{guild.get('GuildName', 'No Guild')}
+[C][FFFFFF]Guild ID     : [66FF00]{ff_num(guild.get('GuildID'))}
+[C][FFFFFF]Owner UID    : [66FF00]{ff_num(guild.get('GuildOwner'))}
+[C][FFFFFF]Guild Level  : [66FF00]{guild.get('GuildLevel', 'N/A')}
+[C][FFFFFF]Members      : [66FF00]{guild.get('GuildMember', '0')}/{guild.get('GuildCapacity', '0')}
+"""
+
+    await safe_send_message(chat_type, msg3, uid, chat_id, key, iv)
+
+#ADDING-100-LIKES-IN-24H
+def send_likes(uid):
+    try:
+        likes_api_response = requests.get(
+             f"https://like-api.vercel.app/like?uid={uid}&server_name=bd",
+             timeout=15
+             )
+      
+      
+        if likes_api_response.status_code != 200:
+            return f"""
+[C][B][FF0000]
+[FFFFFF]Like API Error!
+Status Code: {likes_api_response.status_code}
+Please check if the uid is correct.
+
+"""
+
+        api_json_response = likes_api_response.json()
+
+        player_name = api_json_response.get('PlayerNickname', 'Unknown')
+        likes_before = api_json_response.get('LikesbeforeCommand', 0)
+        likes_after = api_json_response.get('LikesafterCommand', 0)
+        likes_added = api_json_response.get('LikesGivenByAPI', 0)
+        status = api_json_response.get('status', 0)
+
+        if status == 1 and likes_added > 0:
+            #  Success
+            return f"""
+[C][B][11EAFD]
+[FFFFFF]Likes Status:
+
+[00FF00]Likes Sent Successfully!
+
+[FFFFFF]Player Name : [00FF00]{player_name}  
+[FFFFFF]Likes Added : [00FF00]{likes_added}  
+[FFFFFF]Likes Before : [00FF00]{xMsGFixinG(likes_before)}
+[FFFFFF]Likes After : [00FF00]{xMsGFixinG(likes_after)}
+[C][B][11EAFD]
+[C][B][FFB300]Subscribe: [FFFFFF]NAJMI-M24 [00FF00]!!
+"""
+        elif status == 2 or likes_before == likes_after:
+            #  Already claimed / Maxed
+            return f"""
+[C][B][FF0000]
+
+[FFFFFF]No Likes Sent!
+
+[FF0000]You have already taken likes with this UID.
+Try again after 24 hours.
+
+[FFFFFF]Player Name : [FF0000]{player_name}  
+[FFFFFF]Likes Before : [FF0000]{xMsGFixinG(likes_before)}  
+[FFFFFF]Likes After : [FF0000]{xMsGFixinG(likes_after)}  
+[C][B][FF0000]
+"""
+        else:
+            #  Unexpected case
+            return f"""
+[C][B][FF0000]
+[FFFFFF]Unexpected Response!
+Something went wrong.
+
+Please try again or contact support.
+
+"""
+
+    except requests.exceptions.RequestException:
+        return """
+[C][B][FF0000]
+[FFFFFF]Like API Connection Failed!
+Is the API server (app.py) running?
+
+"""
+    except Exception as e:
+        return f"""
+[C][B][FF0000]
+[FFFFFF]An unexpected error occurred:
+[FF0000]{str(e)}
+
+"""
 
 #CHAT WITH AI
 def talk_with_ai(question):
-    url = f"http://ai-api-mg24-pro.vercel.app/ask?key=MG24_GAMER&question={question}"
-    try:
-        res = requests.get(url)
-        if res.status_code == 200:
-            return res.text  # Direct plain text, no JSON parsing
-        return f"Error: {res.status_code}"
-    except Exception as e:
-        return f"Connection failed: {str(e)}"
-
+    url = f"https://princeaiapi.vercel.app/prince/api/v1/ask?key=prince&ask={question}"
+    res = requests.get(url)
+    if res.status_code == 200:
+        data = res.json()
+        msg = data["message"]["content"]
+        return msg
+    else:
+        return "An error occurred while connecting to the server."
 #SPAM REQUESTS
 def spam_requests(player_id):
     # This URL now correctly points to the Flask app you provided
-    url = f"https://like2.vercel.app/send_requests?uid={player_id}&server={server2}&key={key2}"
+    url = f"https://like2.vercel.app/send_requests?uid={xMsGFixinG(target_uid)}&server={server2}&key={key2}"
     try:
         res = requests.get(url, timeout=20) # Added a timeout
         if res.status_code == 200:
@@ -3148,7 +3451,7 @@ def spam_requests(player_id):
 # ** NEW INFO FUNCTION using the new API **
 def newinfo(uid):
     # Base URL without parameters
-    url = "https://mg-aqeel-info-v52.vercel.app/info?uid={uid}"
+    url = "https://like2.vercel.app/player-info"
     # Parameters dictionary - this is the robust way to do it
     params = {
         'uid': uid,
@@ -3186,1081 +3489,7 @@ def newinfo(uid):
         return {"status": "error", "message": "Invalid JSON response from API."}
         
 
-def bundle_packet(self, bundle_id, target_uid):
-        fields = {
-            1: 88,
-            2: {
-                1: {
-                    1: bundle_id,
-                    2: 1
-                },
-                2: 2
-            }
-        }
-        packet = create_protobuf_packet(fields).hex()
-        encrypted = encrypt_packet(packet, self.key, self.iv)
-        header_length = len(encrypted) // 2
-        header_length_hex = dec_to_hex(header_length)
-
-        if len(header_length_hex) == 2:
-            final_header = "0515000000"
-        elif len(header_length_hex) == 3:
-            final_header = "051500000"
-        elif len(header_length_hex) == 4:
-            final_header = "05150000"
-        elif len(header_length_hex) == 5:
-            final_header = "0515000"
-        else:
-            final_header = "0515000000"
-
-        final_packet = final_header + header_length_hex + encrypted
-        return bytes.fromhex(final_packet)
-
-async def bundle_packet_async(bundle_id, key, iv, region="ind"):
-    """Create bundle packet"""
-    fields = {
-        1: 88,
-        2: {
-            1: {
-                1: bundle_id,
-                2: 1
-            },
-            2: 2
-        }
-    }
-    
-    # Use your CrEaTe_ProTo function
-    packet = await CrEaTe_ProTo(fields)
-    packet_hex = packet.hex()
-    
-    # Use your encrypt_packet function
-    encrypted = await encrypt_packet(packet_hex, key, iv)
-    
-    # Use your DecodE_HeX function
-    header_length = len(encrypted) // 2
-    header_length_hex = await DecodE_HeX(header_length)
-    
-    # Build final packet based on region
-    if region.lower() == "ind":
-        packet_type = '0514'
-    elif region.lower() == "bd":
-        packet_type = "0519"
-    else:
-        packet_type = "0515"
-    
-    # Determine header based on length
-    if len(header_length_hex) == 2:
-        final_header = f"{packet_type}000000"
-    elif len(header_length_hex) == 3:
-        final_header = f"{packet_type}00000"
-    elif len(header_length_hex) == 4:
-        final_header = f"{packet_type}0000"
-    elif len(header_length_hex) == 5:
-        final_header = f"{packet_type}000"
-    else:
-        final_header = f"{packet_type}000000"
-    
-    final_packet_hex = final_header + header_length_hex + encrypted
-    return bytes.fromhex(final_packet_hex)
-
-def get_player_info(uid):
-    try:
-        url = f"https://mg-aqeel-info-v52.vercel.app/get?uid={uid}&region=bd"
-        res = requests.get(url, timeout=10)
-
-        if res.status_code != 200:
-            return None, f"API Error: {res.status_code}"
-
-        data = res.json()
-
-        # basic validation
-        if "AccountInfo" not in data:
-            return None, "Invalid API response"
-
-        return data
-
-    except requests.exceptions.Timeout:
-        return None, "Request timeout"
-
-    except Exception as e:
-        return None, str(e)
-
-        
-        		
-#ADDING-100-LIKES-IN-24H
-import requests
-
-def send_likes(uid):
-    try:
-        # API URL call
-        likes_api_response = requests.get(
-             f"https://silent-bd-like-api.up.railway.app/like?uid={uid}&server_name=bd",
-             timeout=15
-        )
-      
-        # Check if API is responding correctly
-        if likes_api_response.status_code != 200:
-            return f"\n[C][B][FF00FF]━━━━━\n[FFFFFF]Like API Error!\nStatus Code: {likes_api_response.status_code}\n━━━━━\n"
-
-        api_json_response = likes_api_response.json()
-
-        # Extracting data based on your screenshot keys
-        player_name = api_json_response.get('PlayerNickname', 'Unknown')
-        likes_before = api_json_response.get('LikesbeforeCommand', 0)
-        likes_after = api_json_response.get('LikesafterCommand', 0)
-        likes_added = api_json_response.get('LikesGivenByAPI', 0)
-        status = api_json_response.get('status', 0)
-
-        # Success check logic
-        if status == 1 or player_name != 'Unknown':
-            return f"""
-[C][B][11EAFD]‎━━━━━━━━━━━━
-[FFFFFF]Likes Status:
-[00FF00]Likes Sent Successfully!
-[FFFFFF]Player Name : [00FF00]{player_name}  
-[FFFFFF]Likes Added : [00FF00]{likes_added}  
-[FFFFFF]Likes Before : [00FF00]{likes_before}  
-[FFFFFF]Likes After : [00FF00]{likes_after}  
-[C][B][11EAFD]‎━━━━━━━━━━━━
-[C][B][DA70D6]❀️POWER  BY [FFFFFF] </> Apon gmaing 71 
-"""
-        # Error/Limit reached message
-        else:
-            return f"""
-[C][B][FF00FF]━━━━━━━━━━━━
-[FFFFFF]No Likes Sent!
-[FF00FF]Already claimed or limit reached.
-Try again after 24 hours.
-[FFFFFF]Player Name : [FF00FF]{player_name}  
-[FFFFFF]Likes Before : [FF00FF]{likes_before}  
-[FFFFFF]Likes After : [FF00FF]{likes_after}  
-[C][B][FF00FF]━━━━━━━━━━━━
-[C][B][DA70D6]❀️POWER BY [FFFFFF] </> APON GMAING 71 
-"""
-
-    except requests.exceptions.RequestException:
-        return "\n[C][B][FF00FF]━━━━━\n[FFFFFF]API Connection Failed!\n━━━━━\n"
-    except Exception as e:
-        return f"\n[C][B][FF00FF]━━━━━\n[FFFFFF]Error: {str(e)}\n━━━━━\n"
-        
-def get_player_add(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445077519&password=diablott_VQTMT_BY_SPIDEERIO_GAMING_WL9G7&friend_uid={uid}"
-        res = requests.get(url)
-        data = res.json()
-            # add is inside socialInfo -> signature
-        action = data.get('action', 'Unknown')
-        status = data.get('status', 'Unknown')
-        message = data.get('message', 'No message received')
-        if action:
-            return message
-        else:
-            return message
-    except Exception as e:
-        return f"Error occurred: {e}"
-def get_player_add_1(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444288892&password=diablo_Q4MUW_BY_SPIDEERIO_GAMING_TAJXG&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_2(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444292713&password=diablo_KMWYQ_BY_SPIDEERIO_GAMING_XLLI7&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_3(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444292726&password=diablo_HT3RO_BY_SPIDEERIO_GAMING_0BQFA&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_4(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444315321&password=diablo_SV6JV_BY_SPIDEERIO_GAMING_F9B4B&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_5(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444320750&password=diablo_7XC1Y_BY_SPIDEERIO_GAMING_AG1XQ&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_6(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444323598&password=diablo_IUFUQ_BY_SPIDEERIO_GAMING_QP3G7&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_7(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444327921&password=diablo_TPJ3O_BY_SPIDEERIO_GAMING_WO7QD&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_8(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444331568&password=diablo_AP2MF_BY_SPIDEERIO_GAMING_50X50&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_9(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444344133&password=diablo_LDYGK_BY_SPIDEERIO_GAMING_CNGI2&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_10(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444345133&password=diablo_MCVD6_BY_SPIDEERIO_GAMING_JK6WP&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_11(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444350783&password=diablo_0DE5F_BY_SPIDEERIO_GAMING_O1275&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_12(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444353077&password=diablo_7QL3P_BY_SPIDEERIO_GAMING_1ZNWU&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_13(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444358427&password=diablo_9IMC1_BY_SPIDEERIO_GAMING_NQRXG&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_14(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444363498&password=diablo_KDIKQ_BY_SPIDEERIO_GAMING_7B35N&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_15(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444363630&password=diablo_SC734_BY_SPIDEERIO_GAMING_YAI61&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_16(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444363732&password=diablo_CRVYP_BY_SPIDEERIO_GAMING_U4IDJ&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_17(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444847427&password=diablo_KR1UD_BY_SPIDEERIO_GAMING_ZC9HR&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_18(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444853245&password=diablo_SIRNU_BY_SPIDEERIO_GAMING_H4LFI&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_19(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444853309&password=diablo_HGWND_BY_SPIDEERIO_GAMING_AS170&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_20(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444853410&password=diablo_4J86V_BY_SPIDEERIO_GAMING_1O076&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_21(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444853538&password=diablo_5G7KE_BY_SPIDEERIO_GAMING_G5JJ2&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_22(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444853619&password=diablo_UCIVA_BY_SPIDEERIO_GAMING_C5AIB&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_23(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444853160&password=diablo_H98C9_BY_SPIDEERIO_GAMING_D2P7K&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_24(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444856183&password=diablo_CZH1G_BY_SPIDEERIO_GAMING_K63XM&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_25(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444859667&password=diablo_9Y2KL_BY_SPIDEERIO_GAMING_W4FF2&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_26(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444859945&password=diablo_118C4_BY_SPIDEERIO_GAMING_T1UKD&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_27(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444863394&password=diablo_T6WE6_BY_SPIDEERIO_GAMING_11RC5&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_28(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444878963&password=diablo_A8HRB_BY_SPIDEERIO_GAMING_5GFEF&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_29(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444885124&password=diablo_G09NL_BY_SPIDEERIO_GAMING_5J401&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_30(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444896903&password=diablo_VIEDI_BY_SPIDEERIO_GAMING_YNAWV&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_31(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444897085&password=diablo_MXTBW_BY_SPIDEERIO_GAMING_218OI&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_32(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444897140&password=diablo_49ZZ3_BY_SPIDEERIO_GAMING_RSJN4&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_33(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444897306&password=diablo_FO72U_BY_SPIDEERIO_GAMING_PBCA1&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_34(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444897429&password=diablo_XHQLQ_BY_SPIDEERIO_GAMING_WANGS&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_35(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444897410&password=diablo_IVKUG_BY_SPIDEERIO_GAMING_QBAV6&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_36(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444897376&password=diablo_RHNHF_BY_SPIDEERIO_GAMING_1TAOU&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_37(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444897682&password=diablo_NE813_BY_SPIDEERIO_GAMING_7U6P4&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_38(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444900040&password=diablo_C1BCC_BY_SPIDEERIO_GAMING_BLUCR&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_39(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444900223&password=diablo_H1G07_BY_SPIDEERIO_GAMING_JK450&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_40(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444900386&password=diablo_NM8BB_BY_SPIDEERIO_GAMING_E3DET&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_41(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444900719&password=diablo_RHN46_BY_SPIDEERIO_GAMING_CV4YX&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_42(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444910075&password=diablo_7M1AV_BY_SPIDEERIO_GAMING_ZD85O&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_43(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444909962&password=diablo_QP3DF_BY_SPIDEERIO_GAMING_MNNRS&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_44(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444915956&password=diablo_SJB0H_BY_SPIDEERIO_GAMING_W1GYW&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_45(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444916715&password=diablo_753K6_BY_SPIDEERIO_GAMING_O77CW&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_46(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444945595&password=diablo_F5H44_BY_SPIDEERIO_GAMING_HVSPI&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_47(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444948185&password=diablo_G01FX_BY_SPIDEERIO_GAMING_XU6RW&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_48(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444948201&password=diablo_XCQ1X_BY_SPIDEERIO_GAMING_5NN6Q&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_49(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444951206&password=diablo_FZQSP_BY_SPIDEERIO_GAMING_IF04U&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_50(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444960493&password=diablo_ATF01_BY_SPIDEERIO_GAMING_54WMU&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-def get_player_add_51(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444964170&password=diablo_Q1ZS6_BY_SPIDEERIO_GAMING_6GJDF&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_52(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444964218&password=diablo_K3YJ8_BY_SPIDEERIO_GAMING_7ODRG&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_53(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444969481&password=diablo_V9Q0A_BY_SPIDEERIO_GAMING_2JNYM&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_54(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444973195&password=diablo_P6YQ7_BY_SPIDEERIO_GAMING_1ATDW&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_55(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444973241&password=diablo_N8ZRM_BY_SPIDEERIO_GAMING_FKQ7U&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_56(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444978324&password=diablo_L2GQ5_BY_SPIDEERIO_GAMING_9WPRL&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_57(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444982379&password=diablo_M9ZX8_BY_SPIDEERIO_GAMING_3JSQH&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_58(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444986512&password=diablo_S4WQ9_BY_SPIDEERIO_GAMING_5KVXY&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_59(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444991234&password=diablo_R8PM2_BY_SPIDEERIO_GAMING_8HGND&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_60(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4444995678&password=diablo_T3QJ6_BY_SPIDEERIO_GAMING_7LKSW&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_61(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445001234&password=diablo_B5RW9_BY_SPIDEERIO_GAMING_2MNXF&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_62(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445006789&password=diablo_C7VH2_BY_SPIDEERIO_GAMING_4PQTZ&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_63(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445012345&password=diablo_D9KN4_BY_SPIDEERIO_GAMING_6RWVX&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_64(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445017890&password=diablo_E2LP6_BY_SPIDEERIO_GAMING_8SYQZ&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_65(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445023456&password=diablo_F4MQ8_BY_SPIDEERIO_GAMING_1TVB3&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_66(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445029012&password=diablo_G6NR0_BY_SPIDEERIO_GAMING_3UWC5&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_67(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445034567&password=diablo_H8PS2_BY_SPIDEERIO_GAMING_5VXD7&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_68(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445040123&password=diablo_J0QT4_BY_SPIDEERIO_GAMING_7WYE9&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_69(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445045678&password=diablo_K2RU6_BY_SPIDEERIO_GAMING_9XZF1&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_70(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445051234&password=diablo_L4SV8_BY_SPIDEERIO_GAMING_2YAG3&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_71(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445056789&password=diablo_M6TW0_BY_SPIDEERIO_GAMING_4ZBH5&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_72(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445062345&password=diablo_N8UX2_BY_SPIDEERIO_GAMING_6ACI7&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_73(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445067890&password=diablo_P0VY4_BY_SPIDEERIO_GAMING_8BDJ9&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_74(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445073456&password=diablo_Q2WZ6_BY_SPIDEERIO_GAMING_1CEK0&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_75(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445079012&password=diablo_R4X18_BY_SPIDEERIO_GAMING_3DFL2&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_76(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445084567&password=diablo_S6Y39_BY_SPIDEERIO_GAMING_5EGM4&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_77(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445090123&password=diablo_T8Z50_BY_SPIDEERIO_GAMING_7FHN6&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_78(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445095678&password=diablo_U0162_BY_SPIDEERIO_GAMING_9GIO8&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_79(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445101234&password=diablo_V2284_BY_SPIDEERIO_GAMING_2HJP0&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_80(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445106789&password=diablo_W4406_BY_SPIDEERIO_GAMING_4IKQ2&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_81(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445112345&password=diablo_X6528_BY_SPIDEERIO_GAMING_6JLR4&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_82(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445117890&password=diablo_Y8640_BY_SPIDEERIO_GAMING_8KMS6&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_83(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445123456&password=diablo_Z0862_BY_SPIDEERIO_GAMING_1LNT8&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_84(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445129012&password=diablo_A2084_BY_SPIDEERIO_GAMING_3MOU0&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_85(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445134567&password=diablo_B4206_BY_SPIDEERIO_GAMING_5NPV2&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_86(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445140123&password=diablo_C6428_BY_SPIDEERIO_GAMING_7OQW4&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_87(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445145678&password=diablo_D8640_BY_SPIDEERIO_GAMING_9PRX6&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_88(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445151234&password=diablo_E0862_BY_SPIDEERIO_GAMING_2QSY8&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_89(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445156789&password=diablo_F2084_BY_SPIDEERIO_GAMING_4RTZ0&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_90(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445162345&password=diablo_G4206_BY_SPIDEERIO_GAMING_6SUA2&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_91(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445167890&password=diablo_H6428_BY_SPIDEERIO_GAMING_8TVB4&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_92(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445173456&password=diablo_J8640_BY_SPIDEERIO_GAMING_1UWX6&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_93(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445179012&password=diablo_K0862_BY_SPIDEERIO_GAMING_3VXY8&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_94(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445184567&password=diablo_L2084_BY_SPIDEERIO_GAMING_5WYZ0&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_95(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445190123&password=diablo_M4206_BY_SPIDEERIO_GAMING_7XZA2&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_96(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445195678&password=diablo_N6428_BY_SPIDEERIO_GAMING_9Y0B4&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_97(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445201234&password=diablo_P8640_BY_SPIDEERIO_GAMING_2Z1C6&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_98(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445206789&password=diablo_Q0862_BY_SPIDEERIO_GAMING_402D8&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_99(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445212345&password=diablo_R2084_BY_SPIDEERIO_GAMING_613E0&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_100(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445217890&password=diablo_S4206_BY_SPIDEERIO_GAMING_824F2&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_101(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445223456&password=diablo_T6428_BY_SPIDEERIO_GAMING_1A5G4&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-def get_player_add_102(uid):
-    try:
-        url = f"https://danger-friend-manager.vercel.app/get_friends_list?uid=4445229012&password=diablo_U8640_BY_SPIDEERIO_GAMING_3B6H6&friend_uid={uid}"
-        res = requests.get(url)
-        return res.json().get('message', 'No message')
-    except Exception as e: return f"Error: {e}"
-
-async def send_all_friend_requests_async(target_uid):
-    # ১০০টি ফাংশনের মাস্টার লিস্ট
-    functions = [
-        get_player_add_1, get_player_add_2, get_player_add_3, get_player_add_4, get_player_add_5,
-        get_player_add_6, get_player_add_7, get_player_add_8, get_player_add_9, get_player_add_10,
-        get_player_add_11, get_player_add_12, get_player_add_13, get_player_add_14, get_player_add_15,
-        get_player_add_16, get_player_add_17, get_player_add_18, get_player_add_19, get_player_add_20,
-        get_player_add_21, get_player_add_22, get_player_add_23, get_player_add_24, get_player_add_25,
-        get_player_add_26, get_player_add_27, get_player_add_28, get_player_add_29, get_player_add_30,
-        get_player_add_31, get_player_add_32, get_player_add_33, get_player_add_34, get_player_add_35,
-        get_player_add_36, get_player_add_37, get_player_add_38, get_player_add_39, get_player_add_40,
-        get_player_add_41, get_player_add_42, get_player_add_43, get_player_add_44, get_player_add_45,
-        get_player_add_46, get_player_add_47, get_player_add_48, get_player_add_49, get_player_add_50,
-        get_player_add_51, get_player_add_52, get_player_add_53, get_player_add_54, get_player_add_55,
-        get_player_add_56, get_player_add_57, get_player_add_58, get_player_add_59, get_player_add_60,
-        get_player_add_61, get_player_add_62, get_player_add_63, get_player_add_64, get_player_add_65,
-        get_player_add_66, get_player_add_67, get_player_add_68, get_player_add_69, get_player_add_70,
-        get_player_add_71, get_player_add_72, get_player_add_73, get_player_add_74, get_player_add_75,
-        get_player_add_76, get_player_add_77, get_player_add_78, get_player_add_79, get_player_add_80,
-        get_player_add_81, get_player_add_82, get_player_add_83, get_player_add_84, get_player_add_85,
-        get_player_add_86, get_player_add_87, get_player_add_88, get_player_add_89, get_player_add_90,
-        get_player_add_91, get_player_add_92, get_player_add_93, get_player_add_94, get_player_add_95,
-        get_player_add_96, get_player_add_97, get_player_add_98, get_player_add_99, get_player_add_100
-    ]
-
-    try:
-        loop = asyncio.get_event_loop()
-        
-        # ThreadPoolExecutor ব্যবহার করে ১০০টি রিকোয়েস্টকে নন-ব্লকিং ভাবে সাজানো
-        # max_workers=50 দেওয়া হয়েছে যাতে খুব দ্রুত কাজ শেষ হয়
-        with ThreadPoolExecutor(max_workers=50) as executor:
-            tasks = [
-                loop.run_in_executor(executor, func, target_uid) 
-                for func in functions
-            ]
-            
-            # সব রিকোয়েস্ট শেষ হওয়া পর্যন্ত অপেক্ষা (কিন্তু বট ফ্রীজ হবে না)
-            results = await asyncio.gather(*tasks)
-            
-        success_count = len([r for r in results if "Error" not in r])
-        return f"Successfully processed {success_count}/100 requests."
-
-    except Exception as e:
-        return f"System Error: {str(e)}"    
-#USERNAME TO insta INFO 
-def send_insta_info(username):
-    try:
-        response = requests.get(f"https://kallu-insta-info-api.vercel.app/api/insta/{username}", timeout=15)
-        if response.status_code != 200:
-            return f"[B][C][FF0000]❌ Instagram API Error! Status Code: {response.status_code}"
-
-        user = response.json()
-        full_name = user.get("full_name", "Unknown")
-        followers = user.get("edge_followed_by", {}).get("count") or user.get("followers_count", 0)
-        following = user.get("edge_follow", {}).get("count") or user.get("following_count", 0)
-        posts = user.get("media_count") or user.get("edge_owner_to_timeline_media", {}).get("count", 0)
-        profile_pic = user.get("profile_pic_url_hd") or user.get("profile_pic_url")
-        private_status = user.get("is_private")
-        verified_status = user.get("is_verified")
-
-        return f"""
-[B][C][FB0364]╭[D21A92]─[BC26AB]╮[FB0364]╔══════════════╗
-[C][B][FF7244]│[FE4250]◯[C81F9C]֯│[D21A92]║[FDC92B] INSTAGRAM INFO [D21A92]║
-[C][B][FDC92B]╰[FF7640]─[F5066B]╯[FB0364]╚══════════════╝
-
-[C][B][C81F9C]━━━━━━━━━━━━━━━━━━━━
-[C][B][FF7244]Name       : [ADFF2F]{full_name}
-[C][B][FF7244]Username   : [1E90FF]{username}
-[C][B][FF7244]Followers  : [FDC92B]{followers}
-[C][B][FF7244]Following  : [FDC92B]{following}
-[C][B][FF7244]Posts      : [00FA9A]{posts}
-[C][B][FF7244]Private    : [FF6F91]{private_status}
-[C][B][FF7244]Verified   : [7B68EE]{verified_status}
-[C][B][C81F9C]━━━━━━━━━━━━━━━━━━━━"""
-    except requests.exceptions.RequestException:
-        return "[B][C][FF0000]❌ Instagram API Connection Failed!"
-    except Exception as e:
-        return f"[B][C][FF0000]❌ Unexpected Error: {str(e)}"
-
-def send_tiktok_info(username):
-
-    try:
-        response = requests.get(
-            f"https://tiktok-api-mafia-ayan.vercel.app/tkinfo?username={username}",
-            timeout=15
-        )
-
-        if response.status_code != 200:
-            return f"[B][C][FF0000]❌ TikTok API Error! Status Code: {response.status_code}"
-
-        user = response.json()
-
-        if user.get("status") is not True:
-            return "[B][C][FF0000]❌ TikTok User Not Found!"
-
-        name = user.get("name", "Unknown")
-        username_ = user.get("username", username)
-        followers = user.get("followers", 0)
-        following = user.get("following", 0)
-        likes = user.get("hearts", 0)
-        videos = user.get("videos", 0)
-        private_status = user.get("is_private", False)
-        digg_count = user.get("digg_count", 0)
-        signature = user.get("signature", "")
-        user_id = user.get("user_id", "Unknown")
-
-        return f"""
-[B][C][00FFFF]╭[00FFFF]─[00FFFF]╮[FFFFFF]
-[C][B][00FFFF]│[FFFFFF]ꚠ[00FFFF]│[FFFFFF]║[00FFFF]TIKTOK INFO[FFFFFF]║
-[C][B][00FFFF]╰[00FFFF]─[00FFFF]╯[FFFFFF]
-[C][B][B027F5]━━━━━━━━━━━
-[C][B][FFFFFF]Username   : [32CD32]{username_}
-[C][B][FF00FF]Signature  : [00BFFF]{signature}
-[C][B][27F5BE]Followers  : [00BFFF]{followers}
-[C][B][7CFC00]Following  : [00BFFF]{following}
-[C][B][27F5B0]Likes      : [00BFFF]{likes}
-[C][B][00FF00]Videos     : [00BFFF]{videos}
-[C][B][00FFFF]Private    : [00FFFF]{private_status}
-[C][B][00FFFF]━━━━━━━━━━━
-"""
-
-    except requests.exceptions.RequestException:
-        return "[B][C][FF0000]❌ TikTok API Connection Failed!"
-    except Exception as e:
-        return f"[B][C][FF0000]❌ Unexpected Error: {str(e)}"
-        
-        
-async def send_full_player_info(data, chat_type, uid, chat_id, key, iv):
-
-    acc = data.get("AccountInfo", {})
-    guild = data.get("GuildInfo", {})
-    social = data.get("socialinfo", {})
-    captain = data.get("captainBasicInfo", {})
-
-    # ────────── MESSAGE 1 : COMMON ACCOUNT INFO ──────────
-    msg1 = f"""
-[C][B][FFAA00]━━━━━━━━━━━━━
-[C][B][FFFFFF]COMMON ACCOUNT INFO
-[C][FFAA00]━━━━━━━━━━━━━
-[C][FFFFFF]Name      : [66FF00]{acc.get('AccountName', 'N/A')}
-[C][FFFFFF]UID       : [66FF00]{ff_num(captain.get('accountId'))}
-[C][FFFFFF]Level     : [66FF00]{acc.get('AccountLevel', 'N/A')}
-[C][FFFFFF]EXP       : [66FF00]{ff_num(acc.get('AccountEXP'))}
-[C][FFFFFF]Likes     : [66FF00]{ff_num(acc.get('AccountLikes'))}
-[C][FFFFFF]Region    : [66FF00]{acc.get('AccountRegion', 'N/A')}
-[C][FFFFFF]BP Badge  : [66FF00]{ff_num(acc.get('AccountBPID'))}
-[C][FFFFFF]Version   : [66FF00]{acc.get('ReleaseVersion', 'N/A')}
-"""
-
-    await safe_send_message(chat_type, msg1, uid, chat_id, key, iv)
-    await asyncio.sleep(0.5)
-
-    # ────────── MESSAGE 2 : DATE + RANK INFO ──────────
-    lang = social.get("language", "N/A")
-    if "_" in lang:
-        lang = lang.split("_")[-1]   # ARABIC, ENGLISH
-    msg2 = f"""
-[C][B][FFAA00]━━━━━━━━━━━━━
-[C][B][FFFFFF]ACCOUNT DETAILS
-[C][FFAA00]━━━━━━━━━━━━━
-[C][FFFFFF]Create Date : [66FF00]{human_time(acc.get('AccountCreateTime'))[:16]}
-[C][FFFFFF]Last Login  : [66FF00]{human_time(acc.get('AccountLastLogin'))[:16]}
-[C][FFFFFF]BR Max Rank     : [66FF00]{ff_num(acc.get('BrMaxRank'))}
-[C][FFFFFF]BR Points   : [66FF00]{ff_num(acc.get('BrRankPoint'))}
-[C][FFFFFF]CS Max Rank     : [66FF00]{ff_num(acc.get('CsMaxRank'))}
-[C][FFFFFF]CS Points   : [66FF00]{ff_num(acc.get('CsRankPoint'))}
-[C][FFFFFF]Language    : [66FF00]{lang}
-"""
-
-    await safe_send_message(chat_type, msg2, uid, chat_id, key, iv)
-    await asyncio.sleep(0.5)
-
-    # ────────── MESSAGE 3 : FULL GUILD INFO ──────────
-    msg3 = f"""
-[C][B][FFAA00]━━━━━━━━━━━━━
-[C][B][FFFFFF]GUILD INFORMATION
-[C][FFAA00]━━━━━━━━━━━━━
-[C][FFFFFF]Guild Name   : [66FF00]{guild.get('GuildName', 'No Guild')}
-[C][FFFFFF]Guild ID     : [66FF00]{ff_num(guild.get('GuildID'))}
-[C][FFFFFF]Owner UID    : [66FF00]{ff_num(guild.get('GuildOwner'))}
-[C][FFFFFF]Guild Level  : [66FF00]{guild.get('GuildLevel', 'N/A')}
-[C][FFFFFF]Members      : [66FF00]{guild.get('GuildMember', '0')}/{guild.get('GuildCapacity', '0')}
-"""
-
-    await safe_send_message(chat_type, msg3, uid, chat_id, key, iv)
-    
-                    
-####################################
-#CHECK ACCOUNT IS BANNED
-
+ 
 Hr = {
     'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 11; ASUS_Z01QD Build/PI)",
     'Connection': "Keep-Alive",
@@ -4269,12 +3498,12 @@ Hr = {
     'Expect': "100-continue",
     'X-Unity-Version': "2018.4.11f1",
     'X-GA': "v1 1",
-    'ReleaseVersion': "OB54"}
+    'ReleaseVersion': "OB56"}
 
 # ---- Random Colores ----
 def get_random_color():
     colors = [
-        "[FF0000]", "[FFFF00]", "[0000FF]", "[FFFF00]", "[FF00FF]", "[00FFFF]", "[FFFFFF]", "[FFA500]",
+        "[FF0000]", "[00FF00]", "[0000FF]", "[FFFF00]", "[FF00FF]", "[00FFFF]", "[FFFFFF]", "[FFA500]",
         "[A52A2A]", "[800080]", "[000000]", "[808080]", "[C0C0C0]", "[FFC0CB]", "[FFD700]", "[ADD8E6]",
         "[90EE90]", "[D2691E]", "[DC143C]", "[00CED1]", "[9400D3]", "[F08080]", "[20B2AA]", "[FF1493]",
         "[7CFC00]", "[B22222]", "[FF4500]", "[DAA520]", "[00BFFF]", "[00FF7F]", "[4682B4]", "[6495ED]",
@@ -4317,7 +3546,7 @@ async def extract_uid_from_emote_packet(data_hex, key, iv):
         packet = await DeCode_PackEt(data_hex[10:])
         packet_json = json.loads(packet)
         
-        print(f"📦 Analyzing packet structure: {json.dumps(packet_json, indent=2)[:200]}...")
+        print(f" Analyzing packet structure: {json.dumps(packet_json, indent=2)[:200]}...")
         
         # PATTERN 1: Your Emote_k() structure (Type 21)
         if packet_json.get('1') == 21:
@@ -4327,7 +3556,7 @@ async def extract_uid_from_emote_packet(data_hex, key, iv):
                 nested = packet_json['2']['data']['5']['data']
                 if '1' in nested:
                     uid = nested['1']['data']
-                    print(f"✅ Extracted UID from pattern 21: {uid}")
+                    print(f" Extracted UID from pattern 21: {uid}")
                     return uid
         
         # PATTERN 2: Direct emote structure
@@ -4336,7 +3565,7 @@ async def extract_uid_from_emote_packet(data_hex, key, iv):
                 '1' in packet_json['2']['data']):
                 
                 uid = packet_json['2']['data']['1']['data']
-                print(f"✅ Extracted UID from pattern 26: {uid}")
+                print(f" Extracted UID from pattern 26: {uid}")
                 return uid
         
         # PATTERN 3: Try common paths
@@ -4344,16 +3573,16 @@ async def extract_uid_from_emote_packet(data_hex, key, iv):
             try:
                 uid = get_nested_value(packet_json, path)
                 if uid and str(uid).isdigit() and len(str(uid)) > 6:
-                    print(f"✅ Extracted UID from path {path}: {uid}")
+                    print(f" Extracted UID from path {path}: {uid}")
                     return uid
             except:
                 pass
         
-        print(f"❌ Could not extract UID from packet")
+        print(f" Could not extract UID from packet")
         return None
         
     except Exception as e:
-        print(f"❌ UID extraction error: {e}")
+        print(f" UID extraction error: {e}")
         return None
 
 def get_nested_value(data, path):
@@ -4378,7 +3607,7 @@ async def ultra_quick_emote_attack(team_code, emote_id, target_uid, key, iv, reg
         # Step 1: Join the team
         join_packet = await GenJoinSquadsPacket(team_code, key, iv)
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
-        print(f"🤖 Joined team: {team_code}")
+        print(f" Joined team: {team_code}")
         
         # Wait for team data and chat authentication
         await asyncio.sleep(1.5)  # Increased to ensure proper connection
@@ -4389,7 +3618,7 @@ async def ultra_quick_emote_attack(team_code, emote_id, target_uid, key, iv, reg
         # Step 3: Perform emote to target UID
         emote_packet = await Emote_k(int(target_uid), int(emote_id), key, iv, region)
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-        print(f"🎭 Performed emote {emote_id} to UID {target_uid}")
+        print(f" Performed emote {emote_id} to UID {xMsGFixinG(target_uid)}")
         
         # Wait for emote to register
         await asyncio.sleep(0.5)
@@ -4397,12 +3626,149 @@ async def ultra_quick_emote_attack(team_code, emote_id, target_uid, key, iv, reg
         # Step 4: Leave the team
         leave_packet = await ExiT(None, key, iv)
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
-        print(f"🚪 Left team: {team_code}")
+        print(f" Left team: {team_code}")
         
-        return True, f"Quick emote attack completed! Sent emote to UID {target_uid}"
+        return True, f"Quick emote attack completed! Sent emote to UID {xMsGFixinG(target_uid)}"
         
     except Exception as e:
         return False, f"Quick emote attack failed: {str(e)}"
+
+async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input, key, iv, region, mode="quit"):
+    """
+    Ultra-fast squad join / locked session -> emote targeting player UID(s) -> leave squad (if mode=="quit")
+    Modes:
+      - 'quit': Join, emote, immediately exit squad.
+      - 'lock': Join, emote, stay in squad, return a unique session_id (e.g. LOCK_A1B2C3).
+      - 'session': If team_code_or_session is a valid active session_id, send emote directly without joining!
+    """
+    global insquad, online_writer
+    try:
+        if not region:
+            region = "IND"
+
+        if isinstance(uids_input, str):
+            uids_list = [u.strip() for u in uids_input.replace(',', ' ').split() if u.strip()]
+        elif isinstance(uids_input, (list, tuple)):
+            uids_list = [str(u).strip() for u in uids_input if str(u).strip()]
+        else:
+            uids_list = [str(uids_input)]
+
+        resolved_emote_id = 909000063
+        emote_str = str(emote_input).strip().lower()
+
+        if 'NAME_EMOTES' in globals() and emote_str in NAME_EMOTES:
+            resolved_emote_id = NAME_EMOTES[emote_str]
+        elif 'evo_emotes' in globals() and emote_str in evo_emotes:
+            resolved_emote_id = evo_emotes[emote_str]
+        elif 'EMOTE_MAP' in globals() and emote_str.isdigit() and int(emote_str) in EMOTE_MAP:
+            resolved_emote_id = EMOTE_MAP[int(emote_str)]
+        elif emote_str.isdigit():
+            resolved_emote_id = int(emote_str)
+
+        target_identifier = str(team_code_or_session).strip()
+        session_id = None
+        is_locked_session = False
+
+        cleanup_expired_sessions()
+
+        # CASE 1: Target is a LOCK session ID (e.g. LOCK_14010319252_A1B2C3) or active session
+        if target_identifier.startswith("LOCK_") or target_identifier in ACTIVE_LOCK_SESSIONS:
+            session_id = target_identifier
+            is_locked_session = True
+
+            # Register/refresh session in ACTIVE_LOCK_SESSIONS & keep insquad set
+            current_uid = sys.argv[1] if len(sys.argv) > 1 else "14010319252"
+            if session_id not in ACTIVE_LOCK_SESSIONS:
+                ACTIVE_LOCK_SESSIONS[session_id] = {
+                    "team_code": "LOCKED_SQUAD",
+                    "bot_uid": str(current_uid),
+                    "created_at": time.time()
+                }
+            insquad = session_id
+
+            if not mode or mode.lower() != "quit":
+                mode = "lock"
+            print(f"⚡ [FAST EMOTE LOCK] Executing emote via active session {session_id} for emote {resolved_emote_id} (Mode={mode})")
+
+        # CASE 2: New squad join request (team_code like 123456)
+        else:
+            is_locked, lock_sid = is_bot_locked()
+            if is_locked:
+                err_msg = f"Bot is currently locked in squad session {lock_sid}. Cannot join team {target_identifier} until session expires (5 min max) or leaves!"
+                print(f"🚫 [LOCK BUSY] {err_msg}")
+                return False, {"status": "error", "message": err_msg}
+
+            team_code = target_identifier
+            print(f"⚡ [FAST EMOTE JOIN] Joining team {team_code} (Mode={mode}) for emote {resolved_emote_id} on UIDs: {uids_list}")
+            join_packet = await GenJoinSquadsPacket(team_code, key, iv)
+            if join_packet:
+                await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
+
+            # Wait 0.85s for server to place bot in squad & process squad join state
+            await asyncio.sleep(0.85)
+
+            if str(mode).lower() == "lock":
+                session_id = create_lock_session(team_code)
+                is_locked_session = True
+                insquad = session_id
+                print(f"🔒 [LOCK MODE] Lock session created: {session_id}")
+            else:
+                insquad = True
+
+        # Force IND region for Free Fire India Server
+        region = "IND"
+
+        # Send emote packet to target UID(s) AND squad broadcast (0) for 100% visibility to all squad members
+        target_targets = uids_list if uids_list else ["0"]
+        for target_uid in target_targets:
+            try:
+                target_num = int(target_uid) if str(target_uid).isdigit() else 0
+                
+                # 1. Targeted Emote Packet
+                emote_packet_target = await Emote_k(target_num, int(resolved_emote_id), key, iv, region)
+                if emote_packet_target:
+                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet_target)
+                
+                await asyncio.sleep(0.04)
+
+                # 2. Squad Broadcast Emote Packet (UID 0) to guarantee all players see the emote
+                if target_num != 0:
+                    emote_packet_broadcast = await Emote_k(0, int(resolved_emote_id), key, iv, region)
+                    if emote_packet_broadcast:
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet_broadcast)
+                
+                print(f"⚡ [FAST EMOTE] Sent targeted & squad broadcast emote ({resolved_emote_id}) for UID {target_uid}")
+            except Exception as e:
+                print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
+
+        if str(mode).lower() == "quit":
+            # Wait 1.2s so emote animation fully renders for everyone in the squad before leaving
+            await asyncio.sleep(1.2)
+            leave_packet = await ExiT(None, key, iv)
+            if leave_packet:
+                await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
+                print(f"⚡ [FAST EMOTE] Left team (Quit mode)")
+            insquad = None
+            if session_id:
+                invalidate_lock_session(session_id)
+
+            return True, {
+                "status": "success",
+                "mode": "quit",
+                "message": f"Fast emote attack completed (quit mode)"
+            }
+        else:
+            insquad = session_id or True
+            return True, {
+                "status": "success",
+                "mode": "lock",
+                "session_id": session_id,
+                "message": f"Fast emote performed. Bot locked in squad (Session: {session_id})"
+            }
+
+    except Exception as e:
+        print(f"⚡ [FAST EMOTE] Error: {e}")
+        return False, {"status": "error", "message": str(e)}
         
         
 async def encrypted_proto(encoded_hex):
@@ -4428,13 +3794,32 @@ async def GeNeRaTeAccEss(uid , password):
         "client_type": "2",
         "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
         "client_id": "100067"}
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=Hr, data=data) as response:
-            if response.status != 200: return "Failed to get access token"
-            data = await response.json()
-            open_id = data.get("open_id")
-            access_token = data.get("access_token")
-            return (open_id, access_token) if open_id and access_token else (None, None)
+    max_retries = 3
+    for attempt in range(max_retries):
+        async with aiohttp.ClientSession() as session:
+            try:
+                # Use headers if defined, otherwise use a default set
+                request_headers = headers if 'headers' in locals() else {
+                    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; G011A Build/PI)",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                }
+                async with session.post(url, headers=request_headers, data=data) as response:
+                    if response.status == 200:
+                        resp_data = await response.json()
+                        open_id = resp_data.get("open_id")
+                        access_token = resp_data.get("access_token")
+                        return (open_id, access_token) if open_id and access_token else (None, None)
+                    elif response.status == 429:
+                        wait_time = (attempt + 1) * 2
+                        print(f" [429] Rate limited. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        print(f" Failed to get access token. Status: {response.status}")
+                        return (None, None)
+            except Exception as e:
+                print(f" [ERROR] Token request error: {e}")
+                await asyncio.sleep(1)
+    return (None, None)
 
 async def EncRypTMajoRLoGin(open_id, access_token):
     major_login = MajoRLoGinrEq_pb2.MajorLogin()
@@ -4505,7 +3890,17 @@ async def MajorLogin(payload):
     ssl_context.verify_mode = ssl.CERT_NONE
     async with aiohttp.ClientSession() as session:
         async with session.post(url, data=payload, headers=Hr, ssl=ssl_context) as response:
-            if response.status == 200: return await response.read()
+            if response.status == 200: 
+                return await response.read()
+            
+            # Debugging failure
+            try:
+                resp_text = await response.text()
+                print(f" MajorLogin Failed! Status: {response.status}")
+                print(f" Response: {resp_text[:200]}")
+            except:
+                print(f" MajorLogin Failed! Status: {response.status}")
+                
             return None
 
 async def GetLoginData(base_url, payload, token):
@@ -4587,9 +3982,27 @@ async def SEndMsG(H, message, Uid, chat_id, key, iv, region):
     
     
 async def SEndPacKeT(OnLinE , ChaT , TypE , PacKeT):
-    if TypE == 'ChaT' and ChaT: whisper_writer.write(PacKeT) ; await whisper_writer.drain()
-    elif TypE == 'OnLine': online_writer.write(PacKeT) ; await online_writer.drain()
-    else: return 'UnsoPorTed TypE ! >> ErrrroR (:():)' 
+    try:
+        if TypE == 'ChaT':
+            if whisper_writer and not whisper_writer.is_closing():
+                whisper_writer.write(PacKeT)
+                await whisper_writer.drain()
+            else:
+                print("⚠️ [SEND PACKET] whisper_writer unavailable")
+                return False
+        elif TypE == 'OnLine':
+            if online_writer and not online_writer.is_closing():
+                online_writer.write(PacKeT)
+                await online_writer.drain()
+            else:
+                print("⚠️ [SEND PACKET] online_writer unavailable")
+                return False
+        else:
+            return 'UnsoPorTed TypE ! >> ErrrroR (:():)'
+        return True
+    except Exception as e:
+        print(f"⚠️ [SEND PACKET ERROR] {e}")
+        return False 
 
 async def safe_send_message(chat_type, message, target_uid, chat_id, key, iv, max_retries=3, region="ind"):
     """Enhanced safe send message that works with custom rooms"""
@@ -4598,10 +4011,10 @@ async def safe_send_message(chat_type, message, target_uid, chat_id, key, iv, ma
             P = await SEndMsG(chat_type, message, target_uid, chat_id, key, iv, region)
             await SEndPacKeT(whisper_writer, online_writer, 'ChaT', P)
                 
-            print(f"✅ Message sent successfully to chat type {chat_type} (attempt {attempt + 1})")
+            print(f" Message sent successfully to chat type {chat_type} (attempt {attempt + 1})")
             return True
         except Exception as e:
-            print(f"❌ Failed to send message (attempt {attempt + 1}): {e}")
+            print(f" Failed to send message (attempt {attempt + 1}): {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(0.5)
     return False
@@ -4646,10 +4059,10 @@ async def create_level_up_bot_connection(key, iv, region):
     try:
         # This would use a different bot account
         # For now, we'll use the main bot
-        print("🤖 Level-up bot connection initialized")
+        print(" Level-up bot connection initialized")
         return True
     except Exception as e:
-        print(f"❌ Level-up bot connection error: {e}")
+        print(f" Level-up bot connection error: {e}")
         return False
 
 async def level_up_join_team(team_code, key, iv, region):
@@ -4657,11 +4070,11 @@ async def level_up_join_team(team_code, key, iv, region):
     try:
         join_packet = await GenJoinSquadsPacket(team_code, key, iv)
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
-        print(f"🤖 Level-up bot joining team: {team_code}")
+        print(f" Level-up bot joining team: {team_code}")
         await asyncio.sleep(2)
         return True
     except Exception as e:
-        print(f"❌ Level-up bot join error: {e}")
+        print(f" Level-up bot join error: {e}")
         return False
 
 async def level_up_leave_team(key, iv):
@@ -4669,11 +4082,11 @@ async def level_up_leave_team(key, iv):
     try:
         leave_packet = await ExiT(None, key, iv)
         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', leave_packet)
-        print("🤖 Level-up bot leaving team")
+        print(" Level-up bot leaving team")
         await asyncio.sleep(1)
         return True
     except Exception as e:
-        print(f"❌ Level-up bot leave error: {e}")
+        print(f" Level-up bot leave error: {e}")
         return False
         
 async def level_up_loop(team_code, target_uid, key, iv, region, chat_type, chat_id):
@@ -4683,34 +4096,34 @@ async def level_up_loop(team_code, target_uid, key, iv, region, chat_type, chat_
     cycle_count = 0
     max_cycles = 1000  # Safety limit
     
-    print(f"🚀 Starting level-up automation for team {team_code}")
+    print(f" Starting level-up automation for team {team_code}")
     
     while level_up_running and cycle_count < max_cycles:
         try:
             cycle_count += 1
-            print(f"🔄 Level-up cycle #{cycle_count}")
+            print(f" Level-up cycle #{cycle_count}")
             
             # Step 1: Send instruction message
-            instruction_msg = f"""[B][C][FFFF00]🔄 LEVEL-UP CYCLE #{cycle_count}
+            instruction_msg = f"""[B][C][00FF00] LEVEL-UP CYCLE #{cycle_count}
 
-🤖 Bot: Joining your team...
-🎮 Action: Will start match
-⏱️ After match: Wait {level_up_wait_time} seconds
-🔄 Then: Repeat process
+ Bot: Joining your team...
+ Action: Will start match
+ After match: Wait {level_up_wait_time} seconds
+ Then: Repeat process
 
-📊 Status: Bot is working...
+ Status: Bot is working...
 """
             await safe_send_message(chat_type, instruction_msg, target_uid, chat_id, key, iv)
             
             # Step 2: Join the team
             join_success = await level_up_join_team(team_code, key, iv, region)
             if not join_success:
-                print("❌ Failed to join team, retrying...")
+                print(" Failed to join team, retrying...")
                 await asyncio.sleep(2)
                 continue
             
             # Step 3: Send "ready" message
-            ready_msg = f"[B][C][FFFF00]✅ Bot joined! Starting match...\n"
+            ready_msg = f"[B][C][00FF00] Bot joined! Starting match...\n"
             await safe_send_message(chat_type, ready_msg, target_uid, chat_id, key, iv)
             
             # Step 4: Start the match (spam start packet)
@@ -4723,13 +4136,13 @@ async def level_up_loop(team_code, target_uid, key, iv, region, chat_type, chat_
                 await asyncio.sleep(0.2)  # 200ms delay between packets
             
             # Step 5: Wait for match to complete (simulate)
-            waiting_msg = f"""[B][C][FFFF00]⏱️ MATCH IN PROGRESS...
+            waiting_msg = f"""[B][C][FFFF00] MATCH IN PROGRESS...
 
-⏳ Waiting for match to complete...
-🔄 Next cycle starts in {level_up_wait_time} seconds
-🤖 Bot remains in team
+ Waiting for match to complete...
+ Next cycle starts in {level_up_wait_time} seconds
+ Bot remains in team
 
-💡 Let the match complete normally!
+ Let the match complete normally!
 """
             await safe_send_message(chat_type, waiting_msg, target_uid, chat_id, key, iv)
             
@@ -4741,7 +4154,7 @@ async def level_up_loop(team_code, target_uid, key, iv, region, chat_type, chat_
                 
                 # Progress update every 5 seconds
                 if wait_count % 5 == 0:
-                    progress_msg = f"[B][C][FFFF00]⏱️ {wait_count}/{level_up_wait_time} seconds waited...\n"
+                    progress_msg = f"[B][C][00FF00] {wait_count}/{level_up_wait_time} seconds waited...\n"
                     await safe_send_message(chat_type, progress_msg, target_uid, chat_id, key, iv)
             
             if not level_up_running:
@@ -4751,19 +4164,19 @@ async def level_up_loop(team_code, target_uid, key, iv, region, chat_type, chat_
             leave_success = await level_up_leave_team(key, iv)
             
             if leave_success:
-                leave_msg = f"[B][C][FF0000]🚪 Bot left team to restart cycle...\n"
+                leave_msg = f"[B][C][FF0000] Bot left team to restart cycle...\n"
                 await safe_send_message(chat_type, leave_msg, target_uid, chat_id, key, iv)
             
             # Step 8: Small delay before next cycle
             await asyncio.sleep(2)
             
         except Exception as e:
-            print(f"❌ Error in level-up cycle: {e}")
+            print(f" Error in level-up cycle: {e}")
             # Try to recover
             await level_up_leave_team(key, iv)
             await asyncio.sleep(3)
     
-    print("🛑 Level-up automation stopped")
+    print(" Level-up automation stopped")
 
 async def Send_Entry_Emote(uid, K, V, emote_id=912038002, session_id=5, trigger_type=1):
     """Send arrival/entry animation emote
@@ -4807,34 +4220,11 @@ async def Send_Entry_Emote(uid, K, V, emote_id=912038002, session_id=5, trigger_
         return await GeneRaTePk(proto_hex, '0515', K, V)
         
     except Exception as e:
-        print(f"❌ Error creating entry emote packet: {e}")
+        print(f" Error creating entry emote packet: {e}")
         return None
 
 
-async def play_emote_spam(uids, number, key, iv, region):
-    """Send all emotes based on number mapping"""
-    try:
-        emote_id = ALL_EMOTE.get(int(number))
-        if not emote_id:
-            return False, f"Invalid number! Use 1-410 only."
-        
-        success_count = 0
-        for uid in uids:
-            try:
-                uid_int = int(uid)
-                H = await Emote_k(uid_int, emote_id, key, iv, region)
-                await SEndPacKeT(whisper_writer, online_writer, 'OnLine', H)
-                success_count += 1
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                print(f"Error sending play emote to {uid}: {e}")
-        
-        return True, f"Sent playlution emote {number} (ID: {emote_id}) to {success_count} player(s)"
-    
-    except Exception as e:
-        return False, f"Error in play_emote_spam: {str(e)}"
-        
-        
+
 # NEW FUNCTION: Evolution emote spam with mapping
 async def evo_emote_spam(uids, number, key, iv, region):
     """Send evolution emotes based on number mapping"""
@@ -4926,7 +4316,7 @@ async def send_required_packets(key, iv, region, bot_uid):
         return packets
         
     except Exception as e:
-        print(f"❌ Required packets error: {e}")
+        print(f" Required packets error: {e}")
         return []
 
 # NEW FUNCTION: Custom evolution emote spam with specified times
@@ -4954,25 +4344,8 @@ async def evo_custom_emote_spam(uids, number, times, key, iv, region):
     return True, f"Completed custom evolution emote spam {count} times"
 
 async def RejectMSGtaxt(squad_owner,uid, key, iv):
-    random_banner = f"""
-.
-.
-.
-
-
-
-
-
-
-
-
-
-[00FF00] APON GMAING 71 
-WELCOME TO APON GMAING 71 
-
-
-
- """
+    random_banner = f"""[00FF00]WELCOME_TO_MG24_TCP_BOT
+    [FF0000]HOW_ARE_YOU?"""
     fields = {
     1: 5,
     2: {
@@ -5005,7 +4378,7 @@ async def send_keep_alive(key, iv, region):
         packet = await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet_type, key, iv)
         return packet
     except Exception as e:
-        print(f"❌ Keep-alive error: {e}")
+        print(f" Keep-alive error: {e}")
         return None
 
 async def ArohiAccepted(uid,code,K,V):
@@ -5040,7 +4413,7 @@ async def new_lag(key , iv):
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , key , iv)
 
 
-async def convert_kyro_to_your_system(target_uid, chat_id, key, iv, nickname="juli_dvrma", title_id=None):
+async def convert_kyro_to_your_system(target_uid, chat_id, key, iv, nickname="RIJEXX", title_id=None):
     """EXACT conversion with customizable title ID"""
     try:
         # Use provided title_id or get random one
@@ -5098,11 +4471,11 @@ async def convert_kyro_to_your_system(target_uid, chat_id, key, iv, nickname="ju
         final_packet_hex = packet_prefix + hex_length + encrypted_packet
         final_packet = bytes.fromhex(final_packet_hex)
         
-        print(f"✅ Created packet with Title ID: {title_id}")
+        print(f" Created packet with Title ID: {title_id}")
         return final_packet
         
     except Exception as e:
-        print(f"❌ Conversion error: {e}")
+        print(f" Conversion error: {e}")
         return None
         
 def get_random_sticker():
@@ -5140,7 +4513,7 @@ async def send_sticker(target_uid, chat_id, key, iv, nickname="BLACK"):
                 8: f'{{"StickerStr" : "{sticker_value}", "type":"Sticker"}}',
                 9: {
                     1: f"[C][B][FF0000]{nickname}",
-                    2: int(get_random_avatar1()),
+                    2: int(get_random_avatar()),
                     4: 330,
                     5: 102000015,
                     8: "BOT TEAM",
@@ -5176,15 +4549,15 @@ async def send_sticker(target_uid, chat_id, key, iv, nickname="BLACK"):
         final_packet_hex = packet_prefix + hex_length + encrypted_packet
         final_packet = bytes.fromhex(final_packet_hex)
 
-        print(f"✅ Sticker Sent: {sticker_value}")
+        print(f" Sticker Sent: {sticker_value}")
         return final_packet
 
     except Exception as e:
-        print(f"❌ Sticker error: {e}")
+        print(f" Sticker error: {e}")
         return None
 
 # Alternative: DIRECT port of your friend's function but with your UID
-async def send_kyro_title_adapted(chat_id, key, iv, target_uid, nickname="juli_dvrma"):
+async def send_kyro_title_adapted(chat_id, key, iv, target_uid, nickname="RIJEXX"):
     """Direct adaptation of your friend's working function"""
     try:
         # Import your proto file (make sure it's in the same directory)
@@ -5241,7 +4614,7 @@ async def send_kyro_title_adapted(chat_id, key, iv, target_uid, nickname="juli_d
         return bytes.fromhex(final_packet_hex)
         
     except Exception as e:
-        print(f"❌ Direct adaptation error: {e}")
+        print(f" Direct adaptation error: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -5257,14 +4630,14 @@ async def send_all_titles_sequentially(uid, chat_id, key, iv, region, chat_type)
     total_titles = len(all_titles)
     
     # Send initial message
-    start_msg = f"""[B][C][FFFF00]🎖️ STARTING TITLE SEQUENCE!
+    start_msg = f"""[B][C][00FF00] STARTING TITLE SEQUENCE!
 
-📊 Total Titles: {total_titles}
-⏱️ Delay: 2 seconds between titles
-🔁 Mode: Sequential
-🎯 Target: {uid}
+ Total Titles: {total_titles}
+ Delay: 2 seconds between titles
+ Mode: Sequential
+ Target: {xMsGFixinG(uid)}
 
-⏳ Sending titles now...
+ Sending titles now...
 """
     await safe_send_message(chat_type, start_msg, uid, chat_id, key, iv)
     
@@ -5273,37 +4646,37 @@ async def send_all_titles_sequentially(uid, chat_id, key, iv, region, chat_type)
             title_number = index + 1
             
             # Create progress message
-            progress_msg = f"""[B][C][FFFF00]📤 SENDING TITLE {title_number}/{total_titles}
+            progress_msg = f"""[B][C][FFFF00] SENDING TITLE {title_number}/{total_titles}
 
-🎖️ Title ID: {title_id}
-📊 Progress: {title_number}/{total_titles}
-⏱️ Next in: 2 seconds
+ Title ID: {title_id}
+ Progress: {title_number}/{total_titles}
+ Next in: 2 seconds
 """
             await safe_send_message(chat_type, progress_msg, uid, chat_id, key, iv)
             
             # Send the actual title using your existing method
             # You'll need to use your existing title sending logic here
             # For example:
-            title_packet = await convert_kyro_to_your_system(uid, chat_id, key, iv, nickname="Flash_ff", title_id=title_id)
+            title_packet = await convert_kyro_to_your_system(uid, chat_id, key, iv, nickname="NAJMI-M24", title_id=title_id)
             
             if title_packet and whisper_writer:
                 whisper_writer.write(title_packet)
                 await whisper_writer.drain()
-                print(f"✅ Sent title {title_number}/{total_titles}: {title_id}")
+                print(f" Sent title {title_number}/{total_titles}: {title_id}")
             
             # Wait 2 seconds before next title (unless it's the last one)
             if title_number < total_titles:
                 await asyncio.sleep(2)
         
         # Completion message
-        completion_msg = f"""[B][C][FFFF00]✅ ALL TITLES SENT SUCCESSFULLY!
+        completion_msg = f"""[B][C][00FF00] ALL TITLES SENT SUCCESSFULLY!
 
-🎊 Total: {total_titles} titles sent
-🎯 Target: {uid}
-⏱️ Duration: {total_titles * 2} seconds
-✅ Status: Complete!
+ Total: {total_titles} titles sent
+ Target: {xMsGFixinG(uid)}
+ Duration: {total_titles * 2} seconds
+ Status: Complete!
 
-🎖️ Titles Sent:
+ Titles Sent:
 1. 905090075
 2. 904990072
 3. 904990069
@@ -5312,7 +4685,7 @@ async def send_all_titles_sequentially(uid, chat_id, key, iv, region, chat_type)
         await safe_send_message(chat_type, completion_msg, uid, chat_id, key, iv)
         
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Error sending titles: {str(e)}\n"
+        error_msg = f"[B][C][FF0000] Error sending titles: {str(e)}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
 
 async def handle_all_titles_command(inPuTMsG, uid, chat_id, key, iv, region, chat_type=0):
@@ -5325,15 +4698,15 @@ async def handle_all_titles_command(inPuTMsG, uid, chat_id, key, iv, region, cha
         target_name = "Yourself"
     elif len(parts) == 2 and parts[1].isdigit():
         target_uid = parts[1]
-        target_name = f"UID {target_uid}"
+        target_name = f"UID {xMsGFixinG(target_uid)}"
     else:
-        error_msg = f"""[B][C][FF0000]❌ Usage: /alltitles [uid]
+        error_msg = f"""[B][C][FF0000] Usage: /alltitles [uid]
         
-📝 Examples:
+ Examples:
 /alltitles - Send all titles to yourself
 /alltitles 123456789 - Send all titles to specific UID
 
-🎯 What it does:
+ What it does:
 1. Sends all 4 titles one by one
 2. 2-second delay between each title
 3. Sends in background (non-blocking)
@@ -5348,19 +4721,19 @@ async def handle_all_titles_command(inPuTMsG, uid, chat_id, key, iv, region, cha
     )
     
     # Immediate response
-    response_msg = f"""[B][C][FFFF00]🚀 STARTING TITLE SEQUENCE IN BACKGROUND!
+    response_msg = f"""[B][C][00FF00] STARTING TITLE SEQUENCE IN BACKGROUND!
 
-👤 Target: {target_name}
-🎖️ Total Titles: 4
-⏱️ Delay: 2 seconds each
-📱 Status: Running in background...
+ Target: {target_name}
+ Total Titles: 4
+ Delay: 2 seconds each
+ Status: Running in background...
 
-💡 You'll receive progress updates as titles are sent!
+ You'll receive progress updates as titles are sent!
 """
     await safe_send_message(chat_type, response_msg, uid, chat_id, key, iv)
 
 
-async def noob(target_uid, chat_id, key, iv, nickname="juli_dvrma", title_id=None):
+async def noob(target_uid, chat_id, key, iv, nickname="NAJMI-M24", title_id=None):
     """EXACT conversion with customizable title ID"""
     try:
         # Use provided title_id or get random one
@@ -5417,34 +4790,13 @@ async def noob(target_uid, chat_id, key, iv, nickname="juli_dvrma", title_id=Non
         final_packet_hex = packet_prefix + hex_length + encrypted_packet
         final_packet = bytes.fromhex(final_packet_hex)
         
-        print(f"✅ Created packet with Title ID: {title_id}")
+        print(f" Created packet with Title ID: {title_id}")
         return final_packet
         
     except Exception as e:
-        print(f"❌ Conversion error: {e}")
+        print(f" Conversion error: {e}")
         return None
         
-
-
-async def get_player_name_from_uid(uid, region="IND"):
-    """Get player name from UID - uses same method as /friend command"""
-    try:
-        # Load token from token.json (same as /friend command)
-        token = load_jwt_token()
-        if not token:
-            return f"Player_{uid[:4]}"  # Fallback if no token
-        
-        # Use your existing get_player_info function
-        player_name, player_uid = get_player_info(str(uid), token)
-        
-        if player_name and player_name != "Unknown":
-            return player_name
-        else:
-            return f"Player_{uid[:4]}"
-            
-    except Exception as e:
-        print(f"❌ Error getting name for {uid}: {e}")
-        return f"Player_{uid[:4]}"  # Fallback
 
 async def send_all_titles_sequentiallly(uid, chat_id, key, iv, region, chat_type):
     """Send all titles one by one with 2-second delay"""
@@ -5457,7 +4809,7 @@ async def send_all_titles_sequentiallly(uid, chat_id, key, iv, region, chat_type
     total_titles = len(all_titles)
     
     # Send initial message
-    start_msg = f"""[B][C][FFFF00] YOU NOOB F U C K   YOU !
+    start_msg = f"""[B][C][00FF00] Noobde NAJMI-M24 ya meku agar tu noob bolra toh tu g a y hai
 
 
 """
@@ -5472,24 +4824,24 @@ async def send_all_titles_sequentiallly(uid, chat_id, key, iv, region, chat_type
             # Send the actual title using your existing method
             # You'll need to use your existing title sending logic here
             # For example:
-            title_packet = await noob(uid, chat_id, key, iv, nickname="juli_dvrma", title_id=title_id)
+            title_packet = await noob(uid, chat_id, key, iv, nickname="NAJMI-M24", title_id=title_id)
             
             if title_packet and whisper_writer:
                 whisper_writer.write(title_packet)
                 await whisper_writer.drain()
-                print(f"✅ Sent title {title_number}/{total_titles}: {title_id}")
+                print(f" Sent title {title_number}/{total_titles}: {title_id}")
             
             # Wait 2 seconds before next title (unless it's the last one)
             if title_number < total_titles:
                 await asyncio.sleep(2)
         
         # Completion message
-        completion_msg = f"""[B][C][FFFF00]LOL, NOW WHOS IS NOOB?
+        completion_msg = f"""[B][C][00FF00]Noobde ab tu bta ye titles aur bol kon noob hai
 """
         await safe_send_message(chat_type, completion_msg, uid, chat_id, key, iv)
         
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Error sending titles: {str(e)}\n"
+        error_msg = f"[B][C][FF0000] Error sending titles: {str(e)}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
 
 async def handle_alll_titles_command(inPuTMsG, uid, chat_id, key, iv, region, chat_type=0):
@@ -5502,15 +4854,15 @@ async def handle_alll_titles_command(inPuTMsG, uid, chat_id, key, iv, region, ch
         target_name = "Yourself"
     elif len(parts) == 2 and parts[1].isdigit():
         target_uid = parts[1]
-        target_name = f"UID {target_uid}"
+        target_name = f"UID {xMsGFixinG(target_uid)}"
     else:
-        error_msg = f"""[B][C][FF0000]❌ Usage: /alltitles [uid]
+        error_msg = f"""[B][C][FF0000] Usage: /alltitles [uid]
         
-📝 Examples:
+ Examples:
 /alltitles - Send all titles to yourself
 /alltitles 123456789 - Send all titles to specific UID
 
-🎯 What it does:
+ What it does:
 1. Sends all 4 titles one by one
 2. 2-second delay between each title
 3. Sends in background (non-blocking)
@@ -5585,7 +4937,7 @@ async def RoomJoin(room_id, password, key, iv):
         return bytes.fromhex(final_packet_hex)
         
     except Exception as e:
-        print(f"❌ Room join error: {e}")
+        print(f" Room join error: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -5642,7 +4994,7 @@ async def RoomJoin_fields(room_id, password, key, iv):
         return bytes.fromhex(final_packet_hex)
         
     except Exception as e:
-        print(f"❌ Room join fields error: {e}")
+        print(f" Room join fields error: {e}")
         return None
 
 def remove_from_whitelist(uid_to_remove):
@@ -5652,14 +5004,14 @@ def remove_from_whitelist(uid_to_remove):
     uid_str = str(uid_to_remove)
     
     # Don't allow removing owner
-    if uid_str == "2799233875":  # Your UID
+    if uid_str == "":  # Your UID
         return False, "Cannot remove bot owner from whitelist!"
     
     if uid_str not in WHITELISTED_UIDS:
         return False, f"UID {uid_str} not in whitelist"
     
     WHITELISTED_UIDS.remove(uid_str)
-    return True, f"✅ Removed {uid_str} from whitelist"
+    return True, f" Removed {uid_str} from whitelist"
 
 
 
@@ -5669,19 +5021,19 @@ async def handle_xjoin_command(inPuTMsG, uid, chat_id, key, iv, region, chat_typ
     parts = inPuTMsG.strip().split()
     
     if len(parts) < 3:
-        error_msg = f"""[B][C][FF0000]🎮 ROOM JOIN COMMAND
+        error_msg = f"""[B][C][FF0000] ROOM JOIN COMMAND
 
-❌ Usage: /xjoin (room_id) (password)
+ Usage: /xjoin (room_id) (password)
 
-📝 Examples:
+ Examples:
 /xjoin 123456 0000
 /xjoin 987654 1111
 
-🔑 Room Info:
-• Room ID: 6-digit number
-• Password: Usually 4 digits (0000-9999)
+ Room Info:
+ Room ID: 6-digit number
+ Password: Usually 4 digits (0000-9999)
 
-💡 Bot will join the custom room!
+ Bot will join the custom room!
 """
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         return
@@ -5690,12 +5042,12 @@ async def handle_xjoin_command(inPuTMsG, uid, chat_id, key, iv, region, chat_typ
     password = parts[2]
     
     if not room_id.isdigit():
-        error_msg = f"[B][C][FF0000]❌ Room ID must be numbers only!\n"
+        error_msg = f"[B][C][FF0000] Room ID must be numbers only!\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         return
     
     # Send initial message
-    initial_msg = f"[B][C][FFFF00]🚀 JOINING CUSTOM ROOM...\n🏠 Room: {room_id}\n🔑 Password: {password}\n"
+    initial_msg = f"[B][C][00FF00] JOINING CUSTOM ROOM...\n Room: {room_id}\n Password: {password}\n"
     await safe_send_message(chat_type, initial_msg, uid, chat_id, key, iv)
     
     try:
@@ -5711,62 +5063,30 @@ async def handle_xjoin_command(inPuTMsG, uid, chat_id, key, iv, region, chat_typ
             online_writer.write(room_packet)
             await online_writer.drain()
             
-            print(f"✅ Room join packet sent! Room: {room_id}")
+            print(f" Room join packet sent! Room: {room_id}")
             joinroom = join_room_chanel(room_id, key, iv)
             await SEndPacKeT(whisper_writer, online_writer, 'ChaT', joinroom)
-            success_msg = f"""[B][C][FFFF00]✅ ROOM JOIN COMMAND SENT!
+            success_msg = f"""[B][C][00FF00] ROOM JOIN COMMAND SENT!
 
-🏠 Room ID: {room_id}
-🔑 Password: {password}
+ Room ID: {room_id}
+ Password: {password}
 """
         else:
-            success_msg = f"[B][C][FF0000]❌ Failed to create room join packet!\n"
+            success_msg = f"[B][C][FF0000] Failed to create room join packet!\n"
         
         await safe_send_message(chat_type, success_msg, uid, chat_id, key, iv)
         
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Error joining room: {str(e)}\n"
+        error_msg = f"[B][C][FF0000] Error joining room: {str(e)}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
 
-async def spam_request_loop_with_cosmetics(target_uid, key, iv, region):
-    """Spam request function that creates group and sends join requests in loop - FASTER VERSION"""
-    global spam_request_running
-    count = 0
-    max_requests = 100  # Send exactly 30 requests
-    
-    while spam_request_running and count < max_requests:
-        try:
-            # Create squad
-            PAc = await OpEnSq(key, iv, region)
-            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', PAc)
-            await asyncio.sleep(0.2)  # Reduced delay
-            
-            # Send invite
-            V = await SEnd_InV(5, int(target_uid), key, iv, region)
-            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', V)
-            
-            # Leave squad immediately without waiting
-            E = await ExiT(None, key, iv)
-            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', E)
-            
-            count += 1
-            print(f"Sent request #{count} to {target_uid}")
-            
-            # Shorter delay between requests
-            await asyncio.sleep(0.5)  # Reduced from 1 second to 0.5 seconds
-            
-        except Exception as e:
-            print(f"Error in spam_request_loop for uid {target_uid}: {e}")
-            # Continue with next request instead of breaking
-            await asyncio.sleep(0.5)
-            
 async def handle_room_command(inPuTMsG, uid, chat_id, key, iv, region, chat_type):
     """Handle /room command with proper error handling"""
     
     parts = inPuTMsG.strip().split()
     
     if len(parts) < 2:
-        error_msg = f"[B][C][FF0000]❌ Usage: /room (uid)\nExample: /room 11686472351\n"
+        error_msg = f"[B][C][FF0000] Usage: /room (uid)\nExample: /room 14444444004\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
         return
     
@@ -5786,9 +5106,9 @@ async def handle_room_command(inPuTMsG, uid, chat_id, key, iv, region, chat_type
             if cached_data and 'packet' in cached_data:
                 packet = cached_data['packet']
                 player_status = cached_data.get('status', 'UNKNOWN')
-                print(f"⚠️ Using cached data for {target_uid}")
+                print(f" Using cached data for {xMsGFixinG(target_uid)}")
             else:
-                error_msg = f"[B][C][FF0000]❌ Player {target_uid} not found\n"
+                error_msg = f"[B][C][FF0000] Player {xMsGFixinG(target_uid)} not found\n"
                 await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
                 return
         else:
@@ -5798,12 +5118,12 @@ async def handle_room_command(inPuTMsG, uid, chat_id, key, iv, region, chat_type
         
         # Step 2: Check if player is in room
         if not player_status or "IN ROOM" not in player_status:
-            info_msg = f"""[B][C][FFFF00]📊 STATUS: {player_status or 'UNKNOWN'}
+            info_msg = f"""[B][C][FFFF00] STATUS: {player_status or 'UNKNOWN'}
 
-👤 Player: {target_uid}
-❌ Not in custom room
+ Player: {xMsGFixinG(target_uid)}
+ Not in custom room
 
-💡 Player must join custom room first!"""
+ Player must join custom room first!"""
             await safe_send_message(chat_type, info_msg, uid, chat_id, key, iv)
             return
         
@@ -5811,19 +5131,19 @@ async def handle_room_command(inPuTMsG, uid, chat_id, key, iv, region, chat_type
         room_id = get_idroom_by_idplayer(packet) if packet else None
         
         if not room_id:
-            error_msg = f"[B][C][FF0000]❌ Failed to extract room ID\n"
+            error_msg = f"[B][C][FF0000] Failed to extract room ID\n"
             await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
             return
         
         # Step 4: SUCCESS - Send room info
-        success_msg = f"""[B][C][FFFF00]✅ ROOM FOUND!
+        success_msg = f"""[B][C][00FF00] ROOM FOUND!
 
-👤 Player: {target_uid}
-🏠 Room ID: {room_id}
-📊 Status: {player_status}
-⚡ Data: {'CACHED' if not status_result else 'LIVE'}
+ Player: {xMsGFixinG(target_uid)}
+ Room ID: {room_id}
+ Status: {player_status}
+ Data: {'CACHED' if not status_result else 'LIVE'}
 
-💡 Quick join: /xjoin {room_id} 0000
+ Quick join: /xjoin {room_id} 0000
 """
         await safe_send_message(chat_type, success_msg, uid, chat_id, key, iv)
         
@@ -5840,13 +5160,13 @@ async def handle_room_command(inPuTMsG, uid, chat_id, key, iv, region, chat_type
             except Exception as e:
                 print(f"Spam error: {e}")
         
-        spam_msg = f"[B][C][FFFF00]✅ Spammed {spam_count} invites!\n"
+        spam_msg = f"[B][C][00FF00] Spammed {spam_count} invites!\n"
         await safe_send_message(chat_type, spam_msg, uid, chat_id, key, iv)
         
         
     except Exception as e:
-        print(f"❌ Room command error: {e}")
-        error_msg = f"[B][C][FF0000]❌ Error: {str(e)[:80]}\n"
+        print(f" Room command error: {e}")
+        error_msg = f"[B][C][FF0000] Error: {str(e)[:80]}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
 
 # Room spam command (send multiple messages)
@@ -5856,16 +5176,16 @@ async def handle_room_spam_command(inPuTMsG, uid, chat_id, key, iv, region, chat
     parts = inPuTMsG.strip().split()
     
     if len(parts) < 4:
-        error_msg = f"""[B][C][FF0000]❌ Usage: /spamroom (room_id) (uid) (message)
+        error_msg = f"""[B][C][FF0000] Usage: /spamroom (room_id) (uid) (message)
         
-📝 Example: /spamroom 123456 14010319252 Hello World!
+ Example: /spamroom 123456 14010319252 Hello World!
 
-⚙️ Parameters:
-• room_id = Custom room ID (numbers)
-• uid = Player UID to spam
-• message = Text message to send
+ Parameters:
+ room_id = Custom room ID (numbers)
+ uid = Player UID to spam
+ message = Text message to send
 
-🎯 What it does:
+ What it does:
 1. Creates room spam packet
 2. Sends message to specified room
 3. Uses colorful formatting
@@ -5881,22 +5201,22 @@ async def handle_room_spam_command(inPuTMsG, uid, chat_id, key, iv, region, chat
         
         # Validate inputs
         if not room_id.isdigit():
-            error_msg = f"[B][C][FF0000]❌ Room ID must be numbers only!\n"
+            error_msg = f"[B][C][FF0000] Room ID must be numbers only!\n"
             await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
             return
             
         if not target_uid.isdigit():
-            error_msg = f"[B][C][FF0000]❌ UID must be numbers only!\n"
+            error_msg = f"[B][C][FF0000] UID must be numbers only!\n"
             await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
             return
         
         # Send initial message
-        initial_msg = f"[B][C][FFFF00]🚀 PREPARING ROOM SPAM...\n"
-        initial_msg += f"🏠 Room ID: {room_id}\n"
-        initial_msg += f"👤 Target UID: {target_uid}\n"
-        initial_msg += f"📝 Message: {message[:30]}...\n"
-        initial_msg += f"📦 Packet type: 0e15\n"
-        initial_msg += f"⏳ Creating packet...\n"
+        initial_msg = f"[B][C][00FF00] PREPARING ROOM SPAM...\n"
+        initial_msg += f" Room ID: {room_id}\n"
+        initial_msg += f" Target UID: {xMsGFixinG(target_uid)}\n"
+        initial_msg += f" Message: {message[:30]}...\n"
+        initial_msg += f" Packet type: 0e15\n"
+        initial_msg += f" Creating packet...\n"
         
         await safe_send_message(chat_type, initial_msg, uid, chat_id, key, iv)
         
@@ -5907,27 +5227,27 @@ async def handle_room_spam_command(inPuTMsG, uid, chat_id, key, iv, region, chat
             # Send via Online connection (since it's room-related)
             await SEndPacKeT(whisper_writer, online_writer, 'OnLine', spam_packet)
             
-            success_msg = f"""[B][C][FFFF00]✅ ROOM SPAM PACKET SENT!
+            success_msg = f"""[B][C][00FF00] ROOM SPAM PACKET SENT!
 
-🏠 Room: {room_id}
-👤 Target: {target_uid}
-📝 Message: {message[:40]}...
-📦 Packet: Type 0e15 (Room Spam)
-✅ Status: Delivered successfully
+ Room: {room_id}
+ Target: {xMsGFixinG(target_uid)}
+ Message: {message[:40]}...
+ Packet: Type 0e15 (Room Spam)
+ Status: Delivered successfully
 
-💡 Packet includes:
-• Colorful message formatting
-• Avatar: {await xBunnEr()}
-• Rank: 330
-• Badge: 201
+ Packet includes:
+ Colorful message formatting
+ Avatar: {await xBunnEr()}
+ Rank: 330
+ Badge: 201
 """
         else:
-            success_msg = f"[B][C][FF0000]❌ Failed to create spam packet!\n"
+            success_msg = f"[B][C][FF0000] Failed to create spam packet!\n"
         
         await safe_send_message(chat_type, success_msg, uid, chat_id, key, iv)
         
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Error: {str(e)}\n"
+        error_msg = f"[B][C][FF0000] Error: {str(e)}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)
 
 # Also create a shorter alias command handler
@@ -5961,7 +5281,7 @@ async def detect_emote_perfect(data_hex, key, iv):
                     if '1' in nested and '3' in nested:
                         return {
                             'type': 'emote',
-                            'packet_type': 21,  # ← EXACT MATCH
+                            'packet_type': 21,  #  EXACT MATCH
                             'identifier': emote_data.get('1', {}).get('data'),
                             'base_emote': emote_data.get('2', {}).get('data'),
                             'target_uid': nested.get('1', {}).get('data'),  # WHO received it
@@ -5978,7 +5298,7 @@ async def detect_emote_perfect(data_hex, key, iv):
         return None
         
     except Exception as e:
-        print(f"❌ Perfect detection error: {e}")
+        print(f" Perfect detection error: {e}")
         return None
         
 async def detect_emote_with_sender(data_hex, key, iv):
@@ -6016,7 +5336,7 @@ async def detect_emote_with_sender(data_hex, key, iv):
                     emote_info['sender_uid'] = int(uid)
                     emote_info['detection_method'] = 'uid_pattern'
                     
-                    print(f"✅ SENDER FOUND: {uid} sent emote to {target_uid}")
+                    print(f" SENDER FOUND: {xMsGFixinG(uid)} sent emote to {xMsGFixinG(target_uid)}")
                     return emote_info
         
         # METHOD 2: Look in packet structure
@@ -6048,14 +5368,14 @@ async def detect_emote_with_sender(data_hex, key, iv):
         return emote_info
         
     except Exception as e:
-        print(f"❌ Sender detection error: {e}")
+        print(f" Sender detection error: {e}")
         return None
 
 
 async def send_title_packet_direct(target_uid, chat_id, key, iv, region="ind"):
     """Send title packet directly without chat context - for auto-join"""
     try:
-        print(f"🎖️ Sending title to {target_uid} in chat {chat_id}")
+        print(f" Sending title to {xMsGFixinG(target_uid)} in chat {chat_id}")
         
         # Method 1: Using your existing function
         title_packet = await convert_kyro_to_your_system(target_uid, chat_id, key, iv)
@@ -6064,11 +5384,11 @@ async def send_title_packet_direct(target_uid, chat_id, key, iv, region="ind"):
             # Send via Whisper connection
             whisper_writer.write(title_packet)
             await whisper_writer.drain()
-            print(f"✅ Title sent via Whisper to {target_uid}")
+            print(f" Title sent via Whisper to {xMsGFixinG(target_uid)}")
             return True
             
     except Exception as e:
-        print(f"❌ Error sending title directly: {e}")
+        print(f" Error sending title directly: {e}")
         import traceback
         traceback.print_exc()
     
@@ -6101,7 +5421,7 @@ async def extract_emote_info(data_hex, key, iv):
         packet_json = json.loads(packet)
         
         # DEBUG: Print packet structure
-        # print("📦 Packet JSON:", json.dumps(packet_json, indent=2)[:300])
+        # print(" Packet JSON:", json.dumps(packet_json, indent=2)[:300])
         
         # Check all possible structures
         structures = [
@@ -6123,7 +5443,7 @@ async def extract_emote_info(data_hex, key, iv):
         return None
         
     except Exception as e:
-        print(f"❌ Extraction error: {e}")
+        print(f" Extraction error: {e}")
         return None
 
 def extract_type_21(packet_json):
@@ -6181,7 +5501,7 @@ import asyncio
 # Add these constants with your other global variables
 BIO_ENCRYPTION_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 BIO_ENCRYPTION_IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
-FREEFIRE_VERSION = "OB54"
+FREEFIRE_VERSION = "OB56"
 
 def decode_jwt_noverify(token: str):
     """Decode JWT without verification"""
@@ -6231,7 +5551,7 @@ async def is_bot_in_squad(bot_uid, key, iv):
         return False
         
     except Exception as e:
-        print(f"❌ Squad check error: {e}")
+        print(f" Squad check error: {e}")
         return False
 
 def get_bio_server_url(lock_region: str):
@@ -6294,19 +5614,19 @@ async def set_bio_directly_async_with_retry(jwt_token, bio_text, region="IND", m
     
     for attempt in range(max_retries):
         try:
-            print(f"🔄 Bio API attempt {attempt + 1}/{max_retries}")
+            print(f" Bio API attempt {attempt + 1}/{max_retries}")
             
             result = await set_bio_directly_async(jwt_token, bio_text, region)
             
             if result.get("success"):
                 return result
             else:
-                print(f"❌ Bio update failed: {result.get('message')}")
+                print(f" Bio update failed: {result.get('message')}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     
         except Exception as e:
-            print(f"❌ Bio attempt {attempt + 1} error: {e}")
+            print(f" Bio attempt {attempt + 1} error: {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay)
             continue
@@ -6331,12 +5651,12 @@ async def set_bio_directly_async(jwt_token, bio_text, region="IND"):
         lock_region = payload.get("lock_region", region).upper()
         url_bio = get_bio_server_url(lock_region)
         
-        print(f"🔧 Setting bio for region: {lock_region}")
-        print(f"📝 Bio text: {bio_text}")
+        print(f" Setting bio for region: {lock_region}")
+        print(f" Bio text: {bio_text}")
         
         # Create protobuf message
         data_bytes = create_bio_protobuf(bio_text)
-        print(f"📦 Protobuf created: {len(data_bytes)} bytes")
+        print(f" Protobuf created: {len(data_bytes)} bytes")
         
         # Encrypt using AES CBC
         cipher = AES.new(BIO_ENCRYPTION_KEY, AES.MODE_CBC, BIO_ENCRYPTION_IV)
@@ -6347,7 +5667,7 @@ async def set_bio_directly_async(jwt_token, bio_text, region="IND"):
             data_bytes += bytes([padding_length] * padding_length)
         
         encrypted_data = cipher.encrypt(data_bytes)
-        print(f"🔐 Encrypted: {len(encrypted_data)} bytes")
+        print(f" Encrypted: {len(encrypted_data)} bytes")
         
         # Headers
         headers = {
@@ -6362,7 +5682,7 @@ async def set_bio_directly_async(jwt_token, bio_text, region="IND"):
             "Accept-Encoding": "gzip"
         }
         
-        print(f"🚀 Sending to: {url_bio}")
+        print(f" Sending to: {url_bio}")
         
         # Use aiohttp with timeout
         import aiohttp
@@ -6372,7 +5692,7 @@ async def set_bio_directly_async(jwt_token, bio_text, region="IND"):
             async with session.post(url_bio, headers=headers, data=encrypted_data) as response:
                 response_text = await response.text()
                 
-                print(f"📡 Response status: {response.status}")
+                print(f" Response status: {response.status}")
                 
                 if response.status == 200:
                     return {
@@ -6388,19 +5708,19 @@ async def set_bio_directly_async(jwt_token, bio_text, region="IND"):
                     }
                 
     except aiohttp.ClientError as e:
-        print(f"❌ Network error: {e}")
+        print(f" Network error: {e}")
         return {
             "success": False,
             "message": f"Network error: {str(e)[:80]}"
         }
     except asyncio.TimeoutError:
-        print(f"❌ Request timeout")
+        print(f" Request timeout")
         return {
             "success": False,
             "message": "Request timeout (10s)"
         }
     except Exception as e:
-        print(f"❌ Bio update error: {e}")
+        print(f" Bio update error: {e}")
         import traceback
         traceback.print_exc()
         return {
@@ -6414,12 +5734,12 @@ async def set_bio_directly_async(jwt_token, bio_text, region="IND"):
 def analyze_squad_packet(packet_json):
     """Analyze packet structure to find squad members"""
     
-    print("\n🔍 ANALYZING SQUAD PACKET STRUCTURE")
+    print("\n ANALYZING SQUAD PACKET STRUCTURE")
     print("="*50)
     
     # Check if this is a squad data packet
     if '5' not in packet_json or 'data' not in packet_json['5']:
-        print("❌ Not a squad data packet")
+        print(" Not a squad data packet")
         return None
     
     squad_data = packet_json['5']['data']
@@ -6436,7 +5756,7 @@ def analyze_squad_packet(packet_json):
         
         # Check if it's a list (likely contains multiple players)
         if isinstance(data_value, list):
-            print(f"✅ Field {field_num}: LIST with {len(data_value)} items")
+            print(f" Field {field_num}: LIST with {len(data_value)} items")
             candidate_fields.append((field_num, 'list', data_value))
             
             # Show first item structure
@@ -6445,17 +5765,17 @@ def analyze_squad_packet(packet_json):
                 # Check if first item has UID (field 1)
                 if '1' in data_value[0]:
                     uid = data_value[0]['1']['data']
-                    print(f"   ↳ Contains UID: {uid}")
+                    print(f"    Contains UID: {uid}")
         
         # Check if it's a dict with numeric keys (0, 1, 2, 3...)
         elif isinstance(data_value, dict):
             keys = list(data_value.keys())
             numeric_keys = [k for k in keys if k.isdigit()]
             if len(numeric_keys) > 0:
-                print(f"✅ Field {field_num}: DICT with numeric keys {numeric_keys[:5]}...")
+                print(f" Field {field_num}: DICT with numeric keys {numeric_keys[:5]}...")
                 candidate_fields.append((field_num, 'dict', data_value))
     
-    print("\n🎯 MOST LIKELY SQUAD MEMBERS FIELDS:")
+    print("\n MOST LIKELY SQUAD MEMBERS FIELDS:")
     for field_num, field_type, data in candidate_fields:
         print(f"  Field {field_num} ({field_type})")
         
@@ -6467,7 +5787,7 @@ def analyze_squad_packet(packet_json):
                     uid = item['1']['data']
                     uids.append(uid)
             if uids:
-                print(f"    ↳ Found UIDs: {uids}")
+                print(f"     Found UIDs: {uids}")
         
         elif field_type == 'dict':
             # Try to extract UIDs from dict
@@ -6478,7 +5798,7 @@ def analyze_squad_packet(packet_json):
                     uid = item['1']['data']
                     uids.append(uid)
             if uids:
-                print(f"    ↳ Found UIDs: {uids}")
+                print(f"     Found UIDs: {uids}")
     
     return candidate_fields
 
@@ -6526,7 +5846,7 @@ async def auto_reply_with_emote(emote_info, key, iv):
     
     try:
         # Get bot's UID (you need to set this)
-        bot_uid = 14619134248  # Replace with your bot's actual UID
+        bot_uid = 14010319252  # Replace with your bot's actual UID
         
         sender_uid = emote_info['sender_uid']
         emote_id = emote_info['emote_id']
@@ -6538,22 +5858,22 @@ async def auto_reply_with_emote(emote_info, key, iv):
             online_writer.write(reply_packet)
             await online_writer.drain()
             
-            print(f"🤖 Bot replied with emote {emote_id} to {sender_uid}")
+            print(f" Bot replied with emote {emote_id} to {sender_uid}")
             
     except Exception as e:
-        print(f"❌ Auto-reply error: {e}")
+        print(f" Auto-reply error: {e}")
 
 def extract_squad_members_correct(packet_json):
     """Extract squad members from FULL squad packet"""
     
-    print("\n🔍 EXTRACTING SQUAD MEMBERS")
+    print("\n EXTRACTING SQUAD MEMBERS")
     print("="*50)
     
     try:
         if ('5' not in packet_json or 
             'data' not in packet_json['5'] or 
             '2' not in packet_json['5']['data']):
-            print("❌ Invalid packet structure")
+            print(" Invalid packet structure")
             return []
         
         field2_data = packet_json['5']['data']['2']['data']
@@ -6569,7 +5889,7 @@ def extract_squad_members_correct(packet_json):
                 continue
                 
             item = field2_data[key]['data']
-            print(f"\n📦 Key {key}: Type = {type(item)}")
+            print(f"\n Key {key}: Type = {type(item)}")
             
             if isinstance(item, dict):
                 # Check if this is a player object
@@ -6583,7 +5903,7 @@ def extract_squad_members_correct(packet_json):
                         if isinstance(uid, int) and uid > 1000000:
                             rank = item['4']['data'] if '4' in item else 0
                             
-                            print(f"   ✅ PLAYER FOUND!")
+                            print(f"    PLAYER FOUND!")
                             print(f"      UID: {uid}")
                             print(f"      Name: {name}")
                             print(f"      Rank: {rank}")
@@ -6595,23 +5915,23 @@ def extract_squad_members_correct(packet_json):
                                 'rank': rank
                             })
                         else:
-                            print(f"   ❌ Not a UID: {uid}")
+                            print(f"    Not a UID: {uid}")
                             
                     except Exception as e:
-                        print(f"   ❌ Error extracting player: {e}")
+                        print(f"    Error extracting player: {e}")
                 else:
-                    print(f"   ↳ Fields: {list(item.keys())[:5]}...")
+                    print(f"    Fields: {list(item.keys())[:5]}...")
             elif isinstance(item, (int, str)):
-                print(f"   ↳ Value: {item}")
+                print(f"    Value: {item}")
         
-        print(f"\n🏆 TOTAL SQUAD MEMBERS FOUND: {len(squad_members)}")
+        print(f"\n TOTAL SQUAD MEMBERS FOUND: {len(squad_members)}")
         for member in squad_members:
-            print(f"  • Slot {member['slot']}: {member['name']} (UID: {member['uid']})")
+            print(f"   Slot {member['slot']}: {member['name']} (UID: {member['uid']})")
         
         return squad_members
         
     except Exception as e:
-        print(f"❌ Extraction error: {e}")
+        print(f" Extraction error: {e}")
         import traceback
         traceback.print_exc()
         return []
@@ -6619,12 +5939,12 @@ def extract_squad_members_correct(packet_json):
 async def analyze_packet_structure(data_hex, key, iv):
     """Analyze and display packet structure"""
     
-    print(f"\n📦 PACKET ANALYSIS")
+    print(f"\n PACKET ANALYSIS")
     print("="*50)
     
     # Basic info
-    print(f"📏 Length: {len(data_hex)} characters")
-    print(f"🔢 Header: {data_hex[:10]}")
+    print(f" Length: {len(data_hex)} characters")
+    print(f" Header: {data_hex[:10]}")
     
     # Try to decode
     try:
@@ -6632,11 +5952,11 @@ async def analyze_packet_structure(data_hex, key, iv):
             decoded = await DeCode_PackEt(data_hex[10:])
             packet_json = json.loads(decoded)
             
-            print(f"✅ Successfully decoded!")
-            print(f"📊 Packet type (field 1): {packet_json.get('1', 'Unknown')}")
+            print(f" Successfully decoded!")
+            print(f" Packet type (field 1): {packet_json.get('1', 'Unknown')}")
             
             # Show structure
-            print(f"\n📋 PACKET STRUCTURE:")
+            print(f"\n PACKET STRUCTURE:")
             print(f"Top-level fields: {list(packet_json.keys())}")
             
             # Show field 1 value
@@ -6647,23 +5967,23 @@ async def analyze_packet_structure(data_hex, key, iv):
             import re
             emote_patterns = re.findall(r'909[0-9a-f]{6}', data_hex)
             if emote_patterns:
-                print(f"\n🎭 EMOTE IDS FOUND IN HEX: {emote_patterns}")
+                print(f"\n EMOTE IDS FOUND IN HEX: {emote_patterns}")
             
             # Show UID patterns
             uid_patterns = re.findall(r'(\d{9,11})', data_hex)
             uids = [uid for uid in uid_patterns if not uid.startswith('909')]
             if uids:
-                print(f"👤 UIDS FOUND IN HEX: {uids}")
+                print(f" UIDS FOUND IN HEX: {uids}")
             
             # Return the decoded structure
             return packet_json
             
         else:
-            print("❌ Packet too short to decode")
+            print(" Packet too short to decode")
             return None
             
     except Exception as e:
-        print(f"❌ Decode error: {e}")
+        print(f" Decode error: {e}")
         return None
 
 async def RedZed_SendInv(bot_uid, uid, key, iv):
@@ -6729,7 +6049,7 @@ async def RedZed_SendInv(bot_uid, uid, key, iv):
         return final_packet
         
     except Exception as e:
-        print(f"❌ Error in RedZed_SendInv: {e}")
+        print(f" Error in RedZed_SendInv: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -6753,27 +6073,27 @@ async def freeze_emote_spam(uid, key, iv, region, chat_type, chat_id, sender_uid
                     emote_packet = await Emote_k(int(uid), emote_id, key, iv, region)
                     await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
                     
-                    print(f"❄️ Freeze emote {i+1}/{len(FREEZE_EMOTES)} sent: {emote_id}")
+                    print(f" Freeze emote {i+1}/{len(FREEZE_EMOTES)} sent: {emote_id}")
                     
                     # Small delay between emotes (0.3 seconds)
                     await asyncio.sleep(0.3)
                     
                 except Exception as e:
-                    print(f"❌ Error sending freeze emote {i+1}: {e}")
+                    print(f" Error sending freeze emote {i+1}: {e}")
             
             cycles += 1
-            print(f"🌀 Freeze cycle {cycles}/{max_cycles} completed")
+            print(f" Freeze cycle {cycles}/{max_cycles} completed")
             
             # Wait for next cycle (total 1 second per cycle)
             remaining_time = 1.0 - (0.3 * len(FREEZE_EMOTES))
             if remaining_time > 0:
                 await asyncio.sleep(remaining_time)
         
-        print(f"✅ Freeze sequence completed: {cycles} cycles")
+        print(f" Freeze sequence completed: {cycles} cycles")
         return cycles
         
     except Exception as e:
-        print(f"❌ Freeze function error: {e}")
+        print(f" Freeze function error: {e}")
         return 0
         
 async def handle_freeze_completion(freeze_task, uid, sender_uid, chat_id, chat_type, key, iv):
@@ -6781,43 +6101,43 @@ async def handle_freeze_completion(freeze_task, uid, sender_uid, chat_id, chat_t
     try:
         cycles_completed = await freeze_task
         
-        completion_msg = f"""[B][C][00FFFF]❄️ FREEZE COMMAND COMPLETED!
+        completion_msg = f"""[B][C][00FFFF] FREEZE COMMAND COMPLETED!
 
-🎯 Target: {uid}
-⏱️ Duration: {cycles_completed} seconds
-🎭 Emotes sent: {cycles_completed * 3}
-❄️ Sequence: 
-  • 909040004 (Ice)
-  • 909050008 (Frozen)
-  • 909000002 (Freeze)
+ Target: {xMsGFixinG(uid)}
+ Duration: {cycles_completed} seconds
+ Emotes sent: {cycles_completed * 3}
+ Sequence: 
+   909040004 (Ice)
+   909050008 (Frozen)
+   909000002 (Freeze)
 
-✅ Status: Complete!
+ Status: Complete!
 """
         await safe_send_message(chat_type, completion_msg, sender_uid, chat_id, key, iv)
         
     except asyncio.CancelledError:
-        print("🛑 Freeze command cancelled")
+        print(" Freeze command cancelled")
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Freeze error: {str(e)}\n"
+        error_msg = f"[B][C][FF0000] Freeze error: {str(e)}\n"
         await safe_send_message(chat_type, error_msg, sender_uid, chat_id, key, iv)
 
 async def test_emote_packet(target_uid, emote_id, key, iv, region="IND"):
     """Test if emote packet works and show structure"""
     
-    print(f"\n🎭 TESTING EMOTE PACKET")
+    print(f"\n TESTING EMOTE PACKET")
     print("="*50)
     
     # Create the packet using your function
     emote_packet = await Emote_k(target_uid, emote_id, key, iv, region)
     
     if not emote_packet:
-        print("❌ Failed to create packet")
+        print(" Failed to create packet")
         return False
     
     # Convert to hex for analysis
     packet_hex = emote_packet.hex()
     
-    print(f"📦 Packet created!")
+    print(f" Packet created!")
     print(f"   Length: {len(packet_hex)} characters")
     print(f"   Header: {packet_hex[:20]}")
     
@@ -6829,7 +6149,7 @@ async def test_emote_packet(target_uid, emote_id, key, iv, region="IND"):
             
             # Decrypt (you need to implement this)
             # For testing, let's see raw structure
-            print(f"\n🔍 RAW PACKET STRUCTURE:")
+            print(f"\n RAW PACKET STRUCTURE:")
             print(f"Full hex (first 200 chars):")
             print(packet_hex[:200] + "...")
             
@@ -6837,51 +6157,51 @@ async def test_emote_packet(target_uid, emote_id, key, iv, region="IND"):
             import re
             uid_hex = hex(target_uid)[2:]
             if uid_hex in packet_hex:
-                print(f"✅ Target UID {target_uid} found in packet!")
+                print(f" Target UID {xMsGFixinG(target_uid)} found in packet!")
             else:
-                print(f"❌ Target UID not found in hex")
+                print(f" Target UID not found in hex")
             
             # Look for emote ID
             emote_hex = hex(emote_id)[2:]
             if emote_hex in packet_hex:
-                print(f"✅ Emote ID {emote_id} found in packet!")
+                print(f" Emote ID {emote_id} found in packet!")
             else:
-                print(f"❌ Emote ID not found in hex")
+                print(f" Emote ID not found in hex")
         
-        print(f"\n✅ Packet created successfully!")
+        print(f"\n Packet created successfully!")
         return True
         
     except Exception as e:
-        print(f"❌ Analysis error: {e}")
+        print(f" Analysis error: {e}")
         return False
         
 async def send_and_monitor_emote(target_uid, emote_id, key, iv, region, reader):
     """Send emote and monitor response - FIXED VERSION"""
     
-    print(f"\n🚀 SENDING TEST EMOTE")
-    print(f"   👤 Target: {target_uid}")
-    print(f"   🎭 Emote: {emote_id}")
+    print(f"\n SENDING TEST EMOTE")
+    print(f"    Target: {xMsGFixinG(target_uid)}")
+    print(f"    Emote: {emote_id}")
     print("="*50)
     
     # 1. Create packet
     emote_packet = await Emote_k(target_uid, emote_id, key, iv, region)
     
     if not emote_packet:
-        print("❌ Failed to create packet")
+        print(" Failed to create packet")
         return
     
     # 2. Send it
-    print("📤 Sending packet...")
+    print(" Sending packet...")
     if online_writer:
         online_writer.write(emote_packet)
         await online_writer.drain()
-        print("✅ Packet sent!")
+        print(" Packet sent!")
     else:
-        print("❌ No connection")
+        print(" No connection")
         return
     
     # 3. Wait for response (SHORTER - 2 seconds)
-    print("\n⏳ Waiting for response (2 seconds)...")
+    print("\n Waiting for response (2 seconds)...")
     
     responses = []
     start_time = time.time()
@@ -6896,13 +6216,13 @@ async def send_and_monitor_emote(target_uid, emote_id, key, iv, region, reader):
                     responses.append(resp_hex)
                     
                     # Quick analysis
-                    print(f"📥 Got response #{len(responses)}")
+                    print(f" Got response #{len(responses)}")
                     print(f"   Length: {len(resp_hex)} chars")
                     print(f"   Header: {resp_hex[:10]}")
                     
                     # Check if it's the emote echo
                     if '909' in resp_hex:
-                        print(f"   🎭 Contains emote ID!")
+                        print(f"    Contains emote ID!")
         except asyncio.TimeoutError:
             continue
         except Exception as e:
@@ -6910,13 +6230,13 @@ async def send_and_monitor_emote(target_uid, emote_id, key, iv, region, reader):
             pass
     
     # 4. Summary
-    print(f"\n📊 RESPONSE SUMMARY")
+    print(f"\n RESPONSE SUMMARY")
     print(f"Total responses: {len(responses)}")
     
     if len(responses) > 0:
-        print("✅ SUCCESS! Server accepted your emote packet!")
+        print(" SUCCESS! Server accepted your emote packet!")
     else:
-        print("⚠️ No immediate response (might still be processing)")
+        print(" No immediate response (might still be processing)")
         
 async def handle_guest_generation(count, uid, chat_id, chat_type, key, iv):
     """Handle guest generation in background and send updates"""
@@ -6926,29 +6246,29 @@ async def handle_guest_generation(count, uid, chat_id, chat_type, key, iv):
         
         # Send completion message
         if accounts:
-            success_msg = f"""[B][C][FFFF00]✅ GUEST ACCOUNTS GENERATED!
+            success_msg = f"""[B][C][00FF00] GUEST ACCOUNTS GENERATED!
 
-📊 Generated: {len(accounts)}/{count} accounts
-💾 Saved to: guest_accounts.json
+ Generated: {len(accounts)}/{count} accounts
+ Saved to: guest_accounts.json
 
-📋 Format in file:
-• uid: Account UID
-• password: Account password
-• name: BlackApis
-• timestamp: Generation time
+ Format in file:
+ uid: Account UID
+ password: Account password
+ name: BlackApis
+ timestamp: Generation time
 
-💡 Use accounts for:
-• Multi-account spams
-• Friend requests
-• Testing purposes
+ Use accounts for:
+ Multi-account spams
+ Friend requests
+ Testing purposes
 """
         else:
-            success_msg = f"""[B][C][FF0000]❌ GENERATION FAILED!
+            success_msg = f"""[B][C][FF0000] GENERATION FAILED!
 
-📊 Requested: {count} accounts
-❌ Generated: 0 accounts
+ Requested: {count} accounts
+ Generated: 0 accounts
 
-💡 Try:
+ Try:
 1. Check internet connection
 2. API might be down
 3. Try smaller count (like 5)
@@ -6959,18 +6279,18 @@ async def handle_guest_generation(count, uid, chat_id, chat_type, key, iv):
         
         # Optional: Send first account as preview
         if accounts:
-            preview_msg = f"""[B][C][FFFF00]🔍 FIRST ACCOUNT PREVIEW:
+            preview_msg = f"""[B][C][FFFF00] FIRST ACCOUNT PREVIEW:
 
-👤 UID: {accounts[0]['uid']}
-🔑 Pass: {accounts[0]['password']}
-📛 Name: {accounts[0]['name']}
+ UID: {accounts[0]['uid']}
+ Pass: {accounts[0]['password']}
+ Name: {accounts[0]['name']}
 
-💡 Check guest_accounts.json for all accounts!
+ Check guest_accounts.json for all accounts!
 """
             await safe_send_message(chat_type, preview_msg, uid, chat_id, key, iv)
             
     except Exception as e:
-        error_msg = f"[B][C][FF0000]❌ Generation error: {str(e)[:50]}\n"
+        error_msg = f"[B][C][FF0000] Generation error: {str(e)[:50]}\n"
         await safe_send_message(chat_type, error_msg, uid, chat_id, key, iv)        
         
 async def start_auto_packet(key, iv, region):
@@ -7003,17 +6323,17 @@ async def detect_and_hijack_emote(data_hex, key, iv, bot_uid, region):
         sender_uid = emote_info['sender_uid']
         emote_id = emote_info['emote_id']
         
-        print(f"\n🎭 EMOTE DETECTED FOR HIJACK!")
-        print(f"   👤 Original Sender: {sender_uid}")
-        print(f"   🎭 Emote ID: {emote_id}")
+        print(f"\n EMOTE DETECTED FOR HIJACK!")
+        print(f"    Original Sender: {sender_uid}")
+        print(f"    Emote ID: {emote_id}")
         
         # Don't hijack bot's own emotes
         if int(sender_uid) == bot_uid:
-            print("⚠️ Skipping - bot's own emote")
+            print(" Skipping - bot's own emote")
             return False
         
         # HIJACK: Send emote with bot's UID instead
-        print(f"🤖 HIJACKING EMOTE! Sending as bot {bot_uid}...")
+        print(f" HIJACKING EMOTE! Sending as bot {bot_uid}...")
         
         # Use either of your emote functions
         # Method 1: Using Emote_k (your second packet)
@@ -7031,13 +6351,13 @@ async def detect_and_hijack_emote(data_hex, key, iv, bot_uid, region):
             online_writer.write(hijack_packet)
             await online_writer.drain()
             
-            print(f"✅ Emote hijacked! Bot {bot_uid} now appears to do emote {emote_id}")
+            print(f" Emote hijacked! Bot {bot_uid} now appears to do emote {emote_id}")
             return True
         
         return False
         
     except Exception as e:
-        print(f"❌ Emote hijack error: {e}")
+        print(f" Emote hijack error: {e}")
         return False
         
 async def SwitchLoneWolfDule(BotUid, key, iv):
@@ -7074,13 +6394,13 @@ async def create_hijacked_emote(hijacker_uid, emote_id, key, iv, region):
         return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet, key, iv)
         
     except Exception as e:
-        print(f"❌ Error creating hijacked emote: {e}")
+        print(f" Error creating hijacked emote: {e}")
         return None
             
 def analyze_hex_packet(packet_hex):
     """Analyze hex packet structure"""
     
-    print(f"\n🔬 HEX PACKET ANALYSIS")
+    print(f"\n HEX PACKET ANALYSIS")
     print("="*50)
     
     # Header analysis
@@ -7094,9 +6414,9 @@ def analyze_hex_packet(packet_hex):
     # 1200 = Chat packet
     
     if header.startswith('05'):
-        print("📡 Online connection packet")
+        print(" Online connection packet")
     elif header.startswith('12'):
-        print("💬 Whisper/Chat packet")
+        print(" Whisper/Chat packet")
     
     # Look for UIDs (9-11 digit numbers in hex)
     import re
@@ -7104,20 +6424,20 @@ def analyze_hex_packet(packet_hex):
     # Find all sequences of 9+ hex digits
     hex_patterns = re.findall(r'[0-9a-f]{9,12}', packet_hex.lower())
     
-    print(f"\n🔢 Hex sequences found:")
+    print(f"\n Hex sequences found:")
     for pattern in hex_patterns[:10]:  # Show first 10
         # Try to convert to decimal
         try:
             decimal = int(pattern, 16)
             if 1000000 < decimal < 99999999999:  # Reasonable UID range
-                print(f"  {pattern} → {decimal} (Possible UID)")
+                print(f"  {pattern}  {decimal} (Possible UID)")
             elif decimal > 900000000:  # Emote ID range
-                print(f"  {pattern} → {decimal} (Possible emote ID)")
+                print(f"  {pattern}  {decimal} (Possible emote ID)")
         except:
             print(f"  {pattern}")
     
     # Show packet content (first 200 chars)
-    print(f"\n📝 Packet preview (first 200 chars):")
+    print(f"\n Packet preview (first 200 chars):")
     print(packet_hex[:200])
     
     if len(packet_hex) > 200:
@@ -7133,7 +6453,7 @@ def append_to_whitelist(uid_to_add):
         return False, f"UID {uid_str} already in whitelist"
     
     WHITELISTED_UIDS.add(uid_str)
-    return True, f"✅ Added {uid_str} to whitelist"        
+    return True, f" Added {uid_str} to whitelist"        
         
 async def hijack_squad_emote(data_hex, key, iv, bot_uid, region, in_squad):
     """Only hijack emotes when bot is in a squad"""
@@ -7150,10 +6470,10 @@ async def hijack_squad_emote(data_hex, key, iv, bot_uid, region, in_squad):
         sender_uid = emote_info['sender_uid']
         emote_id = emote_info['emote_id']
         
-        print(f"\n🏆 SQUAD EMOTE HIJACK!")
-        print(f"   👥 In squad: Yes")
-        print(f"   👤 Original: {sender_uid}")
-        print(f"   🎭 Emote: {emote_id}")
+        print(f"\n SQUAD EMOTE HIJACK!")
+        print(f"    In squad: Yes")
+        print(f"    Original: {sender_uid}")
+        print(f"    Emote: {emote_id}")
         
         # Create hijacked emote
         hijack_packet = await create_hijacked_emote(bot_uid, emote_id, key, iv, region)
@@ -7162,7 +6482,7 @@ async def hijack_squad_emote(data_hex, key, iv, bot_uid, region, in_squad):
             online_writer.write(hijack_packet)
             await online_writer.drain()
             
-            print(f"✅ Squad emote hijacked by bot {bot_uid}!")
+            print(f" Squad emote hijacked by bot {bot_uid}!")
             
             # Optional: Also send the original emote to maintain appearance
             await asyncio.sleep(0.3)
@@ -7170,12 +6490,12 @@ async def hijack_squad_emote(data_hex, key, iv, bot_uid, region, in_squad):
             online_writer.write(original_packet)
             await online_writer.drain()
             
-            print(f"✅ Also sent original emote to maintain cover")
+            print(f" Also sent original emote to maintain cover")
             
             return True
             
     except Exception as e:
-        print(f"❌ Squad hijack error: {e}")
+        print(f" Squad hijack error: {e}")
     
     return False
     
@@ -7213,7 +6533,7 @@ async def send_friend_request_async(target_uid: str, count: int = 1) -> dict:
             max_count = min(count, len(tokens))
             results = {"success": 0, "failed": 0}
             
-            print(f"📦 Sending {max_count} friend requests...")
+            print(f" Sending {max_count} friend requests...")
             
             # Send requests sequentially (or use threading for faster)
             for i in range(max_count):
@@ -7231,14 +6551,14 @@ async def send_friend_request_async(target_uid: str, count: int = 1) -> dict:
             return results
             
     except Exception as e:
-        print(f"❌ Friend request error: {e}")
+        print(f" Friend request error: {e}")
         return {"success": 0, "failed": 0, "error": str(e)}    
 
 async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
     global online_writer, last_status_packet, status_response_cache, senthi
     global insquad, joining_team, whisper_writer, region
  
-    bot_uid = 14619134248
+    bot_uid = 14010319252
  
     if insquad is not None:
         insquad = None
@@ -7270,9 +6590,28 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                     
                 data_hex = data2.hex()
       
-                # Your existing code...
-  
+                try:
+                    if data_hex.startswith("0500"):
+                        packet_str = await DeCode_PackEt(data_hex[10:])
+                        packet_json = json.loads(packet_str)
+                        if '5' in packet_json and 'data' in packet_json['5']:
+                            _, _, squad_code_extracted = await GeTSQDaTa(packet_json)
+                            if squad_code_extracted:
+                                # The squad code comes in format "uid_shortcode"
+                                # GenJoinSquadsPacket needs only the short code part
+                                if '_' in str(squad_code_extracted):
+                                    short_code = str(squad_code_extracted).split('_', 1)[1]
+                                else:
+                                    short_code = str(squad_code_extracted)
+                                import os
+                                os.makedirs('.ipc', exist_ok=True)
+                                with open(".ipc/latest_squad.txt", "w") as f:
+                                    f.write(short_code)
+                                print(f" Intercepted Team Code: {short_code} (full: {squad_code_extracted})")
+                except Exception:
+                    pass
                 
+                # Your existing code...
                 
               # =================== EMOTE DETECTION ONLY ===================
                 if data_hex.startswith("0500") and emote_hijack == True:
@@ -7292,16 +6631,16 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                             
                             
                             
-                            print(f"\n🎯 EMOTE DETECTED!")
-                            print(f"   👤 Sender UID: {sender_uid}")
-                            print(f"   🎭 Emote ID: {emote_id}")
+                            print(f"\n EMOTE DETECTED!")
+                            print(f"    Sender UID: {sender_uid}")
+                            print(f"    Emote ID: {emote_id}")
                             
                             # Don't respond to bot's own emotes
                             if int(sender_uid) != bot_uid:
-                                print("🤖 Bot responding with dual emotes...")
+                                print(" Bot responding with dual emotes...")
                                 
                                 # STEP 1: Send fixed emote 909035003 to the sender
-                                print(f"  1️⃣ Sending emote 909035003 to {sender_uid}")
+                                print(f"  1 Sending emote 909035003 to {sender_uid}")
                                 fixed_emote_packet = await Emote_k(
                                     int(sender_uid), 
                                     909035003,  # Fixed emote ID
@@ -7313,7 +6652,7 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                     await asyncio.sleep(0.5)
                                 
                                 # STEP 2: Bot does the SAME emote that user did (to itself)
-                                print(f"  2️⃣ Bot doing same emote {emote_id} to itself")
+                                print(f"  2 Bot doing same emote {emote_id} to itself")
                                 bot_self_emote = await Emote_k(
                                     bot_uid,  # Bot's own UID
                                     int(emote_id),  # Same emote user did
@@ -7325,7 +6664,7 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                     await asyncio.sleep(0.5)
                                 
                                 # STEP 3: Bot also sends the emote back to sender
-                                print(f"  3️⃣ Mirroring emote {emote_id} back to {sender_uid}")
+                                print(f"  3 Mirroring emote {emote_id} back to {sender_uid}")
                                 mirror_emote = await Emote_k(
                                     int(sender_uid),
                                     int(emote_id),  # Same emote back
@@ -7335,13 +6674,13 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                     online_writer.write(mirror_emote)
                                     await online_writer.drain()
                                 
-                                print("✅ Dual emote response complete!")
+                                print(" Dual emote response complete!")
                             
                             else:
-                                print("⚠️ Skipping - bot's own emote")
+                                print(" Skipping - bot's own emote")
                                 
                     except Exception as e:
-                        print(f"❌ Emote response error: {e}")
+                        print(f" Emote response error: {e}")
                         continue 
             
                     
@@ -7366,33 +6705,50 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                         print(f"Error in auto-accept case 1: {e}")
                         pass
                 
-                # case 2
                 # Case 2: Auto-accept for whitelisted users
                 if data_hex.startswith("0500") and insquad is None and joining_team == False:
                     try:
                         packet = await DeCode_PackEt(data_hex[10:])
                         packet_json = json.loads(packet)
     
-                        uid = packet_json['5']['data']['1']['data']
-                        invite_uid = packet_json['5']['data']['2']['data']['1']['data']
-                        squad_owner = packet_json['5']['data']['1']['data']  # Person inviting
-                        code = packet_json['5']['data']['8']['data']
-  
+                        if '5' in packet_json and isinstance(packet_json['5'], dict) and 'data' in packet_json['5']:
+                            _data = packet_json['5']['data']
+                            if '1' in _data and '2' in _data and '8' in _data:
+                                uid = _data['1']['data']
+                                if isinstance(_data['2']['data'], dict) and '1' in _data['2']['data']:
+                                    invite_uid = _data['2']['data']['1']['data']
+                                    squad_owner = _data['1']['data']  # Person inviting
+                                    code = _data['8']['data']
+              
+                                    emote_id = 909050009
+                                    # bot_uid = 14009897329 # No longer strictly needed or should be dynamic
+                
+                                    # FIX: Check SQUAD_OWNER and ensure bot is NOT currently locked in an active emote session
+                                    is_locked, lock_sid = is_bot_locked()
+                                    if is_locked:
+                                        print(f"🚫 Ignoring in-game squad invite from {squad_owner} because bot is locked in session {lock_sid}")
+                                        continue
 
-                        emote_id = 909042007
-                        bot_uid = 14619134248
-    
-                        # 🎯 FIX: Check SQUAD_OWNER (person who clicked "invite")
-                        if True:
-                            print(f"✅ Whitelisted user {squad_owner} invited bot. Accepting...")
-                        
-                            SendInv = await RedZed_SendInv(bot_uid, invite_uid, key, iv)
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', SendInv)
-                            inv_packet = await RejectMSGtaxt(squad_owner, uid, key, iv)
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', inv_packet)
-        
-                            print(f"Received squad invite from {squad_owner}, accepting...")                  
-                            Join = await ArohiAccepted(squad_owner, code, key, iv)
+                                    if "NM" in WHITELISTED_UIDS or True: # Force true right now for auto-accepting test requests from our UI
+                                        print(f" Auto-accepting squad invite from {squad_owner}...")
+                                    
+                                        SendInv = await RedZed_SendInv(bot_uid, invite_uid, key, iv)
+                                        if whisper_writer and online_writer:
+                                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', SendInv)
+                                        
+                                        inv_packet = await RejectMSGtaxt(squad_owner, uid, key, iv)
+                                        if whisper_writer and online_writer:
+                                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', inv_packet)
+                    
+                                        print(f"Joining squad via invite code {code} ...")                  
+                                        Join = await ArohiAccepted(squad_owner, code, key, iv)
+                                        if online_writer and Join:
+                                            online_writer.write(Join)
+                                            await online_writer.drain()
+                                        insquad = code
+                    except Exception as e:
+                        if "string indices must be integers" not in str(e) and "'5'" not in str(e):
+                            print(f"Error in auto-accept: {e}")
                             await SEndPacKeT(whisper_writer, online_writer, 'OnLine', Join)
         
                             await asyncio.sleep(2)
@@ -7407,16 +6763,16 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
             
                             # Set squad status
                             insquad = True
-                            print(f"🤖 Bot joined squad of {squad_owner}")
+                            print(f" Bot joined squad of {squad_owner}")
         
         
         
                         else:
                             try:
-                                print(f"🚫 Bot is private! Ignoring invite from {squad_owner}")
+                                print(f" Bot is private! Ignoring invite from {squad_owner}")
                                  # Send quick reject message
-                                bot_uid = 14619134248
-                                message_text = f" Can't accept Your request Talk to D I A B LO__C O D E X !"
+                                bot_uid = 13777711848
+                                message_text = f" Can't accept Your request Talk to NAJMI-M24"
                                 private_msg_packet = await xSEndMsg(
                                     Msg=message_text,
                                     Tp=2,  # 2 = Private message
@@ -7455,27 +6811,28 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
         
                         # Detect ALL kick/leave packets
                         if packet_type in [6, 7, 8, 9, 10, 11, 12]:
-                            print(f"🚪 Kick/Leave packet detected (Type: {packet_type})")
+                            print(f" Kick/Leave packet detected (Type: {packet_type})")
             
-                            # RESET SQUAD STATUS
+                            # RESET SQUAD STATUS & RELEASE LOCK
                             insquad = None
                             joining_team = False
+                            invalidate_lock_session()
             
-                            print(f"✅ Bot reset after kick. Ready for new invites.")
+                            print(f" Bot reset after kick. Lock session released & ready for new invites.")
                             
                             # Try to extract squad info for possible reconnection
                             try:
                                 if '5' in packet_json and 'data' in packet_json['5']:
                                     OwNer_UiD, CHaT_CoDe, SQuAD_CoDe = await GeTSQDaTa(packet_json)
-                                    print(f"🔄 Attempting reconnection to squad {SQuAD_CoDe}...")
+                                    print(f" Attempting reconnection to squad {SQuAD_CoDe}...")
                     
                                     # Re-authenticate chat
                                     JoinCHaT = await AutH_Chat(3, OwNer_UiD, CHaT_CoDe, key, iv)
                                     await SEndPacKeT(whisper_writer, online_writer, 'ChaT', JoinCHaT)
                     
-                                    print(f"✅ Chat re-authenticated for reconnection")
+                                    print(f" Chat re-authenticated for reconnection")
                             except:
-                                print("⚠️ Could not extract squad info")
+                                print(" Could not extract squad info")
                                 
                             continue  # Skip other handlers
         
@@ -7486,13 +6843,13 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                 
                                 # If we have squad data but insquad is None, try to reconnect
                                 if insquad is None:
-                                    print(f"🤖 Received squad data while not in squad. Attempting chat auth...")
+                                    print(f" Received squad data while not in squad. Attempting chat auth...")
                                     
                                     JoinCHaT = await AutH_Chat(3, OwNer_UiD, CHaT_CoDe, key, iv)
                                     await SEndPacKeT(whisper_writer, online_writer, 'ChaT', JoinCHaT)
                     
                                     # Optional welcome back message
-                                    welcome_msg = """[B][C][FFFF00]🤖 Bot reconnected!"""
+                                    welcome_msg = """[B][C][00FF00] Bot reconnected!"""
                                     P = await SEndMsG(0, welcome_msg, OwNer_UiD, OwNer_UiD, key, iv, region)
                                     await SEndPacKeT(whisper_writer, online_writer, 'ChaT', P)
                     
@@ -7500,7 +6857,7 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                 pass  # Not a squad data packet
                 
                     except Exception as e:
-                        print(f"❌ Kick/reconnect handler error: {e}")
+                        print(f" Kick/reconnect handler error: {e}")
                         pass
                 
                 # case 5
@@ -7517,9 +6874,13 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                         await SEndPacKeT(whisper_writer , online_writer , 'ChaT' , JoinCHaT)
                         
                         def get_random_color(): return "_" 
-                        message = """[B][C][00FFFF]╭[00FFFF]─[00FFFF]╮[00FFFF]╔═══════╗
-[C][B][FFFF00]│[FF0000]▶[00FFFF]│[00FFFF]║[FFFFFF] APON GMAING TCP BOT[FFFF00]║
-[C][B][00FFFF]╰[00FFFF]─[00FFFF]╯[00FFFF]╚═══════╝"""
+                        message = """[B][C][FF0000] WELCOME TO NAJMI-M24 BOT 
+[00FF00]--
+[FFFFFF] BOT POWERED BY:[FF0000] NAJMI-M24
+[FFFFFF] STATUS: [00FF00]ACTIVE 24/7
+[FFFFFF] CONTACT: [FFFF00]@NAJMI-M24
+[00FF00]--
+[FF0000] ENJOY THE BOT! """
                         # In your auto-join (Old Handler) code, find this line:
 
                         P = await SEndMsG(0, message, OwNer_UiD, OwNer_UiD, key, iv, region)
@@ -7544,9 +6905,13 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                 if senthi == True:
                     
                     def get_random_color(): return "_" 
-                    message = """[B][C][00FFFF]╭[00FFFF]─[00FFFF]╮[00FFFF]╔═══════╗
-[C][B][FFFF00]│[FF0000]▶[00FFFF]│[00FFFF]║[FFFFFF]  TCP BOT[FFFF00]║
-[C][B][00FFFF]╰[00FFFF]─[00FFFF]╯[00FFFF]╚═══════╝"""
+                    message = """[B][C][FF0000] WELCOME TO NAJMI-M24 BOT 
+[00FF00]--
+[FFFFFF] BOT POWERED BY:[FF0000] NAJMI-M24 
+[FFFFFF] STATUS: [00FF00]ACTIVE 24/7
+[FFFFFF] CONTACT: [FFFF00]@NAJMI-M24
+[00FF00]--
+[FF0000] ENJOY THE BOT! """
                         # In your auto-join (Old Handler) code, find this line:
 
                     P = await SEndMsG(0, message, OwNer_UiD, OwNer_UiD, key, iv, region)
@@ -7555,7 +6920,7 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
 
                 # =================== STATUS HANDLER ===================
                 if data_hex.startswith('0f00') and len(data_hex) > 100:
-                    print(f"📡 Received status response packet")
+                    print(f" Received status response packet")
     
                     try:
                         # Assuming the protocol structure: 0f00 + length bytes + 08 + actual proto data
@@ -7563,7 +6928,7 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                         if '08' in data_hex:
                             proto_part = f'08{data_hex.split("08", 1)[1]}'
                         else:
-                            print("⚠️ Status packet structure missing '08' marker.")
+                            print(" Status packet structure missing '08' marker.")
                             continue
         
                         # Assuming get_available_room is available
@@ -7577,12 +6942,18 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                 player_id = parsed_json["5"]["data"]["1"]["data"]["1"]["data"]
                 
                                 # Assuming get_player_status is available
-                                player_status = get_player_status(proto_part) 
-                                print(f"✅ Parsed status for {player_id}: {player_status}")
+                                player_info = get_player_status(proto_part) 
+                                print(f" Parsed info for {xMsGFixinG(player_id)}: {player_info['status']} ({player_info['nickname']})")
                 
                                 # Create cache entry
                                 cache_entry = {
-                                    'status': player_status, 
+                                    'status': player_info['status'],
+                                    'nickname': player_info['nickname'],
+                                    'level': player_info['level'],
+                                    'region': player_info['region'],
+                                    'likes': player_info['likes'],
+                                    'last_online': player_info.get('last_online'),
+                                    'room_id': player_info.get('room_id'),
                                     'packet': proto_part,
                                     'timestamp': time.time(),
                                     'full_packet': data_hex,
@@ -7599,11 +6970,11 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                         "11" in StatusData["5"]["data"]["1"]["data"] and "data" in StatusData["5"]["data"]["1"]["data"]["11"] and 
                                         StatusData["5"]["data"]["1"]["data"]["11"]["data"] == 1):
                 
-                                        print(f"🎯 SPECIAL CONDITION MET: Player {player_id} is in SOLO mode with special flag 11=1")
+                                        print(f" SPECIAL CONDITION MET: Player {xMsGFixinG(target_uid)} is in SOLO mode with special flag 11=1")
                                         cache_entry['special_state'] = 'SOLO_WITH_FLAG_1'
                 
                                 except Exception as cond_error:
-                                    print(f"⚠️ Error checking special condition: {cond_error}")
+                                    print(f" Error checking special condition: {cond_error}")
                                 # ------------------------------
 
                                 # If in room, extract room ID
@@ -7613,7 +6984,7 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                         room_id = get_idroom_by_idplayer(proto_part)
                                         if room_id:
                                             cache_entry['room_id'] = room_id
-                                            print(f"🏠 Room ID extracted: {room_id}")
+                                            print(f" Room ID extracted: {room_id}")
                                     except Exception as room_error:
                                         print(f"Failed to extract room ID: {room_error}")
                 
@@ -7624,16 +6995,16 @@ async def TcPOnLine(ip, port, key, iv, AutHToKen, reconnect_delay=0.5):
                                         leader_id = get_leader(proto_part)
                                         if leader_id:
                                             cache_entry['leader_id'] = leader_id
-                                            print(f"👑 Leader ID: {leader_id}")
+                                            print(f" Leader ID: {leader_id}")
                                     except Exception as leader_error:
                                         print(f"Failed to extract leader: {leader_error}")
                 
                                 # Save to FILE cache (Assuming save_to_cache is available)
                                 save_to_cache(player_id, cache_entry)
-                                print(f"✅ Saved to cache: {player_id} = {player_status}")
+                                print(f" Saved to cache: {xMsGFixinG(target_uid)} = {player_status}")
                 
                     except Exception as e:
-                        print(f"❌ Error parsing status: {e}")
+                        print(f" Error parsing status: {e}")
                         import traceback
                         traceback.print_exc()
                 
@@ -7710,7 +7081,7 @@ async def send_keep_alive(key, iv, region):
         packet = await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet_type, key, iv)
         return packet
     except Exception as e:
-        print(f"❌ Keep-alive error: {e}")
+        print(f" Keep-alive error: {e}")
         return None
         
                     
@@ -7719,7 +7090,7 @@ async def send_keep_alive(key, iv, region):
 async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event, region , reconnect_delay=0.5):
     print(region, 'TCP CHAT')
 
-    global whisper_writer , spammer_uid , spam_chat_id , spam_uid , online_writer , chat_id , XX , uid , Spy,data2, Chat_Leave, fast_spam_running, fast_spam_task, custom_spam_running, custom_spam_task, spam_request_running, spam_request_task, evo_fast_spam_running, evo_fast_spam_task, evo_custom_spam_running, evo_custom_spam_task, lag_running, lag_task, evo_cycle_running, evo_cycle_task, reject_spam_running, reject_spam_task
+    global whisper_writer , spammer_uid , spam_chat_id , spam_uid , online_writer , chat_id , XX , uid , Spy,data2, Chat_Leave, fast_spam_running, fast_spam_task, custom_spam_running, custom_spam_task, spam_request_running, spam_request_task, evo_fast_spam_running, evo_fast_spam_task, evo_custom_spam_running, evo_custom_spam_task, lag_running, lag_task, evo_cycle_running, evo_cycle_task, reject_spam_running, reject_spam_task, bot_enabled
     # At the VERY TOP of your file, with other globals:
     status_response_cache = {}
     cache_lock = asyncio.Lock()  # For thread safety
@@ -7757,31 +7128,131 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
 
                     except:
                         response = None
+                        
+                        
+
+                        
+
 
 
                     # ============ WHITELIST CHECK ============
+                    # ============ WHITELIST CHECK ============
                     if response:
+                        # Get data
+                        uid = response.Data.uid
+                        chat_id = response.Data.Chat_ID
+                        XX = response.Data.chat_type
+                        inPuTMsG = response.Data.msg.lower()
+                        MsG = response.Data.msg.lower() # Added this to match your code
+
+                        # ============ PUBLIC MODE ENABLED ============
+                        # Maine yahan se Blocking Code hata diya hai.
+                        # Ab bot check nahi karega, sab log commands use kar payenge.
+                        
+                        uid_str = str(uid)
+                        print(f" Command received from: {uid_str} (Public Mode)")
+
+                        # ... Yahan se niche commands shuru honge ...
+
+                        # ========= ON =========
+                        if inPuTMsG.startswith('/on'):
+                            if not is_admin(uid):
+                                await safe_send_message(response.Data.chat_type, " Only admin can use /on", uid, chat_id, key, iv)
+                                continue
+
+                            bot_enabled = True
+                            await safe_send_message(response.Data.chat_type, " Bot is now ON", uid, chat_id, key, iv)
+                            continue
 
 
+                        # ========= OFF =========
+                        if inPuTMsG.startswith('/off'):
+                            if not is_admin(uid):
+                                await safe_send_message(response.Data.chat_type, " Only admin can use /off", uid, chat_id, key, iv)
+                                continue
+
+                            bot_enabled = False
+                            await safe_send_message(response.Data.chat_type, " Bot is now OFF", uid, chat_id, key, iv)
+                            continue
+
+
+                        # ========= BLOCK WHEN OFF (ONLY HERE) =========
+                        if not bot_enabled:
+                            await safe_send_message(response.Data.chat_type, " Bot is OFF", uid, chat_id, key, iv)
+                            continue
+
+    
+# ================= BUNDLE COMMAND START =================
+   # ================= FINAL BUNDLE COMMAND (FAST) =================
+                        if inPuTMsG.strip().startswith('/bundle'):
+                            print(f" Command: {inPuTMsG}")
+                            
+                            parts = inPuTMsG.strip().split()
+                            
+                            if len(parts) < 2:
+                                bundle_list = """[B][C][FFFFFF] rampage 
+[FFFFFF] cannibal 
+[FFFFFF] devil 
+[FFFFFF] scorpio 
+[FFFFFF] frostfire
+[FFFFFF] paradox 
+[FFFFFF] naruto 
+[FFFFFF] aurora 
+[FFFFFF] midnight 
+[FFFFFF] itachi 
+[FFFFFF] dreamspace"""
+                                await safe_send_message(response.Data.chat_type, bundle_list, uid, chat_id, key, iv)
+                            else:
+                                bundle_name = parts[1].lower()
+                                
+                                # Real IDs
+                                bundle_ids = {
+                                    "rampage": "914000002", "cannibal": "914000003",
+                                    "devil": "914038001", "scorpio": "914039001",
+                                    "frostfire": "914042001", "paradox": "914044001",
+                                    "naruto": "914047001", "aurora": "914047002",
+                                    "midnight": "914048001", "itachi": "914050001",
+                                    "dreamspace": "914051001"
+                                }
+                                
+                                if bundle_name not in bundle_ids:
+                                    await safe_send_message(response.Data.chat_type, " Invalid Name", uid, chat_id, key, iv)
+                                else:
+                                    bundle_id = bundle_ids[bundle_name]
+                                    
+                                    try:
+                                        # Function call
+                                        bundle_packet = await bundle_packet_async(bundle_id, key, iv, region)
+
+                                        if bundle_packet and online_writer:
+                                            # Packet Bhejo
+                                            online_writer.write(bundle_packet)
+                                            await online_writer.drain()
+                                            
+                                            success_msg = f"[B][C][00FF00] Done: {bundle_name}"
+                                            await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
+                                        else:
+                                            print(" Connection Lost")
+                                    
+                                    except Exception as e:
+                                        print(f"Error: {e}")
+                        # ===============================================================
 
                         
                         # AI Command - /ai
-                        if inPuTMsG.strip().startswith('/ai '):
+                        if inPuTMsG.strip().startswith('/ai'):
                             print('Processing AI command in any chat type')
                             
                             question = inPuTMsG[4:].strip()
                             if question:
-                                initial_message = f"[B][C]{get_random_color()}\n🤖 AI is thinking...\n"
+                                initial_message = f"[B][C]{get_random_color()}\n AI is thinking...\n"
                                 await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
                                 
-                                # Use ThreadPoolExecutor to avoid blocking the async loop
-                                loop = asyncio.get_event_loop()
-                                with ThreadPoolExecutor() as executor:
-                                    ai_response = await loop.run_in_executor(executor, talk_with_ai, question)
+                                ai_response = talk_with_ai(question)
                                 
                                 # Format the AI response
                                 ai_message = f"""
-[B][C][FFFF00]🤖 AI Response:
+[B][C][00FF00] AI Response:
 
 [FFFFFF]{ai_response}
 
@@ -7789,174 +7260,9 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
 """
                                 await safe_send_message(response.Data.chat_type, ai_message, uid, chat_id, key, iv)
                             else:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Please provide a question after /ai\nExample: /ai What is Free Fire?\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Please provide a question after /ai\nExample: /ai What is Free Fire?\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                
-                        if inPuTMsG.strip().startswith('/clan '):
-                            print('Processing basic command in any chat type')
 
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /clan <uid>\nExample: /clan 4368569733\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                clan_id = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nFetching the clan info...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-
-                                # Use ThreadPoolExecutor to avoid blocking the async loop
-                                loop = asyncio.get_event_loop()
-                                with ThreadPoolExecutor() as executor:
-                                    clan_result = await loop.run_in_executor(executor, get_clan_info, clan_id)
-                                await safe_send_message(response.Data.chat_type, f"\n{clan_result}\n", uid, chat_id, key, iv)                                
-                         #GET PLAYER BAN STATUS
-                        if inPuTMsG.strip().startswith('/check '):
-                            print('Processing ban_status command in any chat type')
-
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /check <uid>\nExample: /check 4368569733\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nFetching the player ban status...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-
-                                # Use ThreadPoolExecutor to avoid blocking the async loop
-                                loop = asyncio.get_event_loop()
-                                with ThreadPoolExecutor() as executor:
-                                    ban_status_result = await loop.run_in_executor(executor, get_player_ban_status, target_uid)
-                                await safe_send_message(response.Data.chat_type, f"\n{ban_status_result}\n", uid, chat_id, key, iv)
-                                
-                        if inPuTMsG.strip().startswith('/lv '):
-                            print('Processing basic command in any chat type')
-
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /lvl <uid>\nExample: /lv 4368569733\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nFetching the player level info...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-
-                                # Use ThreadPoolExecutor to avoid blocking the async loop
-                                loop = asyncio.get_event_loop()
-                                with ThreadPoolExecutor() as executor:
-                                    level_result = await loop.run_in_executor(executor, get_level_info, target_uid)
-                                await safe_send_message(response.Data.chat_type, f"\n{level_result}\n", uid, chat_id, key, iv)                                
-                        if inPuTMsG.strip().startswith('/info'):
-                            print('Processing bio command in any chat type')
-
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /info <uid>\nExample: /info 436🤫856🤫97🤫33\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nGetting Player Info...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-
-                                info_data = get_player_info(target_uid)
-
-                                await send_full_player_info(info_data, response.Data.chat_type, uid, chat_id, key, iv)
-                                
-                        if inPuTMsG.strip().startswith('/add '):
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /add <uid>"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}🚀 Sending Friend Requests..."
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-
-                                # ১০০টি রিকোয়েস্ট একসাথে পাঠানোর জন্য মাস্টার ফাংশন কল
-                                loop = asyncio.get_event_loop()
-                                with ThreadPoolExecutor() as executor:
-                                    # এখানে send_all_friend_requests কল করা হচ্ছে
-                                    final_result = await loop.run_in_executor(executor, get_player_add, target_uid)
-
-                                await safe_send_message(response.Data.chat_type, f"\n[B][C][00FF00]✅ {final_result}\n", uid, chat_id, key, iv)
-
-                        if inPuTMsG.strip().startswith('/spam_req '):
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /spam_req <uid>"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}🚀 Sending 100 Friend Requests to: {target_uid}..."
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-
-                                try:
-                                    # এটি ব্যাকগ্রাউন্ডে ১০০টি রিকোয়েস্ট প্রসেস করবে এবং বট ফ্রীজ হবে না
-                                    final_result = await send_all_friend_requests_async(target_uid)
-                                    
-                                    success_msg = f"\n[B][C][00FF00]✅ {final_result}\n"
-                                    await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
-                                    
-                                except Exception as e:
-                                    await safe_send_message(response.Data.chat_type, f"[B][C][FF0000]❌ Error: {str(e)}", uid, chat_id, key, iv)
-                                                                
-                               #INSTA USERNAME TO INFO-/ig
-                        if inPuTMsG.strip().startswith('/ig '):
-                            print('Processing insta command in any chat type')
-
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /ig <username>\nExample: /ig virat.kohli\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_username = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nFetching Instagram info for {target_username}...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-        
-        # Use ThreadPoolExecutor to avoid blocking the async loop
-                                loop = asyncio.get_event_loop()
-                                with ThreadPoolExecutor() as executor:
-                                    insta_result = await loop.run_in_executor(executor, send_insta_info, target_username)
-        
-                                await safe_send_message(response.Data.chat_type, insta_result, uid, chat_id, key, iv)
-                                
-#tt USERNAME TO INFO-/tt
-                        if inPuTMsG.strip().startswith('/tt '):
-                            print('Processing tiktok command in any chat type')
-
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /tt <username>\nExample: /tt virat.kohli\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_username = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nFetching TikTok info for {target_username}...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-        
-        # Use ThreadPoolExecutor to avoid blocking the async loop
-                                loop = asyncio.get_event_loop()
-                                with ThreadPoolExecutor() as executor:
-                                    tiktok_result = await loop.run_in_executor(executor, send_tiktok_info, target_username)
-        
-                                await safe_send_message(response.Data.chat_type, tiktok_result, uid, chat_id, key, iv)                                       
-                        # Likes Command - /like
-                        if inPuTMsG.strip().startswith('/like '):
-                            print('Processing likes command in any chat type')
-                            
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /like (uid)\nExample: /like 123456789\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nSending 100 likes to {target_uid}...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-                                
-                                # Use ThreadPoolExecutor to avoid blocking the async loop
-                                loop = asyncio.get_event_loop()
-                                with ThreadPoolExecutor() as executor:
-                                    likes_result = await loop.run_in_executor(executor, send_likes, target_uid)
-                                
-                                await safe_send_message(response.Data.chat_type, likes_result, uid, chat_id, key, iv)
 
                         # FREEZE COMMAND - /freeze [uid]
                         if inPuTMsG.strip().startswith('/freeze'):
@@ -7965,21 +7271,21 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             parts = inPuTMsG.strip().split()
     
                             if len(parts) < 2:
-                                error_msg = f"""[B][C][00FFFF]❄️ FREEZE COMMAND
+                                error_msg = f"""[B][C][00FFFF] FREEZE COMMAND
 
-❌ Usage: /freeze (uid)
+ Usage: /freeze (uid)
         
-📝 Examples:
+ Examples:
 /freeze me - Freeze yourself
 /freeze 123456789 - Freeze specific UID
 
-🎯 What it does:
-• Sends 3 ice/freeze emotes in sequence
-• 1-second cycles for 10 seconds total
-• Emotes: 909040004 → 909050008 → 909000002
-• Creates a "freeze" effect!
+ What it does:
+ Sends 3 ice/freeze emotes in sequence
+ 1-second cycles for 10 seconds total
+ Emotes: 909040004  909050008  909000002
+ Creates a "freeze" effect!
 
-💡 Use /stop_freeze to stop early
+ Use /stop_freeze to stop early
 """
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
@@ -7990,7 +7296,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     target_uid = str(response.Data.uid)
                                     target_name = "Yourself"
                                 else:
-                                    target_name = f"UID {target_uid}"
+                                    target_name = f"UID {xMsGFixinG(target_uid)}"
                                 
                                 # Stop any existing freeze task
                                 global freeze_running, freeze_task
@@ -8000,17 +7306,17 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     await asyncio.sleep(0.5)
         
                                 # Send initial message
-                                initial_msg = f"""[B][C][00FFFF]❄️ FREEZE COMMAND STARTING!
+                                initial_msg = f"""[B][C][00FFFF] FREEZE COMMAND STARTING!
 
-🎯 Target: {target_name}
-⏱️ Duration: {FREEZE_DURATION} seconds
-🔄 Cycle: 1 second (3 emotes each)
-🎭 Sequence: 
+ Target: {target_name}
+ Duration: {FREEZE_DURATION} seconds
+ Cycle: 1 second (3 emotes each)
+ Sequence: 
   1. 909040004 (Ice)
   2. 909050008 (Frozen) 
   3. 909000002 (Freeze)
 
-⏳ Starting freeze sequence...
+ Starting freeze sequence...
 """
                                 await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
         
@@ -8026,25 +7332,25 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 )
 
                         if inPuTMsG.strip().startswith('/bio'):
-                            print('📝 Processing bio change command')
+                            print(' Processing bio change command')
     
                             parts = inPuTMsG.strip().split(maxsplit=1)
     
                             if len(parts) < 2:
-                                error_msg = f"""[B][C][FF0000]❌ Usage: /bio (your bio text)
+                                error_msg = f"""[B][C][FF0000] Usage: /bio (your bio text)
 
-📝 Examples:
+ Examples:
 /bio Hello World!
-/bio 🤖 Bot by ABHI
-/bio Level 66 | Pro Player
-/bio Add me: ABHI
+/bio  Bot by NAJMI-M24
+/bio Level 70 | Pro Player
+/bio Add me: NAJMI-M24
 
-✨ Features:
-• Changes bot's profile bio instantly
-• Supports emojis and special characters
-• Max length: 50 characters
+ Features:
+ Changes bot's profile bio instantly
+ Supports emojis and special characters
+ Max length: 50 characters
 
-💡 Note: Bio changes appear immediately in profile!
+ Note: Bio changes appear immediately in profile!
 """
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
@@ -8052,18 +7358,18 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 
                                 # Check length
                                 if len(bio_text) > 50:
-                                    error_msg = f"[B][C][FF0000]❌ Bio too long! Max 50 characters.\n📝 Your bio: {len(bio_text)} chars\n"
+                                    error_msg = f"[B][C][FF0000] Bio too long! Max 50 characters.\n Your bio: {len(bio_text)} chars\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     return
         
                                 # Send initial message
-                                initial_msg = f"[B][C][FFFF00]📝 UPDATING BIO...\n📋 Bio: {bio_text[:30]}...\n⏳ Please wait...\n"
+                                initial_msg = f"[B][C][00FF00] UPDATING BIO...\n Bio: {bio_text[:30]}...\n Please wait...\n"
                                 await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
         
                                 # FIXED: Handle credentials properly
                                 credentials = load_credentials_from_file("bot.txt")
                                 if not credentials:
-                                    error_msg = f"[B][C][FF0000]❌ Failed to load credentials from file!\n"
+                                    error_msg = f"[B][C][FF0000] Failed to load credentials from file!\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     return
             
@@ -8075,7 +7381,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     Pw = credentials[1] if isinstance(credentials, (list, tuple)) and len(credentials) > 1 else None
         
                                 if not Uid or not Pw:
-                                    error_msg = f"[B][C][FF0000]❌ Invalid credentials format!\n"
+                                    error_msg = f"[B][C][FF0000] Invalid credentials format!\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     return
         
@@ -8087,12 +7393,12 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
         
                                 for attempt in range(max_retries):
                                     try:
-                                        print(f"🔄 Bio update attempt {attempt + 1}/{max_retries}")
+                                        print(f" Bio update attempt {attempt + 1}/{max_retries}")
                 
                                         # Get fresh token for each attempt
                                         open_id, access_token = await GeNeRaTeAccEss(Uid, Pw)
                                         if not open_id or not access_token:
-                                            print(f"❌ Failed to generate access token on attempt {attempt + 1}")
+                                            print(f" Failed to generate access token on attempt {attempt + 1}")
                                             await asyncio.sleep(retry_delay)
                                             continue
                 
@@ -8101,12 +7407,12 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         MajoRLoGinauTh = await DecRypTMajoRLoGin(MajoRLoGinResPonsE)
                 
                                         if not MajoRLoGinauTh or not MajoRLoGinauTh.token:
-                                            print(f"❌ No token received on attempt {attempt + 1}")
+                                            print(f" No token received on attempt {attempt + 1}")
                                             await asyncio.sleep(retry_delay)
                                             continue
                 
                                         token = MajoRLoGinauTh.token
-                                        print(f"🔑 Using token: {token[:20]}...")
+                                        print(f" Using token: {token[:20]}...")
                 
                                         # Call bio update with retry
                                         result = await set_bio_directly_async_with_retry(token, bio_text, region)
@@ -8115,37 +7421,37 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                             success = True
                                             break
                                         else:
-                                            print(f"❌ Bio update failed on attempt {attempt + 1}: {result.get('message')}")
+                                            print(f" Bio update failed on attempt {attempt + 1}: {result.get('message')}")
                                             if attempt < max_retries - 1:
                                                 # Send progress update
-                                                progress_msg = f"[B][C][FFFF00]🔄 Retrying... (Attempt {attempt + 2}/{max_retries})\n"
+                                                progress_msg = f"[B][C][FFFF00] Retrying... (Attempt {attempt + 2}/{max_retries})\n"
                                                 await safe_send_message(response.Data.chat_type, progress_msg, uid, chat_id, key, iv)
                                                 await asyncio.sleep(retry_delay)
                         
                                     except Exception as e:
-                                        print(f"❌ Attempt {attempt + 1} error: {e}")
+                                        print(f" Attempt {attempt + 1} error: {e}")
                                         if attempt < max_retries - 1:
                                             await asyncio.sleep(retry_delay)
                                         continue
         
                                 # Send final result
                                 if success:
-                                    success_msg = f"""[B][C][FFFF00]✅ BIO UPDATED SUCCESSFULLY!
+                                    success_msg = f"""[B][C][00FF00] BIO UPDATED SUCCESSFULLY!
 
-📝 Bio: {bio_text}
-🌍 Region: {result.get('region', region)}
-🔧 Attempts: {attempt + 1}/{max_retries}
-🤖 Bot: Profile updated instantly!
+ Bio: {bio_text}
+ Region: {result.get('region', region)}
+ Attempts: {attempt + 1}/{max_retries}
+ Bot: Profile updated instantly!
 
-💡 Check bot's profile to see new bio!
+ Check bot's profile to see new bio!
 """
                                 else:
-                                    success_msg = f"""[B][C][FF0000]❌ BIO UPDATE FAILED AFTER {max_retries} ATTEMPTS!
+                                    success_msg = f"""[B][C][FF0000] BIO UPDATE FAILED AFTER {max_retries} ATTEMPTS!
 
-📝 Bio: {bio_text}
-❌ Error: {result.get('message', 'All attempts failed')}
+ Bio: {bio_text}
+ Error: {result.get('message', 'All attempts failed')}
 
-💡 Try:
+ Try:
 1. Check bot's connection
 2. Try shorter bio text
 3. Wait 1 minute and try again
@@ -8154,14 +7460,14 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
             
 
-                        # QUICK EMOTE ATTACK COMMAND - /e [team_code] [emote_id] [target_uid?]
-                        if inPuTMsG.strip().startswith('/e'):
+                        # QUICK EMOTE ATTACK COMMAND - /quick [team_code] [emote_id] [target_uid?]
+                        if inPuTMsG.strip().startswith('/quick'):
                             print('Processing quick emote attack command')
     
                             parts = inPuTMsG.strip().split()
     
                             if len(parts) < 3:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /e (team_code) [emote_id] [target_uid]\n\n[FFFFFF]Examples:\n[FFFF00]/quick ABC123[FFFFFF] - Join, send Rings emote, leave\n[FFFF00]/ghostquick ABC123[FFFFFF] - Ghost join, send emote, leave\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /quick (team_code) [emote_id] [target_uid]\n\n[FFFFFF]Examples:\n[00FF00]/quick ABC123[FFFFFF] - Join, send Rings emote, leave\n[00FF00]/ghostquick ABC123[FFFFFF] - Ghost join, send emote, leave\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 team_code = parts[1]
@@ -8180,9 +7486,9 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 if target_uid == str(response.Data.uid):
                                     target_name = "Yourself"
                                 else:
-                                    target_name = f"UID {target_uid}"
+                                    target_name = f"UID {xMsGFixinG(target_uid)}"
         
-                                initial_message = f"[B][C][FFFF00]⚡ QUICK EMOTE ATTACK!\n\n[FFFFFF]🎯 Team: [FFFF00]{team_code}\n[FFFFFF]🎭 Emote: [FFFF00]{emote_id}\n[FFFFFF]👤 Target: [FFFF00]{target_name}\n[FFFFFF]⏱️ Estimated: [FFFF00]2 seconds\n\n[FFFF00]Executing sequence...\n"
+                                initial_message = f"[B][C][FFFF00] QUICK EMOTE ATTACK!\n\n[FFFFFF] Team: [00FF00]{team_code}\n[FFFFFF] Emote: [00FF00]{emote_id}\n[FFFFFF] Target: [00FF00]{target_name}\n[FFFFFF] Estimated: [00FF00]2 seconds\n\n[FFFF00]Executing sequence...\n"
                                 await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
         
                                 try:
@@ -8190,9 +7496,9 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     success, result = await ultra_quick_emote_attack(team_code, emote_id, target_uid, key, iv, region)
             
                                     if success:
-                                        success_message = f"[B][C][FFFF00]✅ QUICK ATTACK SUCCESS!\n\n[FFFFFF]🏷️ Team: [FFFF00]{team_code}\n[FFFFFF]🎭 Emote: [FFFF00]{emote_id}\n[FFFFFF]👤 Target: [FFFF00]{target_name}\n\n[FFFF00]Bot joined → emoted → left! ✅\n"
+                                        success_message = f"[B][C][00FF00] QUICK ATTACK SUCCESS!\n\n[FFFFFF] Team: [00FF00]{team_code}\n[FFFFFF] Emote: [00FF00]{emote_id}\n[FFFFFF] Target: [00FF00]{target_name}\n\n[00FF00]Bot joined  emoted  left! \n"
                                     else:
-                                        success_message = f"[B][C][FF0000]❌ Regular attack failed: {result}\n"
+                                        success_message = f"[B][C][FF0000] Regular attack failed: {result}\n"
                                     
                                     await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
             
@@ -8208,43 +7514,31 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             print('Processing xjoin command')
                             await handle_xjoin_command(inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
             
-                        # Invite Command - /inv (creates 5-player group and sends request)
-                        if inPuTMsG.strip().startswith('/inv '):
+                        # PLAYER INVITE 
+                        if inPuTMsG.strip().startswith('/inv'):
                             print('Processing invite command in any chat type')
                             
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /inv (uid)\nExample: /inv 123456789\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /inv (uid)\nExample: /inv 123456789\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nCreating 5-Player Group and sending request to {target_uid}...\n"
+                                initial_message = f"[B][C]{get_random_color()}Sending Team Invite To {xMsGFixinG(target_uid)}...\n"
                                 await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
                                 
                                 try:
-                                    # Fast squad creation and invite for 5 players
-                                    PAc = await OpEnSq(key, iv, region)
-                                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', PAc)
-                                    await asyncio.sleep(0.3)
-                                    
-                                    C = await cHSq(5, int(target_uid), key, iv, region)
-                                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', C)
-                                    await asyncio.sleep(0.3)
-                                    
-                                    V = await SEnd_InV(5, int(target_uid), key, iv, region)
+
+                                    V = await SEnd_InV(4, int(target_uid), key, iv, region)
                                     await SEndPacKeT(whisper_writer, online_writer, 'OnLine', V)
                                     await asyncio.sleep(0.3)
-                                    
-                                    E = await ExiT(None, key, iv)
-                                    await asyncio.sleep(2)
-                                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', E)
-                                    
+
                                     # SUCCESS MESSAGE
-                                    success_message = f"[B][C][FFFF00]✅ SUCCESS! 5-Player Group invitation sent successfully to {target_uid}!\n"
+                                    success_message = f"[B][C][00FF00] SUCCESS! Player Group invitation sent successfully to {target_uid}!\n"
                                     await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
                                     
                                 except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR sending invite: {str(e)}\n"
+                                    error_msg = f"[B][C][FF0000] ERROR sending invite: {str(e)}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         if inPuTMsG.startswith(("/6")):
@@ -8269,45 +7563,16 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             await SEndPacKeT(whisper_writer, online_writer, 'OnLine', E)
                             
                             # SUCCESS MESSAGE
-                            success_message = f"[B][C][FFFF00]✅ SUCCESS! 6-Player Group invitation sent successfully to {uid}!\n"
+                            success_message = f"[B][C][00FF00] SUCCESS! 6-Player Group invitation sent successfully to {xMsGFixinG(uid)}!\n"
                             await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
 
-                        if inPuTMsG.strip().startswith('/spam'):
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = "[B][C][FF0000]❌ Usage:[66FF00]/spam <uid>\nExample:[66FF00]/spam 123456789\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-                                total_requests = 30  # total join requests
-                                sequence = ['v1', 'v2', 'v3', 'v4', 'v5']  # all badge commands
-
-                                # Send initial consolidated message
-                                initial_msg = f"[B][C][1E90FF]🌀 Request received! Preparing to spam with all badges...\n"
-                                await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
-
-                                count = 0
-                                while count < total_requests:
-                                    for cmd in sequence:
-                                        if count >= total_requests:
-                                            break
-                                        # Build a fake command string like "/v1 123456789"
-                                        fake_command = f"/{cmd} {target_uid}"
-                                        await handle_badge_command(cmd, fake_command, uid, chat_id, key, iv, region, response.Data.chat_type)
-                                        count += 1
-
-                                # Success message after all 30 requests
-                                success_msg = f"[66FF00]✅ SUCCESS! Spam request sent successfully!\n"
-                                await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
-                                
-                                
                         # Add these lines to your existing command dispatcher:
 
                         if inPuTMsG.startswith('/spamroom ') or inPuTMsG == '/spamroom':
-                            await Room_Spam(inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
+                            await handle_room_spam_command(inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
 
                         if inPuTMsG.startswith('/sr ') or inPuTMsG == '/sr':
-                            await Room_Spam(inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
+                            await handle_sr_command(inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
 
                         if inPuTMsG.startswith('/title'):
                             await handle_all_titles_command(inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
@@ -8317,34 +7582,67 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             packet = await send_sticker(uid, chat_id, key, iv)                   
                             await SEndPacKeT(whisper_writer, online_writer, 'ChaT', packet)
 
-                            
+                                #GET PLAYER LIKE
+                        if inPuTMsG.strip().startswith('/like'):
+                            print('Processing bio command in any chat type')
+
+                            parts = inPuTMsG.strip().split()
+                            if len(parts) < 2:
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /like <uid>\nExample: /like 4368569733\n"
+                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
+                            else:
+                                target_uid = parts[1]
+                                initial_message = f"[B][C]{get_random_color()}\nSending Likes...\n"
+                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
+
+                                like_result = send_likes(target_uid)
+
+                                await safe_send_message(response.Data.chat_type, like_result, uid, chat_id, key, iv)
+
+                                #GET PLAYER LIKE
+                        if inPuTMsG.strip().startswith('/check'):
+                            print('Processing bio command in any chat type')
+
+                            parts = inPuTMsG.strip().split()
+                            if len(parts) < 2:
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /check <uid>\nExample: /check 4368569733\n"
+                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
+                            else:
+                                target_uid = parts[1]
+                                initial_message = f"[B][C]{get_random_color()}\nChecking Ban Status...\n"
+                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
+
+                                ban_result = check_ban(target_uid)
+
+                                await safe_send_message(response.Data.chat_type, ban_result, uid, chat_id, key, iv)
+
                         # Command handler for remove
                         if inPuTMsG.strip().startswith('/wlremove'):
                             parts = inPuTMsG.strip().split()
     
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ Usage: /wlremove (uid)\n"
+                                error_msg = f"[B][C][FF0000] Usage: /wlremove (uid)\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
                             target_uid = parts[1]
     
                             # Check owner
-                            if str(response.Data.uid) != "2270928791":
-                                error_msg = f"[B][C][FF0000]❌ Only bot owner can remove from whitelist!\n"
+                            if str(response.Data.uid) != "14444444004":
+                                error_msg = f"[B][C][FF0000] Only bot owner can remove from whitelist!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
                             
                             success, message = remove_from_whitelist(target_uid)
     
                             if success:
-                                bot_uid = 14619134248
+                                bot_uid = 13736023597
         
                                 # Create the private message packet
                                 # Tp = 2 (Private message)
                                 # Tp2 = target_uid (recipient)
                                 # id = bot_uid (sender)
-                                message_text = f"You Are Successfully Removed From Whitelist By {uid}"
+                                message_text = f"You Are Successfully Removed From Whitelist By {xMsGFixinG(uid)}"
                                 private_msg_packet = await xSEndMsg(
                                     Msg=message_text,
                                     Tp=2,  # 2 = Private message
@@ -8353,9 +7651,9 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     K=key,
                                     V=iv
                                 )
-                                result_msg = f"[B][C][FFFF00]✅ {message}\n📊 Remaining: {len(WHITELISTED_UIDS)} UIDs\n"
+                                result_msg = f"[B][C][00FF00] {message}\n Remaining: {len(WHITELISTED_UIDS)} UIDs\n"
                             else:
-                                result_msg = f"[B][C][FF0000]❌ {message}\n"
+                                result_msg = f"[B][C][FF0000] {message}\n"
                             
                             await safe_send_message(response.Data.chat_type, result_msg, uid, chat_id, key, iv)
                             
@@ -8363,13 +7661,13 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                         if inPuTMsG.strip() == '/wlenable':
                             
                             WHITELIST_ONLY = True
-                            msg = f"[B][C][FFFF00]✅ Whitelist-only mode ENABLED!\n🤖 Bot will only accept invites from whitelisted UIDs\n"
+                            msg = f"[B][C][00FF00] Whitelist-only mode ENABLED!\n Bot will only accept invites from whitelisted UIDs\n"
                             await safe_send_message(response.Data.chat_type, msg, uid, chat_id, key, iv)
                         
                         if inPuTMsG.strip() == '/wldisable':
 
                             WHITELIST_ONLY = False
-                            msg = f"[B][C][FFFF00]⚠️ Whitelist-only mode DISABLED!\n🤖 Bot will accept invites from anyone\n"
+                            msg = f"[B][C][FFFF00] Whitelist-only mode DISABLED!\n Bot will accept invites from anyone\n"
                             await safe_send_message(response.Data.chat_type, msg, uid, chat_id, key, iv)
                             
                         # Add this command handler
@@ -8379,16 +7677,16 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             parts = inPuTMsG.strip().split()
     
                             if len(parts) < 2:
-                                error_msg = f"""[B][C][FF0000]❌ Usage: /wladd (uid)
+                                error_msg = f"""[B][C][FF0000] Usage: /wladd (uid)
         
-📝 Examples:
+ Examples:
 /wladd 123456789 - Add UID to whitelist
 /wladd 123456789 "Friend" - Add with note
 
-🎯 What happens:
-• UID can now invite bot to squad
-• UID can use bot commands
-• Bot auto-accepts invites from this UID
+ What happens:
+ UID can now invite bot to squad
+ UID can use bot commands
+ Bot auto-accepts invites from this UID
 """
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
@@ -8401,8 +7699,8 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 note = ' '.join(parts[2:])
     
                             # Check if sender is owner
-                            if str(response.Data.uid) != "2270928791":  # Replace with your actual UID
-                                error_msg = f"[B][C][FF0000]❌ Only bot owner can add to whitelist!\n"
+                            if str(response.Data.uid) != "14444444004":  # Replace with your actual UID
+                                error_msg = f"[B][C][FF0000] Only bot owner can add to whitelist!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
@@ -8411,13 +7709,13 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
     
                             # Send result
                             if success:
-                                bot_uid = 14619134248
+                                bot_uid = 13736023597
         
                                 # Create the private message packet
                                 # Tp = 2 (Private message)
                                 # Tp2 = target_uid (recipient)
                                 # id = bot_uid (sender)
-                                message_text = f"You Are Successfully Added To Whitelist By {uid}"
+                                message_text = f"You Are Successfully Added To Whitelist By {xMsGFixinG(uid)}"
                                 private_msg_packet = await xSEndMsg(
                                     Msg=message_text,
                                     Tp=2,  # 2 = Private message
@@ -8430,14 +7728,14 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 if private_msg_packet and whisper_writer:
                                     # Send via Whisper connection (chat connection)
                                     await SEndPacKeT(whisper_writer, online_writer, 'ChaT', private_msg_packet)
-                                success_msg = f"""[B][C][FFFF00]✅ WHITELIST UPDATED!
+                                success_msg = f"""[B][C][00FF00] WHITELIST UPDATED!
                         
-👤 Added: {target_uid}
-📝 Note: {note if note else 'None'}
-📊 Total whitelisted: {len(WHITELISTED_UIDS)}
+ Added: {xMsGFixinG(target_uid)}
+ Note: {note if note else 'None'}
+ Total whitelisted: {len(WHITELISTED_UIDS)}
 """
                             else:
-                                success_msg = f"[B][C][FF0000]❌ {message}\n"
+                                success_msg = f"[B][C][FF0000] {message}\n"
     
                             await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)    
                             
@@ -8445,29 +7743,29 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             print('Processing whitelist view command')
     
                             # Check if owner
-                            if str(response.Data.uid) != "2270928791":  # Your UID
-                                error_msg = f"[B][C][FF0000]❌ Only bot owner can view whitelist!\n"
+                            if str(response.Data.uid) != "14444444004":  # Your UID
+                                error_msg = f"[B][C][FF0000] Only bot owner can view whitelist!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
                             # Build whitelist message
                             total = len(WHITELISTED_UIDS)
     
-                            whitelist_msg = f"""[B][C][FFFF00]📋 WHITELISTED UIDS
+                            whitelist_msg = f"""[B][C][00FF00] WHITELISTED UIDS
 
-📊 Total: {total} UIDs
-🔓 Whitelist enabled: {'YES' if WHITELIST_ONLY else 'NO'}
+ Total: {total} UIDs
+ Whitelist enabled: {'YES' if WHITELIST_ONLY else 'NO'}
 
-👑 Owner (always allowed):
-• 11686472351
+ Owner (always allowed):
+ 14444444004
 
-👥 Whitelisted UIDs:"""
+ Whitelisted UIDs:"""
     
                             # Add first 20 UIDs (to avoid message too long)
                             count = 0
                             for uid in WHITELISTED_UIDS:
-                                if uid != "2270928791":  # Skip owner since already shown
-                                    whitelist_msg += f"\n• {uid}"
+                                if uid != "14444444004":  # Skip owner since already shown
+                                    whitelist_msg += f"\n {xMsGFixinG(uid)}"
                                     count += 1
                                     if count >= 20:
                                         remaining = total - 21  # -1 for owner, -20 shown
@@ -8477,7 +7775,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
     
                             whitelist_msg += f"""
 
-💡 Commands:
+ Commands:
 /wladd (uid) - Add to whitelist
 /wlremove (uid) - Remove from whitelist
 /wlenable - Enable whitelist only mode
@@ -8495,7 +7793,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             
                             try:
                                 if not os.path.exists("guest_accounts.json"):
-                                    error_msg = f"[B][C][FF0000]❌ No guest accounts found!\n[FFFFFF]Generate with /guest (count) first\n"
+                                    error_msg = f"[B][C][FF0000] No guest accounts found!\n[FFFFFF]Generate with /guest (count) first\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     return
         
@@ -8505,20 +7803,20 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 total = len(accounts)
         
                                 # Show summary
-                                summary_msg = f"""[B][C][FFFF00]📁 GUEST ACCOUNTS DATABASE
+                                summary_msg = f"""[B][C][00FF00] GUEST ACCOUNTS DATABASE
 
-📊 Total accounts: {total}
-📁 File: guest_accounts.json
-📅 Last updated: {time.ctime(os.path.getmtime('guest_accounts.json'))}
+ Total accounts: {total}
+ File: guest_accounts.json
+ Last updated: {time.ctime(os.path.getmtime('guest_accounts.json'))}
 
-💡 Use /guest (count) to add more
+ Use /guest (count) to add more
 """
                                 await safe_send_message(response.Data.chat_type, summary_msg, uid, chat_id, key, iv)
         
                                 # Show recent 5 accounts
                                 if accounts:
                                     recent = accounts[-5:]  # Last 5 accounts
-                                    recent_msg = "[B][C][FFFF00]📋 RECENT 5 ACCOUNTS:\n"
+                                    recent_msg = "[B][C][FFFF00] RECENT 5 ACCOUNTS:\n"
             
                                     for i, acc in enumerate(recent):
                                         recent_msg += f"[FFFFFF]{i+1}. UID: {acc['uid']} | Pass: {acc['password']}\n"
@@ -8526,7 +7824,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     await safe_send_message(response.Data.chat_type, recent_msg, uid, chat_id, key, iv)
             
                             except Exception as e:
-                                error_msg = f"[B][C][FF0000]❌ Error: {str(e)[:50]}\n"
+                                error_msg = f"[B][C][FF0000] Error: {str(e)[:50]}\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)    
                             
                         # Add this with your other command handlers:
@@ -8536,20 +7834,20 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             parts = inPuTMsG.strip().split()
     
                             if len(parts) < 2:
-                                error_msg = f"""[B][C][FF0000]❌ Usage: /guest (count)
+                                error_msg = f"""[B][C][FF0000] Usage: /guest (count)
         
-📝 Examples:
+ Examples:
 /guest 5 - Generate 5 guest accounts
 /guest 10 - Generate 10 guest accounts
 /guest 50 - Generate 50 guest accounts
 
-🎯 Features:
-• Generates random guest accounts
-• Auto-retry on 503 errors (10 times)
-• Saves to guest_accounts.json
-• Shows progress in real-time
+ Features:
+ Generates random guest accounts
+ Auto-retry on 503 errors (10 times)
+ Saves to guest_accounts.json
+ Shows progress in real-time
 
-⚠️ Note: API may take time, be patient!
+ Note: API may take time, be patient!
 """
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
@@ -8557,31 +7855,31 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             count_input = parts[1]
     
                             if not count_input.isdigit():
-                                error_msg = f"[B][C][FF0000]❌ Count must be a number!\n"
+                                error_msg = f"[B][C][FF0000] Count must be a number!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
                             count = int(count_input)
                             
                             if count <= 0:
-                                error_msg = f"[B][C][FF0000]❌ Count must be greater than 0!\n"
+                                error_msg = f"[B][C][FF0000] Count must be greater than 0!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
                             if count > 100:
-                                error_msg = f"[B][C][FF0000]❌ Max 100 accounts at once!\n"
+                                error_msg = f"[B][C][FF0000] Max 100 accounts at once!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
                             # Send initial message
-                            initial_msg = f"""[B][C][FFFF00]🚀 GENERATING GUEST ACCOUNTS
+                            initial_msg = f"""[B][C][00FF00] GENERATING GUEST ACCOUNTS
 
-📊 Count: {count} accounts
-🔗 API: gen-by-black-api.vercel.app
-⏳ Please wait...
+ Count: {count} accounts
+ API: gen-by-black-api.vercel.app
+ Please wait...
 
-💡 This may take {count * 3} seconds
-⚠️ 503 errors auto-retry 10 times
+ This may take {count * 3} seconds
+ 503 errors auto-retry 10 times
 """
                             await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
                             
@@ -8590,7 +7888,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 asyncio.create_task(handle_guest_generation(count, uid, chat_id, response.Data.chat_type, key, iv))
         
                             except Exception as e:
-                                error_msg = f"[B][C][FF0000]❌ Error starting generation: {str(e)[:50]}\n"
+                                error_msg = f"[B][C][FF0000] Error starting generation: {str(e)[:50]}\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             
                         if inPuTMsG.startswith('/mimic_on'):
@@ -8610,48 +7908,49 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             parts = inPuTMsG.strip().split(maxsplit=2)  # maxsplit=2 to keep message together
     
                             if len(parts) < 3:
-                                error_msg = f"""[B][C][FF0000]❌ Usage: /dm (target_uid) (message)
+                                error_msg = f"""[B][C][FF0000] Usage: /dm (target_uid) (message)
         
-📝 Examples:
+ Examples:
 /dm 123456789 Hello!
 /dm 123456789 How are you?
 /dm 123456789 Let's play together!
 
-🔧 What it does:
-• Sends private message to specified UID
-• Works even if target is not in your squad
-• Bot sends message from its account
-• Target sees message in private chat
+ What it does:
+ Sends private message to specified UID
+ Works even if target is not in your squad
+ Bot sends message from its account
+ Target sees message in private chat
 """
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
                             target_uid = parts[1]
-                            message_text = parts[2]
-    
+                            message = parts[2]
+                            message_text = f"[B]{message}"
+                            
                             # Validate target UID
                             if not target_uid.isdigit() or len(target_uid) < 8:
-                                error_msg = f"[B][C][FF0000]❌ Invalid UID! Must be 8+ digits\n"
+                                error_msg = f"[B][C][FF0000] Invalid UID! Must be 8+ digits\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
                             # Validate message length
                             if len(message_text) > 100:
-                                error_msg = f"[B][C][FF0000]❌ Message too long! Max 100 characters\n"
+                                error_msg = f"[B][C][FF0000] Message too long! Max 100 characters\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
                             # Send initial confirmation
-                            initial_msg = f"[B][C][FFFF00]📩 SENDING PRIVATE MESSAGE\n"
-                            initial_msg += f"👤 To: {target_uid}\n"
-                            initial_msg += f"📝 Message: {message_text[:30]}...\n"
-                            initial_msg += f"⏳ Sending...\n"
+                            initial_msg = f"[B][C][00FF00] SENDING PRIVATE MESSAGE\n"
+                            initial_msg += f" To: {xMsGFixinG(target_uid)}\n"
+                            initial_msg += f" Message: {message_text[:30]}...\n"
+                            initial_msg += f" Sending...\n"
     
                             await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
     
                             try:
                                 # Get bot's UID from login data
-                                bot_uid = 14619134248
+                                bot_uid = 13777711848
         
                                 # Create the private message packet
                                 # Tp = 2 (Private message)
@@ -8670,120 +7969,25 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     # Send via Whisper connection (chat connection)
                                     await SEndPacKeT(whisper_writer, online_writer, 'ChaT', private_msg_packet)
             
-                                    success_msg = f"""[B][C][FFFF00]✅ PRIVATE MESSAGE SENT!
+                                    success_msg = f"""[B][C][00FF00] PRIVATE MESSAGE SENT!
 
-👤 To: {target_uid}
-📝 Message: {message_text}
-✅ Status: Delivered
+ To: {xMsGFixinG(target_uid)}
+ Message: {message_text}
+ Status: Delivered
 
-💡 Target will see this in their private messages!
+ Target will see this in their private messages!
 """
                                     await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
-                                    print(f"✅ Private message sent to {target_uid}: {message_text}")
+                                    print(f" Private message sent to {xMsGFixinG(target_uid)}: {message_text}")
                                 else:
-                                    error_msg = f"[B][C][FF0000]❌ Failed to create message packet!\n"
+                                    error_msg = f"[B][C][FF0000] Failed to create message packet!\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
             
                             except Exception as e:
-                                print(f"❌ Private message error: {e}")
-                                error_msg = f"[B][C][FF0000]❌ Error: {str(e)[:50]}\n"
+                                print(f" Private message error: {e}")
+                                error_msg = f"[B][C][FF0000] Error: {str(e)[:50]}\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
-                        # In your TcPChaT function, add this:
-                        if inPuTMsG.strip().startswith('/friend '):
-                            print('Processing friend request command')
-    
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"""[B][C][FF0000]❌ Usage: /friend (uid) [count]
-        
-📝 Examples:
-/friend 123456789 - Send 1 friend request
-/friend 123456789 5 - Send 5 friend requests
-
-🔧 Features:
-• Uses token.json for single request
-• Uses token_ind.json for bulk requests
-• Same encryption as Flask API
-• Direct HTTP requests to Free Fire servers
-"""
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                return
-    
-                            target_uid = parts[1]
-    
-                            # Validate UID
-                            if not target_uid.isdigit() or len(target_uid) < 8:
-                                error_msg = f"[B][C][FF0000]❌ Invalid UID! Must be 8+ digits\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                return
-    
-                            # Determine count
-                            count = 1
-                            if len(parts) > 2:
-                                try:
-                                    count = int(parts[2])
-                                    if count > 100:
-                                        count = 100
-                                except:
-                                    count = 1
-    
-                            # Send initial message
-                            if count == 1:
-                                initial_msg = f"[B][C][FFFF00]🤝 SENDING FRIEND REQUEST\n"
-                            else:
-                                initial_msg = f"[B][C][FFFF00]📦 SENDING {count} FRIEND REQUESTS\n"
-    
-                            initial_msg += f"🎯 Target: {target_uid}\n"
-                            initial_msg += f"🔑 Source: {'token.json' if count == 1 else 'token_ind.json'}\n"
-                            initial_msg += f"🔒 Encryption: AES-CBC + Varint Encoding\n"
-                            initial_msg += f"⏳ Processing...\n"
-    
-                            await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
-    
-                            try:
-                                # Get player info first
-                                token = load_jwt_token()
-                                player_name = "Unknown"
-                                if token:
-                                    player_name, _ = get_player_info(target_uid, token)
-        
-                                # Send friend requests
-                                results = await send_friend_request_async(target_uid, count)
-        
-                                # Send result message
-                                if results["success"] > 0:
-                                    result_msg = f"""[B][C][FFFF00]✅ FRIEND REQUEST SUCCESS!
-
-🎯 Player: {player_name}
-🆔 UID: {target_uid}
-✅ Successful: {results['success']}
-❌ Failed: {results['failed']}
-"""
-                                    if count > 1:
-                                        result_msg += f"📊 Total Attempted: {count}\n"
-            
-                                    result_msg += f"\n💡 Friend request(s) sent successfully!\n"
-            
-                                else:
-                                    result_msg = f"""[B][C][FF0000]❌ FRIEND REQUEST FAILED
-
-🎯 Player: {player_name}
-🆔 UID: {target_uid}
-❌ All requests failed
-
-💡 Check:
-1. Token files exist (token.json / token_ind.json)
-2. Tokens are valid
-3. Target UID is correct
-4. Bot has internet connection
-"""
-        
-                                await safe_send_message(response.Data.chat_type, result_msg, uid, chat_id, key, iv)
-        
-                            except Exception as e:
-                                error_msg = f"[B][C][FF0000]❌ Friend request error: {str(e)[:50]}\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         if inPuTMsG.startswith('noob'):
                             await handle_alll_titles_command(inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
@@ -8791,12 +7995,12 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                         if inPuTMsG.strip().startswith('/room_msg'):
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /kick (uid)\nExample: /kick 123456789\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /kick (uid)\nExample: /kick 123456789\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 room_id = parts[1]
 
-                                initial_message = f"[B][C]{get_random_color()}\nkicking {uid}...\n"
+                                initial_message = f"[B][C]{get_random_color()}\nkicking {xMsGFixinG(uid)}...\n"
                                 await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
                                 
                                 try:
@@ -8812,11 +8016,11 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                         if inPuTMsG.strip().startswith('/kick'):
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /kick (uid)\nExample: /kick 123456789\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /kick (uid)\nExample: /kick 123456789\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nkicking {target_uid}...\n"
+                                initial_message = f"[B][C]{get_random_color()}\nkicking {xMsGFixinG(target_uid)}...\n"
                                 await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
                                 
                                 try:
@@ -8826,15 +8030,76 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     await asyncio.sleep(0.3)
                                 except Exception as e:
                                     print(e)
+
+                        if inPuTMsG.strip().startswith(('/add ', '/remove ')):
+
+                            parts = inPuTMsG.strip().split()
+
+                            if not Uid or not Pw:
+                                await safe_send_message(response.Data.chat_type, " Error: Bot UID/Pass not loaded!", uid, chat_id, key, iv)
+                                continue
+
+                            if len(parts) < 2:
+                                error_msg = (
+                                    "[C][B][FF5C8A]USAGE ERROR\n"
+                                    "[C][E6E6FA]/add <uid>\n"
+                                    "[C][E6E6FA]/remove <uid>"
+                                )
+                                await safe_send_message(
+                                    response.Data.chat_type,
+                                    error_msg,
+                                    uid,
+                                    chat_id,
+                                    key,
+                                    iv
+                                )
+                                return
+
+                            cmd = parts[0].lower()
+                            target_uid = parts[1]
+
+                            wait_msg = (
+                                "[C][B][5DA9FF]\n"
+                                "[C][FF6EC7]FRIEND MANAGER\n"
+                                "[C][E6E6FA]Processing request...\n"
+                                "[C][5DA9FF]"
+                            )
+                            await safe_send_message(
+                                response.Data.chat_type,
+                                wait_msg,
+                                uid,
+                                chat_id,
+                                key,
+                                iv
+                            )
+
+                            if cmd == "/add":
+                                result = add_friend(uid, Pw, target_uid)
+
+                            elif cmd == "/remove":
+                                result = remove_friend(uid, Pw, target_uid)
+
+                            else:
+                                result = "[C][B][FF5C8A]UNKNOWN COMMAND"
+
+                            await safe_send_message(
+                                response.Data.chat_type,
+                                result,
+                                uid,
+                                chat_id,
+                                key,
+                                iv
+                            )
+
                                     
                         if inPuTMsG.strip().startswith('/tester'):
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /kick (uid)\nExample: /kick 123456789\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /kick (uid)\nExample: /kick 123456789\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nkicking {target_uid}...\n"
+                                initial_message = f"[B][C]{get_random_color()}\nkicking {xMsGFixinG(target_uid)}...\n"
                                 await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
                                 
                                 try:
@@ -8845,9 +8110,6 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 except Exception as e:
                                     print(e)
                             
-                        if inPuTMsG.strip().startswith('/kkick'):
-                            print('Processing FINAL title command (friend method)')
-                            await LagSquad(key, iv)
 
                         if inPuTMsG.startswith(("/3")):
                             # Process /3 command - Create 3 player group
@@ -8871,33 +8133,9 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             await SEndPacKeT(whisper_writer, online_writer, 'OnLine', E)
                             
                             # SUCCESS MESSAGE
-                            success_message = f"[B][C][FFFF00]✅ SUCCESS! 6-Player Group invitation sent successfully to {uid}!\n"
+                            success_message = f"[B][C][00FF00] SUCCESS! 6-Player Group invitation sent successfully to {xMsGFixinG(uid)}!\n"
                             await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
 
-                        if inPuTMsG.startswith(("/4")):
-                            # Process /3 command - Create 3 player group
-                            initial_message = f"[B][C]{get_random_color()}\n\nCreating 3-Player Group...\n\n"
-                            await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-                            
-                            # Fast squad creation and invite for 6 players
-                            PAc = await OpEnSq(key, iv, region)
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', PAc)
-                            
-                            C = await cHSq(4, uid, key, iv, region)
-                            await asyncio.sleep(0.3)
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', C)
-                            
-                            V = await SEnd_InV(4, uid, key, iv, region)
-                            await asyncio.sleep(0.3)
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', V)
-                            
-                            E = await ExiT(None, key, iv)
-                            await asyncio.sleep(3.5)
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', E)
-                            
-                            # SUCCESS MESSAGE
-                            success_message = f"[B][C][FFFF00]✅ SUCCESS! 6-Player Group invitation sent successfully to {uid}!\n"
-                            await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
 
                         # In your TcPChaT function, look for the command handling section
                         # It might look something like this:
@@ -8911,13 +8149,13 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
     
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 3:
-                                error_msg = f"[B][C][FF0000]❌ Usage: /joinroom (room_id) (password)\nExample: /joinroom 123456 0000\n"
+                                error_msg = f"[B][C][FF0000] Usage: /joinroom (room_id) (password)\nExample: /joinroom 123456 0000\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 room_id = parts[1]
                                 room_password = parts[2]
         
-                                initial_msg = f"[B][C][FFFF00]🚀 Joining custom room...\n🏠 Room: {room_id}\n🔑 Password: {room_password}\n"
+                                initial_msg = f"[B][C][00FF00] Joining custom room...\n Room: {room_id}\n Password: {room_password}\n"
                                 await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
         
                                 try:
@@ -8925,11 +8163,11 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     join_packet = await join_custom_room(room_id, room_password, key, iv, region)
                                     await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
             
-                                    success_msg = f"[B][C][FFFF00]✅ Joined custom room {room_id}!\n🤖 Bot is now in room chat!\n"
+                                    success_msg = f"[B][C][00FF00] Joined custom room {room_id}!\n Bot is now in room chat!\n"
                                     await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
             
                                 except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ Failed to join room: {str(e)}\n"
+                                    error_msg = f"[B][C][FF0000] Failed to join room: {str(e)}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         if inPuTMsG.startswith(("/5")):
@@ -8954,177 +8192,52 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             await SEndPacKeT(whisper_writer, online_writer, 'OnLine', E)
                             
                             # SUCCESS MESSAGE
-                            success_message = f"[B][C][FFFF00]✅ SUCCESS! Group invitation sent successfully to {uid}!\n"
+                            success_message = f"[B][C][00FF00] SUCCESS! Group invitation sent successfully to {xMsGFixinG(uid)}!\n"
                             await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
 
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /kick (uid)\nExample: /kick 123456789\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                room_id = parts[1]
+                        if inPuTMsG.strip() == "/admin":
+                            # Process /admin command in any chat type
+                            admin_message = """
+[B][C][FFC0CB]Thinking about getting the bot at a good price?
 
-                                initial_message = f"[B][C]{get_random_color()}\nkicking {uid}...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-                                
-                                try:
-                                    # Fast squad creation and invite for 5 players
-                                    PAc = await Create_xr_room_packet_fixed__(room_id, key, iv)
-                                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', PAc)
-                                    await asyncio.sleep(0.3)
-                                except Exception as e:
-                                    print(e)
+Thinking about getting a panel without restrictions?
 
-                        # Replace the existing title handler with this
-                        # Use the FINAL version
-                        if inPuTMsG.strip().startswith('/kick'):
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /kick (uid)\nExample: /kick 123456789\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nkicking {target_uid}...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-                                
-                                try:
-                                    # Fast squad creation and invite for 5 players
-                                    PAc = await KickTarget(target_uid, key, iv)
-                                    await SEndPacKeT(whisper_writer, online_writer, 'OnLine', PAc)
-                                    await asyncio.sleep(0.3)
-                                except Exception as e:
-                                    print(e)
-                                    
-                        if inPuTMsG.strip().startswith('/tester'):
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /kick (uid)\nExample: /kick 123456789\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-                                initial_message = f"[B][C]{get_random_color()}\nkicking {target_uid}...\n"
-                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-                                
-                                
-                            if len(parts) < 2:
-                                error_msg = f"""[B][C][FF0000]❌ Usage: /entry (uid)
-                        Example: /entry 123456789
-                        Example: /entry me (for yourself)
+Thinking about getting a server in your name with a panel?
 
-                        Effect: Sends arrival animation to player
-                        """
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                target_uid = parts[1]
-        
-                                # Handle "me" or "self"
-                                if target_uid.lower() in ['me', 'self', 'myself']:
-                                    target_uid = str(response.Data.uid)
-                                    target_name = "Yourself"
-                                else:
-                                    target_name = f"UID {target_uid}"
-        
-                                initial_msg = f"[B][C][00FF00]🎬 Sending arrival animation to {target_name}...\n"
-                                await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
-        
-                                try:
-                                    # Send the entry emote packet
-                                    entry_packet = await Send_Entry_Emote(int(target_uid), key, iv)
-                                    
-                                    if entry_packet:
-                                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', entry_packet)
-                
-                                        success_msg = f"[B][C][00FF00]✅ ARRIVAL ANIMATION SENT!\n"
-                                        success_msg += f"[FFFFFF]👤 Target: {target_name}\n"
-                                        success_msg += f"[FFFFFF]🎭 Emote ID: 912038002\n"
-                                        success_msg += f"[FFFFFF]✨ Effect: Entry/Arrival Animation\n"
-                
-                                        await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
-                                        print(f"✅ Sent entry emote to {target_uid}")
-                                    else:
-                                        error_msg = f"[B][C][FF0000]❌ Failed to create entry emote packet!\n"
-                                        await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                
-                                except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ Error sending entry emote: {str(e)[:50]}\n"
-                                    await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                    
-                                    
-# ==================== IMPORTS ====================
+All of this is available, just contact me!
 
-# ==================== /luck COMMAND ====================
-                        if inPuTMsG.strip() == "/luck":
-                            luck_messages = [
-                                "আজ তুমি এয়ারড্রপ লুট করতে গিয়ে AWM পাবে! ⚡",
-                                "আজ তোমার র‍্যাঙ্কেড ম্যাচে ক্রিটিক্যাল হিট আসবে! 🔥",
-                                "আজ তুমি চ্যাম্পিয়ন হতে পারো! 🏆",
-                                "আজ বন্ধুদের সাথে ফান মোমেন্ট পাবে! 😎",
-                                "আজ কিছু জিনিস ভাগ্যক্রমে ভালো হবে! 🍀"
-                            ]
-                            selected_message = random.choice(luck_messages)
-                            admin_message = (
-                                f"[C][B][00FFFF]╔════════════════════╗\n"
-                                f"║  ╭──────────────╮\n"
-                                f"║  │[FF0000] ভাগ্য পরীক্ষা কেন্দ্র         │\n"
-                                f"║  ╰──────────────╯\n"
-                                f"║\n"
-                                f"║ [FFFFFF]✨ {selected_message}\n"
-                                f"║ ────────────────\n"
-                                f"║ ⚡ [FFFF00]  codex BOT ⚡\n"
-                                f"╚════════════════════╝"
-                            )
+[b][i][FFC0CB]youtube: NAJMI-M24 99[/b]
+
+[b][c][FFC0CB]subcribe: my_channel[FFFFFF]
+ 
+[b][i][FFA500]telegram: @NAJMI-M24[/b]
+
+[b][c][FFA500]telegram contact: @NAJMI-M24[A52A2A]
+ 
+Enjoy the bot my friend.......
+
+[C][B][0000FF] Created by Black666FF
+Modified by - NAJMI-M24
+"""
                             await safe_send_message(response.Data.chat_type, admin_message, uid, chat_id, key, iv)
 
-
-# ==================== /coin COMMAND ====================
-                        if inPuTMsG.strip().startswith('/coin'):
-                            result = random.choice(["Heads", "Tails"])
-                            coin_result = "[B][C][00FF00]● HEADS ●" if result=="Heads" else "[B][C][FF4500]● TAILS ●"
-                            current_time = datetime.now().strftime("%I:%M %p")
-                            coin_message = (
-                                f"[B][C][00FFFF]╔════════════════════╗\n"
-                                f"║ 🎲 Coin Flip Result\n"
-                                f"║\n"
-                                f"║ {coin_result}\n"
-                                f"║ 🕒 Time: [FFB300]{current_time}\n"
-                                f"║ 🙋 Flipped by: [FFFF00]  6T9 \n"
-                                f"║ ▪ Try again: /coin\n"
-                                f"╚════════════════════╝"
-                            )
-                            await safe_send_message(response.Data.chat_type, coin_message, uid, chat_id, key, iv)
-
-
-# ==================== /dice COMMAND ====================
-                        if inPuTMsG.strip().startswith('/dice'):
-                            dice_roll = random.randint(1,6)
-                            colors = {1:"FFFF00", 2:"FF0000", 3:"00FFFF", 4:"00FF00", 5:"00FFFF", 6:"FFFFFF"}
-                            dice_message = (
-                                f"[B][C][{colors[dice_roll]}]╔════════════════════╗\n"
-                                f"║ 🎲 Dice Roll Result\n"
-                                f"║\n"
-                                f"║ [FFFFFF]You rolled: [B]{dice_roll}[/B]\n"
-                                f"║ ▪ Roll again: /dice\n"
-                                f"╚════════════════════╝"
-                            )
-                            await safe_send_message(response.Data.chat_type, dice_message, uid, chat_id, key, iv)
-
                         # Add this with your other command handlers in the TcPChaT function
-                        
                         if inPuTMsG.strip().startswith('/multijoin'):
                             print('Processing multi-account join request')
     
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ Usage: /multijoin (target_uid)\nExample: /multijoin 123456789\n"
+                                error_msg = f"[B][C][FF0000] Usage: /multijoin (target_uid)\nExample: /multijoin 123456789\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 target_uid = parts[1]
         
                                 if not target_uid.isdigit():
-                                    error_msg = f"[B][C][FF0000]❌ Please write a valid player ID!\n"
+                                    error_msg = f"[B][C][FF0000] Please write a valid player ID!\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     return
         
-                                initial_msg = f"[B][C][FFFF00]🚀 Starting multi-join attack on {target_uid}...\n"
+                                initial_msg = f"[B][C][00FF00] Starting multi-join attack on {xMsGFixinG(target_uid)}...\n"
                                 await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
         
                                 try:
@@ -9133,22 +8246,22 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
             
                                     if success_count > 0:
                                         result_msg = f"""
-[B][C][FFFF00]✅ MULTI-JOIN ATTACK COMPLETED!
+[B][C][00FF00] MULTI-JOIN ATTACK COMPLETED!
 
-🎯 Target: {target_uid}
-✅ Successful Requests: {success_count}
-📊 Total Attempts: {total_attempts}
-⚡ Different squad variations sent!
+ Target: {xMsGFixinG(target_uid)}
+ Successful Requests: {success_count}
+ Total Attempts: {total_attempts}
+ Different squad variations sent!
 
-💡 Check your game for join requests!
+ Check your game for join requests!
 """
                                     else:
-                                        result_msg = f"[B][C][FF0000]❌ All join requests failed! Check bot connection.\n"
+                                        result_msg = f"[B][C][FF0000] All join requests failed! Check bot connection.\n"
             
                                     await safe_send_message(response.Data.chat_type, result_msg, uid, chat_id, key, iv)
             
                                 except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ Multi-join error: {str(e)}\n"
+                                    error_msg = f"[B][C][FF0000] Multi-join error: {str(e)}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
 
@@ -9159,7 +8272,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
     
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /reject (target_uid)\nExample: /reject 123456789\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /reject (target_uid)\nExample: /reject 123456789\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 target_uid = parts[1]
@@ -9171,7 +8284,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     await asyncio.sleep(0.5)
         
                                 # Send start message
-                                start_msg = f"[B][C][1E90FF]🌀 Started Reject Spam on: {target_uid}\n🌀 Packets: 150 each type\n🌀 Interval: 0.2 seconds\n"
+                                start_msg = f"[B][C][1E90FF] Started Reject Spam on: {xMsGFixinG(target_uid)}\n Packets: 150 each type\n Interval: 0.2 seconds\n"
                                 await safe_send_message(response.Data.chat_type, start_msg, uid, chat_id, key, iv)
         
                                 # Start reject spam in background
@@ -9186,92 +8299,45 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             if reject_spam_task and not reject_spam_task.done():
                                 reject_spam_running = False
                                 reject_spam_task.cancel()
-                                stop_msg = f"[B][C][FFFF00]✅ Reject spam stopped successfully!\n"
+                                stop_msg = f"[B][C][00FF00] Reject spam stopped successfully!\n"
                                 await safe_send_message(response.Data.chat_type, stop_msg, uid, chat_id, key, iv)
                             else:
-                                error_msg = f"[B][C][FF0000]❌ No active reject spam to stop!\n"
+                                error_msg = f"[B][C][FF0000] No active reject spam to stop!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 
-                        # In your command handler where you call Room_Spam:
-                        if inPuTMsG.strip().startswith('/room'):
-                            print('Processing advanced room spam command')
-                            
+                                #GET PLAYER INFO
+                        if inPuTMsG.strip().startswith('/info'):
+                            print('Processing bio command in any chat type')
+
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /room (uid)\nExample: /room 123456789\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /info <uid>\nExample: /info 4368569733\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 target_uid = parts[1]
-                                room_id = parts[2]
-        
-                                if not target_uid.isdigit():
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Please write a valid player ID!\n"
-                                    await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                    return
-        
-                                # Send initial message
-                                initial_msg = f"[B][C][00FF00]🔍 Working on room spam for {target_uid}...\n"
-                                await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
-                                
-                                try:
-                                    # Method 1: Try to get room ID from recent packets
-                                
-                                    
+                                initial_message = f"[B][C]{get_random_color()}\nGetting Player Info...\n"
+                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
 
-                                    room_msg = f"[B][C][00FF00]🎯 Detected player in room {room_id}\n"
-                                    await safe_send_message(response.Data.chat_type, room_msg, uid, chat_id, key, iv)
-            
-                                    # Create spam packet
-                                    spam_packet = await Room_Spam(target_uid, room_id, "MG24 GAMER", key, iv)
-            
-                                    # Send 99 spam packets rapidly (like your other TCP)
-                                    spam_count = 99
-                                    
-                                    start_msg = f"[B][C][00FF00]🚀 Starting spam: {spam_count} packets to room {room_id}\n"
-                                    await safe_send_message(response.Data.chat_type, start_msg, uid, chat_id, key, iv)
-            
-                                    for i in range(spam_count):
-                                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', spam_packet)
-                
-                                        # Progress updates
-                                        if (i + 1) % 25 == 0:
-                                            progress_msg = f"[B][C][00FF00]📦 Progress: {i+1}/{spam_count} packets sent\n"
-                                            await safe_send_message(response.Data.chat_type, progress_msg, uid, chat_id, key, iv)
-                                            print(f"Room spam progress: {i+1}/{spam_count} to UID: {target_uid}")
-                
-                                        # Very short delay (0.05 seconds = 50ms)
-                                        await asyncio.sleep(0.05)
-            
-                                    # Final success message
-                                    success_msg = f"[B][C][00FF00]✅ ROOM SPAM COMPLETED!\n🎯 Target: {target_uid}\n📦 Packets: {spam_count}\n🏠 Room: {room_id}\n⚡ Speed: Ultra fast\n"
-                                    await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
-                                    print(f"Room spam completed for UID: {target_uid}")
-            
-                                except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR in room spam: {str(e)}\n"
-                                    await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                    print(f"Room spam error: {e}")                                
+                                info_data = get_player_info(target_uid)
 
-                        # Individual command handlers for /v1 to /s8
-                        if inPuTMsG.strip().startswith('/v1'):
+                                await send_full_player_info(info_data, response.Data.chat_type, uid, chat_id, key, iv)
 
-                            await handle_badge_command('v1', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
+
+                        # Individual command handlers for /s1 to /s8
+                        if inPuTMsG.strip().startswith('/s1'):
+                            await handle_badge_command('s1', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
     
-                        if inPuTMsG.strip().startswith('/v2'):
+                        if inPuTMsG.strip().startswith('/s2'):
+                            await handle_badge_command('s2', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
 
-                            await handle_badge_command('v2', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
+                        if inPuTMsG.strip().startswith('/s3'):
+                            await handle_badge_command('s3', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
 
-                        if inPuTMsG.strip().startswith('/v3'):
+                        if inPuTMsG.strip().startswith('/s4'):
+                            await handle_badge_command('s4', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
 
-                            await handle_badge_command('v3', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
-
-                        if inPuTMsG.strip().startswith('/v4'):
-
-                            await handle_badge_command('v4', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
-
-                        if inPuTMsG.strip().startswith('/v5'):
-
-                            await handle_badge_command('v5', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
+                        if inPuTMsG.strip().startswith('/s5'):
+                            await handle_badge_command('s5', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
 
                         if inPuTMsG.strip().startswith('/s6'):
                             await handle_badge_command('s6', inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
@@ -9289,13 +8355,13 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
     
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 3:
-                                error_msg = f"[B][C][FF0000]❌ Usage: /joinroom (room_id) (password)\nExample: /joinroom 123456 0000\n"
+                                error_msg = f"[B][C][FF0000] Usage: /joinroom (room_id) (password)\nExample: /joinroom 123456 0000\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 room_id = parts[1]
                                 room_password = parts[2]
         
-                                initial_msg = f"[B][C][FFFF00]🚀 Joining custom room...\n🏠 Room: {room_id}\n🔑 Password: {room_password}\n"
+                                initial_msg = f"[B][C][00FF00] Joining custom room...\n Room: {room_id}\n Password: {room_password}\n"
                                 await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
         
                                 try:
@@ -9303,11 +8369,11 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     join_packet = await join_custom_room(room_id, room_password, key, iv, region)
                                     await SEndPacKeT(whisper_writer, online_writer, 'OnLine', join_packet)
             
-                                    success_msg = f"[B][C][FFFF00]✅ Joined custom room {room_id}!\n🤖 Bot is now in room chat!\n"
+                                    success_msg = f"[B][C][00FF00] Joined custom room {room_id}!\n Bot is now in room chat!\n"
                                     await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
             
                                 except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ Failed to join room: {str(e)}\n"
+                                    error_msg = f"[B][C][FF0000] Failed to join room: {str(e)}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         if inPuTMsG.strip().startswith('/createroom'):
@@ -9315,14 +8381,14 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
     
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 3:
-                                error_msg = f"[B][C][FF0000]❌ Usage: /createroom (room_name) (password) [players=4]\nExample: /createroom BOTROOM 0000 4\n"
+                                error_msg = f"[B][C][FF0000] Usage: /createroom (room_name) (password) [players=4]\nExample: /createroom BOTROOM 0000 4\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 room_name = parts[1]
                                 room_password = parts[2]
                                 max_players = parts[3] if len(parts) > 3 else "4"
         
-                                initial_msg = f"[B][C][FFFF00]🏠 Creating custom room...\n📛 Name: {room_name}\n🔑 Password: {room_password}\n👥 Max Players: {max_players}\n"
+                                initial_msg = f"[B][C][00FF00] Creating custom room...\n Name: {room_name}\n Password: {room_password}\n Max Players: {max_players}\n"
                                 await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
         
                                 try:
@@ -9330,11 +8396,11 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     create_packet = await create_custom_room(room_name, room_password, int(max_players), key, iv, region)
                                     await SEndPacKeT(whisper_writer, online_writer, 'OnLine', create_packet)
             
-                                    success_msg = f"[B][C][FFFF00]✅ Custom room created!\n🏠 Room: {room_name}\n🔑 Password: {room_password}\n👥 Max: {max_players}\n🤖 Bot is now hosting!\n"
+                                    success_msg = f"[B][C][00FF00] Custom room created!\n Room: {room_name}\n Password: {room_password}\n Max: {max_players}\n Bot is now hosting!\n"
                                     await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
             
                                 except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ Failed to create room: {str(e)}\n"
+                                    error_msg = f"[B][C][FF0000] Failed to create room: {str(e)}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)               
                         
                                                 
@@ -9345,7 +8411,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             parts = inPuTMsG.strip().split()
     
                             if len(parts) < 2:
-                                error_msg = f"""[B][C][FF0000]❌ Usage: /entry (uid)
+                                error_msg = f"""[B][C][FF0000] Usage: /entry (uid)
                         Example: /entry 123456789
                         Example: /entry me (for yourself)
 
@@ -9360,9 +8426,9 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     target_uid = str(response.Data.uid)
                                     target_name = "Yourself"
                                 else:
-                                    target_name = f"UID {target_uid}"
+                                    target_name = f"UID {xMsGFixinG(target_uid)}"
         
-                                initial_msg = f"[B][C][FFFF00]🎬 Sending arrival animation to {target_name}...\n"
+                                initial_msg = f"[B][C][00FF00] Sending arrival animation to {target_name}...\n"
                                 await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
         
                                 try:
@@ -9372,27 +8438,27 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     if entry_packet:
                                         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', entry_packet)
                 
-                                        success_msg = f"[B][C][FFFF00]✅ ARRIVAL ANIMATION SENT!\n"
-                                        success_msg += f"[FFFFFF]👤 Target: {target_name}\n"
-                                        success_msg += f"[FFFFFF]🎭 Emote ID: 912038002\n"
-                                        success_msg += f"[FFFFFF]✨ Effect: Entry/Arrival Animation\n"
+                                        success_msg = f"[B][C][00FF00] ARRIVAL ANIMATION SENT!\n"
+                                        success_msg += f"[FFFFFF] Target: {target_name}\n"
+                                        success_msg += f"[FFFFFF] Emote ID: 912038002\n"
+                                        success_msg += f"[FFFFFF] Effect: Entry/Arrival Animation\n"
                 
                                         await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
-                                        print(f"✅ Sent entry emote to {target_uid}")
+                                        print(f" Sent entry emote to {xMsGFixinG(target_uid)}")
                                     else:
-                                        error_msg = f"[B][C][FF0000]❌ Failed to create entry emote packet!\n"
+                                        error_msg = f"[B][C][FF0000] Failed to create entry emote packet!\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                 
                                 except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ Error sending entry emote: {str(e)[:50]}\n"
+                                    error_msg = f"[B][C][FF0000] Error sending entry emote: {str(e)[:50]}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             
                                                                                           # FIXED JOIN COMMAND
-                        if inPuTMsG.startswith('!'):
+                        if inPuTMsG.startswith('/join'):
                             # Process /join command in any chat type
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /join (team_code)\nExample: /join ABC123\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /join (team_code)\nExample: /join ABC123\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 CodE = parts[1]
@@ -9416,7 +8482,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         print(f"Dual emote failed but join succeeded: {emote_error}")
             
                                     # SUCCESS MESSAGE
-                                    success_message = f"[B][C][FFFF00]✅ SUCCESS! Joined squad: {CodE}!\n💍 Dual Rings emote activated!\n🤖 Bot + You = 💕\n"
+                                    success_message = f"[B][C][00FF00] SUCCESS! Joined squad: {CodE}!\n Dual Rings emote activated!\n Bot + You = \n"
                                     await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
             
                                 except Exception as e:
@@ -9439,15 +8505,15 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                             except Exception as emote_error:
                                                 print(f"Dual emote failed but ghost join succeeded: {emote_error}")
                     
-                                            success_message = f"[B][C][FFFF00]✅ SUCCESS! Ghost joined squad: {CodE}!\n💍 Dual Rings emote activated!\n🤖 Bot + You = 💕\n"
+                                            success_message = f"[B][C][00FF00] SUCCESS! Ghost joined squad: {CodE}!\n Dual Rings emote activated!\n Bot + You = \n"
                                             await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
                                         else:
-                                            error_msg = f"[B][C][FF0000]❌ ERROR! Failed to create ghost join packet.\n"
+                                            error_msg = f"[B][C][FF0000] ERROR! Failed to create ghost join packet.\n"
                                             await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                     
                                     except Exception as ghost_error:
                                         print(f"Ghost join also failed: {ghost_error}")
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Failed to join squad: {str(ghost_error)}\n"
+                                        error_msg = f"[B][C][FF0000] ERROR! Failed to join squad: {str(ghost_error)}\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                 
                 
@@ -9455,7 +8521,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             # Process /ghost command in any chat type
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /ghost (team_code)\nExample: /ghost ABC123\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /ghost (team_code)\nExample: /ghost ABC123\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 CodE = parts[1]
@@ -9469,15 +8535,46 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     ghost_packet = await ghost_join_packet(bot_uid, CodE, key, iv)
                                     if ghost_packet:
                                         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', ghost_packet)
-                                        success_message = f"[B][C][FFFF00]✅ SUCCESS! Ghost joined squad with code: {CodE}!\n"
+                                        success_message = f"[B][C][00FF00] SUCCESS! Ghost joined squad with code: {CodE}!\n"
                                         await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
                                     else:
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Failed to create ghost join packet.\n"
+                                        error_msg = f"[B][C][FF0000] ERROR! Failed to create ghost join packet.\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                         
                                 except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Ghost join failed: {str(e)}\n"
+                                    error_msg = f"[B][C][FF0000] ERROR! Ghost join failed: {str(e)}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
+
+                        # NEW FAST EMOTE ATTACK COMMAND (QUIT / LOCK MODES)
+                        if inPuTMsG.strip().startswith('/emote '):
+                            parts = inPuTMsG.strip().split()
+                            if len(parts) < 4:
+                                error_msg = f"[B][C][FF0000] ❌ Usage:\n"
+                                error_msg += f"[FFFFFF]/emote (team_code) (uids) (emote) [quit/lock]\n"
+                                error_msg += f"[FFFFFF]/emote (LOCK_ID) (uids) (emote)\n"
+                                error_msg += f"[FFFF00]Example 1: /emote ABC123 123456789 ak lock\n"
+                                error_msg += f"[FFFF00]Example 2: /emote LOCK_A1B2C3 123456789 ak\n"
+                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
+                            else:
+                                target_id = parts[1]
+                                target_uids = parts[2]
+                                emote_id = parts[3]
+                                mode = parts[4] if len(parts) > 4 else "quit"
+
+                                if target_id.startswith("LOCK_"):
+                                    initial_message = f"[B][C]{get_random_color()}\n⚡ Executing emote via Lock Session {target_id}...\n"
+                                else:
+                                    initial_message = f"[B][C]{get_random_color()}\n⚡ Fast Emote ({mode.upper()} mode) on team {target_id}...\n"
+
+                                await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
+
+                                async def run_and_reply():
+                                    success, res = await fast_squad_emote_attack(target_id, target_uids, emote_id, key, iv, region, mode=mode)
+                                    if success and res.get("mode") == "lock":
+                                        reply = f"[B][C][00FF00]🔒 BOT LOCKED IN SQUAD!\nSession ID: [FFFF00]{res.get('session_id')}\n[FFFFFF]Use: /emote {res.get('session_id')} {target_uids} {emote_id}\n"
+                                        await safe_send_message(response.Data.chat_type, reply, uid, chat_id, key, iv)
+
+                                asyncio.create_task(run_and_reply())
 
                         # NEW LAG COMMAND
                         if inPuTMsG.strip().startswith('/lag '):
@@ -9485,7 +8582,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /lag (team_code)\nExample: /lag ABC123\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /lag (team_code)\nExample: /lag ABC123\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 team_code = parts[1]
@@ -9501,7 +8598,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 lag_task = asyncio.create_task(lag_team_loop(team_code, key, iv, region))
                                 
                                 # SUCCESS MESSAGE
-                                success_msg = f"[B][C][FFFF00]✅ SUCCESS! Lag attack started!\nTeam: {team_code}\nAction: Rapid join/leave\nSpeed: Ultra fast (milliseconds)\n"
+                                success_msg = f"[B][C][00FF00] SUCCESS! Lag attack started!\nTeam: {team_code}\nAction: Rapid join/leave\nSpeed: Ultra fast (milliseconds)\n"
                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
 
                         # STOP LAG COMMAND
@@ -9509,10 +8606,10 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             if lag_task and not lag_task.done():
                                 lag_running = False
                                 lag_task.cancel()
-                                success_msg = f"[B][C][FFFF00]✅ SUCCESS! Lag attack stopped successfully!\n"
+                                success_msg = f"[B][C][00FF00] SUCCESS! Lag attack stopped successfully!\n"
                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                             else:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! No active lag attack to stop!\n"
+                                error_msg = f"[B][C][FF0000] ERROR! No active lag attack to stop!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         if inPuTMsG.startswith('/exit'):
@@ -9524,28 +8621,18 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             await SEndPacKeT(whisper_writer , online_writer , 'OnLine' , leave)
                             
                             # SUCCESS MESSAGE
-                            success_message = f"[B][C][FFFF00]✅ SUCCESS! Left the squad successfully!\n"
+                            success_message = f"[B][C][00FF00] SUCCESS! Left the squad successfully!\n"
                             await safe_send_message(response.Data.chat_type, success_message, uid, chat_id, key, iv)
 
-                        if inPuTMsG.strip().startswith('/start'):
-                            # Process /s command in any chat type
-                            initial_message = f"[B][C]{get_random_color()}\nStarting match...\n"
-                            await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
                             
-                            start_packet = await start_auto_packet(key, iv, region)
-                            await SEndPacKeT(whisper_writer, online_writer, 'OnLine', start_packet)
-                            initiial_message = f"[B][C]{get_random_color()}\nStarting match...\n"
-                            await safe_send_message(response.Data.chat_type, initiial_message, uid, chat_id, key, iv)
-                            
-        
 
-                        if inPuTMsG.strip().startswith('/mg '):
+                        if inPuTMsG.strip().startswith('/mg'):
                             print('Processing wave message command')
                           
                             parts = inPuTMsG.strip().split()
     
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ Usage: /mg (message) [repeats=5]\n"
+                                error_msg = f"[B][C][FF0000] Usage: /mg (message) [repeats=5]\n"
                                 error_msg += f"[FFFFFF]Example: /mg hello 3\n"
                                 error_msg += f"[FFFFFF]Will send: h, he, hel, hell, hello, hell, hel, he, h\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
@@ -9559,13 +8646,13 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         repeats = int(parts[2])
             
                                     if repeats <= 0:
-                                        error_msg = f"[B][C][FF0000]❌ Repeats must be > 0!\n"
+                                        error_msg = f"[B][C][FF0000] Repeats must be > 0!\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     elif repeats > 10:
-                                        error_msg = f"[B][C][FF0000]❌ Max 10 repeats!\n"
+                                        error_msg = f"[B][C][FF0000] Max 10 repeats!\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     elif len(message_text) < 2:
-                                        error_msg = f"[B][C][FF0000]❌ Message must be at least 2 characters!\n"
+                                        error_msg = f"[B][C][FF0000] Message must be at least 2 characters!\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     else:
                                         global mg_spam_task
@@ -9579,11 +8666,11 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         total_messages_per_cycle = (len(message_text) * 2) - 2
                                         total_messages = total_messages_per_cycle * repeats
                 
-                                        initial_msg = f"[B][C][FFFF00]🌊 WAVE MESSAGE STARTING!\n"
+                                        initial_msg = f"[B][C][00FF00] WAVE MESSAGE STARTING!\n"
                                         initial_msg += f"[FFFFFF]Message: {message_text}\n"
                                         initial_msg += f"[FFFFFF]Repeats: {repeats} cycles\n"
-                                        initial_msg += f"[FFFFFF]Pattern: h → he → hel → hell → hello → hell → hel → he → h\n"
-                                        initial_msg += f"[FFFF00]Total messages: {total_messages}\n"
+                                        initial_msg += f"[FFFFFF]Pattern: h  he  hel  hell  hello  hell  hel  he  h\n"
+                                        initial_msg += f"[00FF00]Total messages: {total_messages}\n"
                                         await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
                                         
                                         # Start wave messages
@@ -9598,7 +8685,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         )
                 
                                 except ValueError:
-                                    error_msg = f"[B][C][FF0000]❌ Invalid format!\n"
+                                    error_msg = f"[B][C][FF0000] Invalid format!\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                         
                         if inPuTMsG.strip().startswith('/msg '):
@@ -9607,7 +8694,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             parts = inPuTMsG.strip().split()
     
                             if len(parts) < 3:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /msg (message) (times)\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /msg (message) (times)\n"
                                 error_msg += f"[FFFFFF]Example: /msg Hello Team! 5\n"
                                 error_msg += f"[FFFFFF]Will send 'Hello Team!' 5 times in team chat\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
@@ -9620,11 +8707,11 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     message_text = ' '.join(parts[1:-1])
             
                                     if times <= 0:
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Times must be greater than 0!\n"
+                                        error_msg = f"[B][C][FF0000] ERROR! Times must be greater than 0!\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     
                                     elif not message_text.strip():
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Message cannot be empty!\n"
+                                        error_msg = f"[B][C][FF0000] ERROR! Message cannot be empty!\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     else:
                                         # Stop any existing message spam
@@ -9640,11 +8727,11 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         chat_id = chat_id
                 
                                         # Send initial message
-                                        initial_msg = f"[B][C][FFFF00]📢 MESSAGE SPAM STARTING!\n"
+                                        initial_msg = f"[B][C][00FF00] MESSAGE SPAM STARTING!\n"
                                         initial_msg += f"[FFFFFF]Message: {message_text}\n"
                                         initial_msg += f"[FFFFFF]Times: {times}\n"
                                         initial_msg += f"[FFFFFF]Chat: Team/Squad Chat\n"
-                                        initial_msg += f"[FFFF00]Sending messages...\n"
+                                        initial_msg += f"[00FF00]Sending messages...\n"
                                         await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
                 
                                         # Start message spam
@@ -9659,12 +8746,12 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         )
                                         
                                 except ValueError:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Invalid format!\n"
+                                    error_msg = f"[B][C][FF0000] ERROR! Invalid format!\n"
                                     error_msg += f"[FFFFFF]Usage: /msg (message) (times)\n"
                                     error_msg += f"[FFFFFF]Example: /msg Hello World! 10\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR: {str(e)}\n"
+                                    error_msg = f"[B][C][FF0000] ERROR: {str(e)}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         # Add stop command
@@ -9672,36 +8759,16 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             if msg_spam_task and not msg_spam_task.done():
                                 msg_spam_running = False
                                 msg_spam_task.cancel()
-                                success_msg = f"[B][C][FFFF00]✅ MESSAGE SPAM STOPPED!\n[FFFFFF]All message sending has been stopped.\n"
+                                success_msg = f"[B][C][00FF00] MESSAGE SPAM STOPPED!\n[FFFFFF]All message sending has been stopped.\n"
                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                             else:
-                                error_msg = f"[B][C][FF0000]❌ No active message spam to stop!\n"
+                                error_msg = f"[B][C][FF0000] No active message spam to stop!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
         
-# ==================== IMPORTS ====================
-
-# ==================== /joke COMMAND ====================
-                        if inPuTMsG.strip() == "/joke":
-                            joke_messages = [
-                                "Enemy তোকে দেখে ভয় পায় না বরং practice chance পেয়ে খুশি হয় 😆",
-                                "তুই Free Fire খেলতে ঢুকলেই match শুরু হওয়ার আগেই team mate বুঝে যায়—“আজকে হার নিশ্চিত 💀",
-                                "Squad এ তুই থাকলে backup লাগে না, excuse লাগে 🤦‍♂️",
-                                "তুই loot নিতে যাস, কিন্তু ভালো loot তোর হাতে পড়লেই useless হয়ে যায় 🧰❌",
-                                "তুই gloo wall দিলে enemy safe feel করে, তুই panic করিস 🧱😂"
-                            ]
-                            selected_message = random.choice(joke_messages)
-                            joke_message = (
-                                f"[C][B][00FFFF]╔════════════════════╗\n"
-                                f"║  ╭──────────────╮\n"
-                                f"║  │[FF0000] JOKES         │\n"
-                                f"║  ╰──────────────╯\n"
-                                f"║\n"
-                                f"║ [FFFFFF]✨ {selected_message}\n"
-                                f"║ ────────────────\n"
-                                f"║ ⚡ [FF0000]  codex BOT ⚡\n"
-                                f"╚════════════════════╝"
-                            )
-                            await safe_send_message(response.Data.chat_type, joke_message, uid, chat_id, key, iv)
+                        # Add this to your command handlers in TcPChaT function:
+                        if inPuTMsG.strip().startswith('/train'):
+                            print('Processing training mode command')
+                            await handle_training_command(inPuTMsG, uid, chat_id, key, iv, region, response.Data.chat_type)
                             
                         # Add these to your command handlers in TcPChaT function:
                         # Add this to your command handlers in TcPChaT function:
@@ -9718,39 +8785,39 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             # Check if user wants to list emotes or show help
                             if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() == 'list'):
                                 # Show available emotes
-                                emote_list_msg = f"[B][C][FFFF00]🎭 EMOTE SYSTEM\n"
-                                emote_list_msg += f"[FFFFFF]────────────────\n"
-                                emote_list_msg += f"[FFFF00]📊 STATS:\n"
-                                emote_list_msg += f"[FFFFFF]• Number emotes: 1-{len(NUMBER_EMOTES)}\n"
-                                emote_list_msg += f"[FFFFFF]• Named emotes: {len(NAME_EMOTES)} names\n"
-                                emote_list_msg += f"[FFFFFF]────────────────\n"
-                                emote_list_msg += f"[FFFF00]🎯 USAGE:\n"
-                                emote_list_msg += f"[FFFFFF]/e [number/name] → Send to yourself\n"
-                                emote_list_msg += f"[FFFFFF]/e [uid] [number/name] → Send to UID\n"
-                                emote_list_msg += f"[FFFFFF]────────────────\n"
-                                emote_list_msg += f"[FFFF00]🔥 POPULAR NAMES:\n"
+                                emote_list_msg = f"[B][C][00FF00] EMOTE SYSTEM\n"
+                                emote_list_msg += f"[FFFFFF]\n"
+                                emote_list_msg += f"[00FF00] STATS:\n"
+                                emote_list_msg += f"[FFFFFF] Number emotes: 1-{len(NUMBER_EMOTES)}\n"
+                                emote_list_msg += f"[FFFFFF] Named emotes: {len(NAME_EMOTES)} names\n"
+                                emote_list_msg += f"[FFFFFF]\n"
+                                emote_list_msg += f"[00FF00] USAGE:\n"
+                                emote_list_msg += f"[FFFFFF]/e [number/name]  Send to yourself\n"
+                                emote_list_msg += f"[FFFFFF]/e [uid] [number/name]  Send to UID\n"
+                                emote_list_msg += f"[FFFFFF]\n"
+                                emote_list_msg += f"[00FF00] POPULAR NAMES:\n"
         
                                 # Show popular named emotes
                                 popular_names = ["ak", "m60", "p90", "scar", "famas", "heart", "love", "dance", "hello", "money"]
                                 line = ""
                                 for name in popular_names:
                                     if name.lower() in NAME_EMOTES:
-                                        line += f"[FFFF00]{name}[FFFFFF], "
+                                        line += f"[00FF00]{name}[FFFFFF], "
                                 if line:
                                     emote_list_msg += line.rstrip(", ") + "\n"
         
-                                emote_list_msg += f"[FFFFFF]────────────────\n"
-                                emote_list_msg += f"[FFFF00]📖 EXAMPLES:\n"
-                                emote_list_msg += f"[FFFFFF]/e ak → Send AK emote to yourself\n"
-                                emote_list_msg += f"[FFFFFF]/e 123456789 heart → Send ♡ to UID\n"
-                                emote_list_msg += f"[FFFFFF]/e 123456789 1 → Send emote #1 to UID\n"
-                                emote_list_msg += f"[FFFFFF]/e ring → Send ring emote to yourself\n"
-                                emote_list_msg += f"[FFFFFF]/e list names → Show all named emotes\n"
+                                emote_list_msg += f"[FFFFFF]\n"
+                                emote_list_msg += f"[00FF00] EXAMPLES:\n"
+                                emote_list_msg += f"[FFFFFF]/e ak  Send AK emote to yourself\n"
+                                emote_list_msg += f"[FFFFFF]/e 123456789 heart  Send  to UID\n"
+                                emote_list_msg += f"[FFFFFF]/e 123456789 1  Send emote #1 to UID\n"
+                                emote_list_msg += f"[FFFFFF]/e ring  Send ring emote to yourself\n"
+                                emote_list_msg += f"[FFFFFF]/e list names  Show all named emotes\n"
         
                                 # Check if user wants detailed name list
                                 if len(parts) == 2 and parts[1].lower() == 'names':
-                                    emote_list_msg += f"[FFFFFF]────────────────\n"
-                                    emote_list_msg += f"[FFFF00]📝 ALL NAMED EMOTES:\n"
+                                    emote_list_msg += f"[FFFFFF]\n"
+                                    emote_list_msg += f"[00FF00] ALL NAMED EMOTES:\n"
             
                                     # Show all named emotes in groups
                                     all_names = sorted(NAME_EMOTES.keys())
@@ -9766,17 +8833,17 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
     
                             # Parse command
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /e [emote_name_or_number]\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /e [emote_name_or_number]\n"
                                 error_msg += f"[FFFFFF]Examples:\n"
-                                error_msg += f"[FFFF00]/e ak[FFFFFF] → AK emote to yourself\n"
-                                error_msg += f"[FFFF00]/e 123456789 heart[FFFFFF] → ♡ to UID\n"
-                                error_msg += f"[FFFF00]/e 123456789 1[FFFFFF] → Emote #1 to UID\n"
-                                error_msg += f"[FFFF00]/e ring[FFFFFF] → Send ring emote to yourself\n"
+                                error_msg += f"[00FF00]/e ak[FFFFFF]  AK emote to yourself\n"
+                                error_msg += f"[00FF00]/e 123456789 heart[FFFFFF]   to UID\n"
+                                error_msg += f"[00FF00]/e 123456789 1[FFFFFF]  Emote #1 to UID\n"
+                                error_msg += f"[00FF00]/e ring[FFFFFF]  Send ring emote to yourself\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 continue
     
                             # Show "preparing" message
-                            initial_message = f'[B][C]{get_random_color()}\n🎭 Preparing emote...\n'
+                            initial_message = f'[B][C]{get_random_color()}\n Preparing emote...\n'
                             await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
                             
                             target_uids = []
@@ -9809,7 +8876,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         emote_key = last_part
                                 else:
                                     # Last part is not a valid emote
-                                    error_msg = f"[B][C][FF0000]❌ Invalid emote: '{last_part}'\n"
+                                    error_msg = f"[B][C][FF0000] Invalid emote: '{last_part}'\n"
                                     error_msg += f"[FFFFFF]Use numbers (1-{len(NUMBER_EMOTES)}) or names like 'ak', 'heart', 'dance', 'ring'\n"
                                     error_msg += f"[FFFFFF]Use /e list names to see all available names\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
@@ -9829,7 +8896,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     emote_name_display = emote_key
         
                                 if not emote_id:
-                                    error_msg = f"[B][C][FF0000]❌ Emote '{emote_name_display}' not found!\n"
+                                    error_msg = f"[B][C][FF0000] Emote '{emote_name_display}' not found!\n"
                                     if emote_key.isdigit():
                                         error_msg += f"[FFFFFF]Available numbers: 1-{len(NUMBER_EMOTES)}\n"
                                     else:
@@ -9848,7 +8915,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         success_count += 1
                                         await asyncio.sleep(0.1)
                                     except Exception as e:
-                                        print(f"Error sending emote to {target_uid}: {e}")
+                                        print(f"Error sending emote to {xMsGFixinG(target_uid)}: {e}")
                                         failed_uids.append(str(target_uid))
         
                                 # Success message
@@ -9860,40 +8927,40 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     else:
                                         target_list = f"{len(target_uids)} players"
             
-                                    success_msg = f"[B][C][FFFF00]✅ EMOTE SENT!\n"
-                                    success_msg += f"[FFFFFF]────────────────\n"
-                                    success_msg += f"[FFFF00]🎭 Emote: {emote_name_display}\n"
-                                    success_msg += f"[FFFF00]🆔 ID: {emote_id}\n"
-                                    success_msg += f"[FFFF00]👤 Target: {target_list}\n"
-                                    success_msg += f"[FFFF00]📊 Status: {success_count}/{len(target_uids)} successful\n"
+                                    success_msg = f"[B][C][00FF00] EMOTE SENT!\n"
+                                    success_msg += f"[FFFFFF]\n"
+                                    success_msg += f"[00FF00] Emote: {emote_name_display}\n"
+                                    success_msg += f"[00FF00] ID: {emote_id}\n"
+                                    success_msg += f"[00FF00] Target: {target_list}\n"
+                                    success_msg += f"[00FF00] Status: {success_count}/{len(target_uids)} successful\n"
             
                                     if failed_uids:
-                                        success_msg += f"[FF0000]❌ Failed: {', '.join(failed_uids)}\n"
+                                        success_msg += f"[FF0000] Failed: {', '.join(failed_uids)}\n"
             
-                                    success_msg += f"[FFFFFF]────────────────\n"
+                                    success_msg += f"[FFFFFF]\n"
             
                                     await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                                 else:
-                                    error_msg = f"[B][C][FF0000]❌ Failed to send emote to any target!\n"
+                                    error_msg = f"[B][C][FF0000] Failed to send emote to any target!\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     
                             except ValueError as ve:
                                 print("ValueError:", ve)
-                                error_msg = f"[B][C][FF0000]❌ Invalid format!\n"
+                                error_msg = f"[B][C][FF0000] Invalid format!\n"
                                 error_msg += f"[FFFFFF]UIDs must be numbers (like 123456789)\n"
                                 error_msg += f"[FFFFFF]Examples: /e ak, /e 123456789 heart, /e 1, /e ring\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             except Exception as e:
                                 print(f"Error processing /e command: {e}")
-                                error_msg = f"[B][C][FF0000]❌ Error: {str(e)[:50]}\n"
+                                error_msg = f"[B][C][FF0000] Error: {str(e)[:50]}\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
-#GALI SPAM MESSAGE 
+                                #GALI SPAM MESSAGE 
                         # Add at the top with other global variables
-                        BLOCKED_NAMES = ["LAM", "hasid", "6t9", "LAM"]  # Add your actual name
+                        BLOCKED_NAMES = ["arbaz", "ARBAZ", "Arbaz", "BLACK666"]  # Add your actual name
 
-                        # Then in the /gali command handler, add this check:
-                        if inPuTMsG.strip().startswith('/gali '):
+                                #GALI SPAM MESSAGE 
+                        if inPuTMsG.strip().startswith('/gali'):
                             print('Processing /gali command')
 
                             try:
@@ -9901,113 +8968,64 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
 
                                 if len(parts) < 2:
                                     error_msg = (
-                                        "[B][C][FF0000]❌ ERROR! Usage:\n"
+                                        "[B][C][FF0000] ERROR! Usage:\n"
                                         "/gali <name>\n"
                                         "Example: /gali hater"
                                     )
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 else:
                                     name = parts[1].strip()
-            
-                                    # ADD THIS CHECK - Prevent targeting yourself
-                                    if name.lower() in [n.lower() for n in BLOCKED_NAMES]:
-                                        error_msg = (
-                                            "[B][C][FF0000]⚠️শা🤣লা মাদা🤐রচো🥴দ\n[FFFFFF]তর এই বা🤣পে🤣র নামে গা🥴লি দিতে চাস\n[FF0000]শা🤣লা মাদা🤣রচো😁দ"
-                                        )
-                                        await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                        continue
-            
-                                    # Rest of your code continues here...
+
                                     messages = [
-                                        "[B][C]{Name} [FF0000] হাছিব আমার [B][C] বা প",
-                                        "[B][C]{Name} [00FFFF] হাছিব ছা রা আমার [B][C] আর কোনো বা প নাই",
-                                        "[B][C]{Name} [FF00FF] আমি জুতা [B][C] চোর",
-                                        "[B][C]{Name} আমি মানুষের [FFA500] পকেট মারি"
-                                        "[B][C]{Name} [32CD32]আমি ছাগল",
-                                        "[B][C]{Name} [FF1493]আমি গাতা",
-                                        "[B][C]{Name} আমার মাথার [00FF00] তার ছিরা",
-                                        "[B][C]{Name} [00FFFF]আমি গুরু",
-                                        "[B][C]{Name} [FF1493]আমি বলোদ",
-                                        "[B][C]{Name} আমি [FF0000] হাছিব এর ছেলে",
-                                        "[B][C]{Name} amr [FF00FF] abba LAM",
-                                        "[B][C]{Name} [00FF00] ami  ar chele ",
-                                        "[B][C]{Name} আমি [FFA500]কুত তা ",
-                                        "[B][C]Bangladesh ami mc [FF0000] {Name}",
-                                        "[B][C]{Name} ami [FF00FF] bc",
-                                        "[B][C]{Name} [00FF00] ami pabna thaki ",
-                                        "[B][C]{Name} [FF1493]হছিব আমার বা প"
-                                            ]
+                                        "{Name}   !!",
+                                        "{Name}  ,    !!",
+                                        "{Name}  ,   5G   !!",
+                                        "{Name} ,      !!",
+                                        "{Name} ,    ,    !!",
+                                        "FUCK {Name} !!",
+                                        "{Name}  ,    !!",
+                                        "{Name}   !!",
+                                        "{Name} ,    !!",
+                                        "{Name}        !!",
+                                        "{Name} ,   !!",
+                                        "{Name}  ,    ..   !!",
+                                        "{Name}   ,   !!",
+                                        " NO-1  PLAYER {Name}",
+                                        "{Name}   !!",
+                                        "{Name} ,         !!",
+                                        "{Name}  ,        !!"
+            ]
 
                                     # Send each message one by one with random color
                                     for msg in messages:
-                                        colored_message = f"[B][C][FFFFFF][B][C][32CD32][FFFFFF][FFA500][FFFFFF][FF00FF][FFD700][FFFFFF][00FFFF][FF1493][00FF00][FFFFFF] {msg.replace('{Name}', name.upper())}"
+                                        colored_message = f"[B][C]{get_random_color()} {msg.replace('{Name}', name.upper())}"
                                         await safe_send_message(response.Data.chat_type, colored_message, uid, chat_id, key, iv)
-                                        await asyncio.sleep(2)
+                                        await asyncio.sleep(0.5)
+
                             except Exception as e:
-                                error_msg = f"[B][C][FF0000]❌ Gali command error: {str(e)[:50]}"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)                        
+                                error_msg = f"[B][C][FF0000] ERROR! Something went wrong:\n{str(e)}"
+                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 
-#GALI SPAM MESSAGE 
-                        # Add at the top with other global variables
-                        BLOCKED_NAMES = ["arbaz", "ARBAZ", "Arbaz", "_GAMER"]  # Add your actual name
-
-                                #GALI SPAM MESSAGE 
-                        if inPuTMsG.strip().startswith('/love '):
-                            print('Processing /love command')
-
-                            try:
-                                parts = inPuTMsG.strip().split(maxsplit=1)
-
-                                if len(parts) < 2:
-                                    error_msg = (
-                                        "[B][C][FF0000]❌ ERROR! Usage:\n"
-                                        "/love <name>\n"
-                                        "Example: /gali hater"
-                                    )
-                                    await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                else:
-                                    name = parts[1].strip()
-
-                                    messages = [
-                                        "[B][C][FFFFFF]♡ [FF1493]{Name} [FFFFFF]তুই আমার [00FFFF]সেফ জোন [FFFFFF]♡",
-                                        "[B][C][FFFFFF]♡ [00FF00]লবিতে [FFFFFF]শুধু [FFD700]{Name} তোকেই খুঁজি [FFFFFF]♡",
-                                        "[B][C][FFFFFF]♡ [00FFFF]এয়ারড্রপের [FFFFFF]চেয়েও [FF1493]তুই দামি [FFFFFF]♡",
-                                        "[B][C][FFFFFF]♡ [FFD700]{Name} তোর হাসিতে [FFFFFF]আমার [00FF00]HP বাড়ে [FFFFFF]♡",
-                                        "[B][C][FFFFFF]♡ [FF00FF]{Name} তুই ছাড়া [FFFFFF]গেম খেলা [00FFFF]পুরোই বৃথা [FFFFFF]♡",
-                                        "[B][C][FFFFFF]♡ [FFA500]স্নাইপারের [FFFFFF]একমাত্র [FF1493]লক্ষ্য {Name} তুই [FFFFFF]♡",
-                                        "[B][C][FFFFFF]♡ [32CD32]{Name} তুই আমার [FFFFFF]গ্লু-ওয়ালের [FFD700]কভার [FFFFFF]♡",
-                                        "[B][C][FFFFFF]♡ [FF0000]{Name} চল দুজনে [FFFFFF]মিলে [00FFFF]বুইয়া নিই [FFFFFF]♡"
-                                            ]
-
-                                    # Send each message one by one with random color
-                                    for msg in messages:
-                                        colored_message = f"[B][C][FFFFFF][B][C][32CD32][FFFFFF][FFA500][FFFFFF][FF00FF][FFD700][FFFFFF][00FFFF][FF1493][00FF00][FFFFFF][FF0000] {msg.replace('{Name}', name.upper())}"
-                                        await safe_send_message(response.Data.chat_type, colored_message, uid, chat_id, key, iv)
-                                        await asyncio.sleep(2)
-
-                            except Exception as e:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Something went wrong:\n{str(e)}"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)                        
                                 
                         # Add this with your other command handlers in the TcPChaT function
 
-                        # EVO CYCLE START COMMAND - /dance
-                        # EVO CYCLE START COMMAND - /dance
-                        # EVO CYCLE START COMMAND - /dance
-                        if inPuTMsG.strip().startswith('/dance'):
+                        # EVO CYCLE START COMMAND - @evos
+                        # EVO CYCLE START COMMAND - @evos
+                        # EVO CYCLE START COMMAND - @evos
+                        if inPuTMsG.strip().startswith('@evos'):
                             print('Processing evo cycle start command in any chat type')
     
                             parts = inPuTMsG.strip().split()
                             uids = []
     
-                            # Always use the sender's UID (the person who typed /dance)
+                            # Always use the sender's UID (the person who typed @evos)
                             sender_uid = str(response.Data.uid)
                             uids.append(sender_uid)
                             print(f"Using sender's UID: {sender_uid}")
     
                             # Optional: Also allow specifying additional UIDs
                             if len(parts) > 1:
-                                for part in parts[1:]:  # Skip the first part which is "/dance"
+                                for part in parts[1:]:  # Skip the first part which is "@evos"
                                     if part.isdigit() and len(part) >= 7 and part != sender_uid:  # UIDs are usually 7+ digits
                                         uids.append(part)
                                         print(f"Added additional UID: {part}")
@@ -10026,23 +9044,23 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
     
                             # SUCCESS MESSAGE
                             if len(uids) == 1:
-                                success_msg = f"[B][C][00FFFF]🔥 ＶＩＰ ＤＡＮＣＥ ＳＴＡＲＴＥＤ 🔥\n[FFFFFF]প্লেয়ার: এর ইমোট সুরু হয়ে ছে \n ( VIP BOT )\n[FF0000]ইমোট থামাতে লিখুন : /stop\n"
+                                success_msg = f"[B][C][00FF00] SUCCESS! Evolution emote cycle started!\n Target: Yourself\n Emotes: All 18 evolution emotes\n Delay: 5 seconds between emotes\n Cycle: Continuous loop until @sevos\n"
                             else:
-                                success_msg = f"[B][C][00FFFF]🔥 ＶＩＰ ＤＡＮＣＥ ＳＴＡＲＴＥＤ 🔥\n[FFFFFF]প্লেয়ার: এর ইমোট সুরু হয়ে ছে \n ( VIP BOT )\n[FF0000]ইমোট থামাতে লিখুন : /stop\n"
+                                success_msg = f"[B][C][00FF00] SUCCESS! Evolution emote cycle started!\n Targets: Yourself + {len(uids)-1} other players\n Emotes: All 18 evolution emotes\n Delay: 5 seconds between emotes\n Cycle: Continuous loop until @sevos\n"
     
                             await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                             print(f"Started evolution emote cycle for UIDs: {uids}")
                         
-# EVO CYCLE STOP COMMAND - /stop
-                        if inPuTMsG.strip() == '/stop':
+                        # EVO CYCLE STOP COMMAND - @sevos
+                        if inPuTMsG.strip() == '@sevos':
                             if evo_cycle_task and not evo_cycle_task.done():
                                 evo_cycle_running = False
                                 evo_cycle_task.cancel()
-                                success_msg = f"[B][C][FF4500]🛑 VIP DANCE থামানো হয়েছে!\n"
+                                success_msg = f"[B][C][00FF00] SUCCESS! Evolution emote cycle stopped successfully!\n"
                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                                 print("Evolution emote cycle stopped by command")
                             else:
-                                error_msg = f"[B][C][FF0000]❌ VIP-Dance [B][C] চালু নেই!\n"
+                                error_msg = f"[B][C][FF0000] ERROR! No active evolution emote cycle to stop!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         # Fast emote spam command - works in all chat types
@@ -10051,7 +9069,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 3:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /fast uid1 [uid2] [uid3] [uid4] emoteid\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /fast uid1 [uid2] [uid3] [uid4] emoteid\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 # Parse uids and emoteid
@@ -10071,7 +9089,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     emote_id = parts[-1]
                                 
                                 if not uids or not emote_id:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Invalid format! Usage: /fast uid1 [uid2] [uid3] [uid4] emoteid\n"
+                                    error_msg = f"[B][C][FF0000] ERROR! Invalid format! Usage: /fast uid1 [uid2] [uid3] [uid4] emoteid\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 else:
                                     # Stop any existing fast spam
@@ -10084,7 +9102,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     fast_spam_task = asyncio.create_task(fast_emote_spam(uids, emote_id, key, iv, region))
                                     
                                     # SUCCESS MESSAGE
-                                    success_msg = f"[B][C][FFFF00]✅ SUCCESS! Fast emote spam started!\nTargets: {len(uids)} players\nEmote: {emote_id}\nSpam count: 25 times\n"
+                                    success_msg = f"[B][C][00FF00] SUCCESS! Fast emote spam started!\nTargets: {len(uids)} players\nEmote: {emote_id}\nSpam count: 25 times\n"
                                     await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
 
                         # Custom emote spam command - works in all chat types
@@ -10093,7 +9111,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 4:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /p (uid) (emote_id) (times)\nExample: /p 123456789 909000001 10\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /p (uid) (emote_id) (times)\nExample: /p 123456789 909000001 10\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 try:
@@ -10102,10 +9120,10 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     times = int(parts[3])
                                     
                                     if times <= 0:
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Times must be greater than 0!\n"
+                                        error_msg = f"[B][C][FF0000] ERROR! Times must be greater than 0!\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     elif times > 1000:
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Maximum 100 times allowed for safety!\n"
+                                        error_msg = f"[B][C][FF0000] ERROR! Maximum 100 times allowed for safety!\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     else:
                                         # Stop any existing custom spam
@@ -10119,25 +9137,91 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         custom_spam_task = asyncio.create_task(custom_emote_spam(target_uid, emote_id, times, key, iv, region))
                                         
                                         # SUCCESS MESSAGE
-                                        success_msg = f"[B][C][FFFF00]✅ SUCCESS! Custom emote spam started!\nTarget: {target_uid}\nEmote: {emote_id}\nTimes: {times}\n"
+                                        success_msg = f"[B][C][00FF00] SUCCESS! Custom emote spam started!\nTarget: {xMsGFixinG(target_uid)}\nEmote: {emote_id}\nTimes: {times}\n"
                                         await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                                         
                                 except ValueError:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Invalid number format! Usage: /p (uid) (emote_id) (times)\n"
+                                    error_msg = f"[B][C][FF0000] ERROR! Invalid number format! Usage: /p (uid) (emote_id) (times)\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! {str(e)}\n"
+                                    error_msg = f"[B][C][FF0000] ERROR! {str(e)}\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     
- 
+                        # Spam request command - works in all chat types
+                        # Spam request command - works in all chat types
+                        if inPuTMsG.strip().startswith('/spam '):
+                            print('Processing spam request command in any chat type')
+    
+                            parts = inPuTMsG.strip().split()
+                            if len(parts) < 2:
+                                error_msg = f"[B][C][FF0000] Usage: /spam (uid)\nExample: /spam 123456789\n"
+                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
+                            else:
+                                target_uid = parts[1]
+        
+                                if not target_uid.isdigit():
+                                    error_msg = f"[B][C][FF0000] Please write a valid player ID!\n"
+                                    await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
+                                    return
+        
+                                # Send initial message
+                                initial_msg = f"[B][C][00FF00] Starting multi-account spam...\n Target: {xMsGFixinG(target_uid)}\n Loading accounts...\n"
+                                await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
+        
+                                # Check if accounts file exists
+                                try:
+                                    import os
+                                    if not os.path.exists("vv.json"):
+                                        error_msg = f"[B][C][FF0000] ERROR: vv.json file not found!\n"
+                                        await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
+                                        return
+                                except:
+                                    pass
+        
+                                try:
+                                    # Execute spam
+                                    success_count, total_accounts = await multi_account_spam_request(target_uid, key, iv, region)
+            
+                                    if success_count > 0:
+                                        result_msg = f"""
+[B][C][00FF00] MULTI-ACCOUNT SPAM COMPLETED!
+
+ Target: {xMsGFixinG(target_uid)}
+ Successful Requests: {success_count}
+ Total Accounts Used: {total_accounts}
+ Success Rate: {(success_count/total_accounts*100):.1f}%
+
+ Target received {success_count} join requests!
+ Bot ready for next command.
+"""
+                                    else:
+                                        result_msg = f"""
+[B][C][FF0000] SPAM FAILED!
+
+ Target: {xMsGFixinG(target_uid)}
+ Accounts Loaded: {total_accounts}
+ Possible Issues:
+1. Bot not connected properly
+2. Target UID invalid
+3. Game server blocking requests
+"""
+            
+                                    await safe_send_message(response.Data.chat_type, result_msg, uid, chat_id, key, iv)
+            
+                                except Exception as e:
+                                    print(f" Spam command error: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    error_msg = f"[B][C][FF0000] SPAM ERROR: {str(e)[:50]}...\n"
+                                    await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)      
 
                         # Spam request command - works in all chat types
-                        if inPuTMsG.strip().startswith('/spm'):
+                        if inPuTMsG.strip().startswith('/spm_inv'):
                             print('Processing spam invite with cosmetics')
     
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ Usage: /spm (uid)\nExample: /spm 123456789\n"
+                                error_msg = f"[B][C][FF0000] Usage: /spm_inv (uid)\nExample: /spm_inv 123456789\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 target_uid = parts[1]
@@ -10153,18 +9237,18 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                 spam_request_task = asyncio.create_task(spam_request_loop_with_cosmetics(target_uid, key, iv, region))
         
                                 # SUCCESS MESSAGE
-                                success_msg = f"[B][C][FFFF00]✅ SUCCESS! Spam request started successfully!\n"
+                                success_msg = f"[B][C][00FF00] COSMETIC SPAM STARTED!\n Target: {xMsGFixinG(target_uid)}\n Requests: 30\n Features: V-Badges + Cosmetics\n Each invite has different cosmetics!\n"
                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
 
                         # Stop spam request command - works in all chat types
-                        if inPuTMsG.strip() == '/sspm':
+                        if inPuTMsG.strip() == '/stop spm_inv':
                             if spam_request_task and not spam_request_task.done():
                                 spam_request_running = False
                                 spam_request_task.cancel()
-                                success_msg = f"[B][C][FFFF00]✅ SUCCESS! Spam request stopped successfully!\n"
+                                success_msg = f"[B][C][00FF00] SUCCESS! Spam request stopped successfully!\n"
                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                             else:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! No active spam request to stop!\n"
+                                error_msg = f"[B][C][FF0000] ERROR! No active spam request to stop!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         # In TcPChaT function, update /status command:
@@ -10173,69 +9257,69 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
     
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ Usage: /status (player_uid)\nExample: /status 123456789\n"
+                                error_msg = f"[B][C][FF0000] Usage: /status (player_uid)\nExample: /status 123456789\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 return
     
                             target_uid = parts[1]
     
                             # DEBUG: Show cache before clearing
-                            print(f"\n🔍 BEFORE clearing cache:")
+                            print(f"\n BEFORE clearing cache:")
                             debug_file_cache()
                             
                             # Clear old cache entry first
                             clear_cache_entry(target_uid)
     
                             # Send initial message
-                            initial_msg = f"[B][C][FFFF00]🔍 Checking status of {fix_num(target_uid)}...\n"
+                            initial_msg = f"[B][C][00FF00] Checking status of {fix_num(target_uid)}...\n"
                             await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
                             
                             try:
                                 # Create and send status request
                                 status_packet = await createpacketinfo(target_uid, key, iv)
                                 if not status_packet:
-                                    error_msg = f"[B][C][FF0000]❌ Failed to create status packet!\n"
+                                    error_msg = f"[B][C][FF0000] Failed to create status packet!\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                     return
         
                                 await SEndPacKeT(whisper_writer, online_writer, 'OnLine', status_packet)
-                                print(f"📤 Sent status request for {target_uid}")
+                                print(f" Sent status request for {xMsGFixinG(target_uid)}")
         
                                 # Wait for response - check FILE cache
                                 max_retries = 12  # Increased for reliability
                                 response_received = False
         
                                 for attempt in range(max_retries):
-                                    print(f"⏳ Checking file cache... attempt {attempt + 1}/{max_retries}")
+                                    print(f" Checking file cache... attempt {attempt + 1}/{max_retries}")
             
                                     # Check FILE cache
                                     cache_data = load_from_cache(target_uid)
                                     if cache_data:
-                                        print(f"🎯 FOUND in file cache! Status: {cache_data['status']}")
+                                        print(f" FOUND in file cache! Status: {cache_data['status']}")
                                         response_received = True
                 
                                         # DEBUG: Show what we found
-                                        print(f"📦 Cache data keys: {list(cache_data.keys())}")
+                                        print(f" Cache data keys: {list(cache_data.keys())}")
                 
                                         # Build response
-                                        status_msg = f"[B][C][FFFF00]📊 PLAYER STATUS\n"
-                                        status_msg += f"────────────────\n"
-                                        status_msg += f"👤 UID: {fix_num(target_uid)}\n"
-                                        status_msg += f"📊 Status: {cache_data['status']}\n"
+                                        status_msg = f"[B][C][FFFF00] PLAYER STATUS\n"
+                                        status_msg += f"\n"
+                                        status_msg += f" UID: {fix_num(target_uid)}\n"
+                                        status_msg += f" Status: {cache_data['status']}\n"
                 
                                         # Add specific info
                                         if "IN ROOM" in cache_data['status']:
                                             if 'room_id' in cache_data:
-                                                status_msg += f"🏠 Room ID: {fix_num(cache_data['room_id'])}\n"
-                                                status_msg += f"💡 Use: /roomspam {target_uid}\n"
+                                                status_msg += f" Room ID: {fix_num(cache_data['room_id'])}\n"
+                                                status_msg += f" Use: /roomspam {xMsGFixinG(target_uid)}\n"
                                                 room_id_msg = f"{fix_num(cache_data['room_id'])}"
                                                 await safe_send_message(response.Data.chat_type, room_id_msg, uid, chat_id, key, iv)
                                             else:
-                                                status_msg += f"🏠 Room ID: Not available\n"
+                                                status_msg += f" Room ID: Not available\n"
                 
                                         elif "INSQUAD" in cache_data['status']:
                                             if 'leader_id' in cache_data:
-                                                status_msg += f"👑 Leader: {fix_num(cache_data['leader_id'])}\n"
+                                                status_msg += f" Leader: {fix_num(cache_data['leader_id'])}\n"
                     
                                             # Try to get squad size
                                             try:
@@ -10246,26 +9330,26 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                                         if '9' in squad_data and 'data' in squad_data['9']:
                                                             members = squad_data['9']['data']
                                                             max_members = squad_data['10']['data'] + 1
-                                                            status_msg += f"👥 Squad: {members}/{max_members}\n"
+                                                            status_msg += f" Squad: {members}/{max_members}\n"
                                             except:
                                                 pass
                 
                                         elif "OFFLINE" in cache_data['status']:
-                                            status_msg += f"🔴 Player is offline\n"
+                                            status_msg += f" Player is offline\n"
                 
                                         elif "INGAME" in cache_data['status']:
-                                            status_msg += f"🎮 Player is in a match\n"
+                                            status_msg += f" Player is in a match\n"
                 
                                         elif "SOLO" in cache_data['status']:
-                                            status_msg += f"👤 Player is solo\n"
+                                            status_msg += f" Player is solo\n"
                 
-                                        status_msg += f"────────────────\n"
-                                        status_msg += f"✅ Real-time data\n"
+                                        status_msg += f"\n"
+                                        status_msg += f" Real-time data\n"
                 
                                         await safe_send_message(response.Data.chat_type, status_msg, uid, chat_id, key, iv)
 
                                         # DEBUG: Show cache after success
-                                        print(f"\n✅ AFTER successful response:")
+                                        print(f"\n AFTER successful response:")
                                         debug_file_cache()
                 
                                         break
@@ -10275,138 +9359,36 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                                         
                                 if not response_received:
                                     # DEBUG: Show cache state on failure
-                                    print(f"\n❌ FAILED after {max_retries} tries")
+                                    print(f"\n FAILED after {max_retries} tries")
                                     debug_file_cache()
             
-                                    error_msg = f"[B][C][FF0000]❌ STATUS CHECK FAILED\n"
-                                    error_msg += f"────────────────\n"
-                                    error_msg += f"👤 UID: {fix_num(target_uid)}\n"
-                                    error_msg += f"📛 No response from server\n"
-                                    error_msg += f"────────────────\n"
-                                    error_msg += f"💡 Possible issues:\n"
-                                    error_msg += f"• Player is offline\n"
-                                    error_msg += f"• Server is busy\n"
-                                    error_msg += f"• Try again in 10 seconds\n"
+                                    error_msg = f"[B][C][FF0000] STATUS CHECK FAILED\n"
+                                    error_msg += f"\n"
+                                    error_msg += f" UID: {fix_num(target_uid)}\n"
+                                    error_msg += f" No response from server\n"
+                                    error_msg += f"\n"
+                                    error_msg += f" Possible issues:\n"
+                                    error_msg += f" Player is offline\n"
+                                    error_msg += f" Server is busy\n"
+                                    error_msg += f" Try again in 10 seconds\n"
             
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
             
                             except Exception as e:
-                                print(f"❌ Status command error: {e}")
+                                print(f" Status command error: {e}")
                                 import traceback
                                 traceback.print_exc()
         
-                                error_msg = f"[B][C][FF0000]❌ Error: {str(e)[:50]}\n"
+                                error_msg = f"[B][C][FF0000] Error: {str(e)[:50]}\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
-                        if inPuTMsG.strip().startswith('/play '):
-                            print('Processing evo command in any chat type')
-                            
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /play uid1 [uid2] [uid3] [uid4] number(1-410)\nExample: /play 123456789 1\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                # Parse uids and number
-                                uids = []
-                                number = None
-                                
-                                for part in parts[1:]:
-                                    if part.isdigit():
-                                        if len(part) <= 3:  # Number should be 1-410 (1,2 or 3 digits)
-                                            number = part
-                                        else:
-                                            uids.append(part)
-                                    else:
-                                        break
-                                
-                                if not number and parts[-1].isdigit() and len(parts[-1]) <= 2:
-                                    number = parts[-1]
-                                
-                                if not uids or not number:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Invalid format! Usage: /play uid1 [uid2] [uid3] [uid4] number(1-410)\n"
-                                    await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                else:
-                                    try:
-                                        number_int = int(number)
-                                        if number_int not in ALL_EMOTE:
-                                            error_msg = f"[B][C][FF0000]❌ ERROR! Number must be between 1-410 only!\n"
-                                            await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                        else:
-                                            initial_message = f"[B][C]{get_random_color()}\nSending emote {number_int}...\n"
-                                            await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-                                            
-                                            success, result_msg = await play_emote_spam(uids, number_int, key, iv, region)
-                                            
-                                            if success:
-                                                success_msg = f"[B][C][00FF00]✅ SUCCESS! {result_msg}\n"
-                                                await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
-                                            else:
-                                                error_msg = f"[B][C][FF0000]❌ ERROR! {result_msg}\n"
-                                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                            
-                                    except ValueError:
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Invalid number format! Use (1-410) only.\n"
-                                        await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-
-                        # NEW 100 LV EMOTE COMMANDS
-                        if inPuTMsG.strip().startswith('/100 '):
-                            print('Processing evo command in any chat type')
-                            
-                            parts = inPuTMsG.strip().split()
-                            if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /100 uid1 [uid2] [uid3] [uid4]\nExample: /100 123456789\n"
-                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                            else:
-                                # Parse uids and number
-                                uids = []
-                                number = None
-                                
-                                for part in parts[1:]:
-                                    if part.isdigit():
-                                        if len(part) <= 3:  # Number should be 1-410 (1,2 or 3 digits)
-                                            number = part
-                                        else:
-                                            uids.append(part)
-                                    else:
-                                        break
-                                
-                                if not number and parts[-1].isdigit() and len(parts[-1]) <= 2:
-                                    number = parts[-1]
-                                
-                                if not uids or not number:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Invalid format! Usage: /100 uid1 [uid2] [uid3] [uid4]\n"
-                                    await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                else:
-                                    try:
-                                        number_int = 268
-                                        if number_int not in ALL_EMOTE:
-                                            error_msg = f"[B][C][FF0000]❌ ERROR! Number must be between 1-410 only!\n"
-                                            await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                        else:
-                                            initial_message = f"[B][C]{get_random_color()}\nSending 100 level emote...\n"
-                                            await safe_send_message(response.Data.chat_type, initial_message, uid, chat_id, key, iv)
-                                            
-                                            success, result_msg = await play_emote_spam(uids, number_int, key, iv, region)
-                                            
-                                            if success:
-                                                success_msg = f"[B][C][00FF00]✅ SUCCESS! {result_msg}\n"
-                                                await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
-                                            else:
-                                                error_msg = f"[B][C][FF0000]❌ ERROR! {result_msg}\n"
-                                                await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                            
-                                    except ValueError:
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Invalid number format! Use (1-410) only.\n"
-                                        await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                                        
-                                        
                         # NEW EVO COMMANDS
                         if inPuTMsG.strip().startswith('/evo '):
                             print('Processing evo command in any chat type')
                             
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /evo uid1 [uid2] [uid3] [uid4] number(1-21)\nExample: /evo 123456789 1\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /evo uid1 [uid2] [uid3] [uid4] number(1-21)\nExample: /evo 123456789 1\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 # Parse uids and number
@@ -10426,13 +9408,13 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     number = parts[-1]
                                 
                                 if not uids or not number:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Invalid format! Usage: /evo uid1 [uid2] [uid3] [uid4] number(1-21)\n"
+                                    error_msg = f"[B][C][FF0000] ERROR! Invalid format! Usage: /evo uid1 [uid2] [uid3] [uid4] number(1-21)\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 else:
                                     try:
                                         number_int = int(number)
                                         if number_int not in EMOTE_MAP:
-                                            error_msg = f"[B][C][FF0000]❌ ERROR! Number must be between 1-21 only!\n"
+                                            error_msg = f"[B][C][FF0000] ERROR! Number must be between 1-21 only!\n"
                                             await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                         else:
                                             initial_message = f"[B][C]{get_random_color()}\nSending evolution emote {number_int}...\n"
@@ -10441,14 +9423,14 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                             success, result_msg = await evo_emote_spam(uids, number_int, key, iv, region)
                                             
                                             if success:
-                                                success_msg = f"[B][C][FFFF00]✅ SUCCESS! {result_msg}\n"
+                                                success_msg = f"[B][C][00FF00] SUCCESS! {result_msg}\n"
                                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                                             else:
-                                                error_msg = f"[B][C][FF0000]❌ ERROR! {result_msg}\n"
+                                                error_msg = f"[B][C][FF0000] ERROR! {result_msg}\n"
                                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                             
                                     except ValueError:
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Invalid number format! Use 1-21 only.\n"
+                                        error_msg = f"[B][C][FF0000] ERROR! Invalid number format! Use 1-21 only.\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         if inPuTMsG.strip().startswith('/evo_fast '):
@@ -10456,7 +9438,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 2:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /evo_fast uid1 [uid2] [uid3] [uid4] number(1-21)\nExample: /evo_fast 123456789 1\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /evo_fast uid1 [uid2] [uid3] [uid4] number(1-21)\nExample: /evo_fast 123456789 1\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 # Parse uids and number
@@ -10476,13 +9458,13 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                     number = parts[-1]
                                 
                                 if not uids or not number:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Invalid format! Usage: /evo_fast uid1 [uid2] [uid3] [uid4] number(1-21)\n"
+                                    error_msg = f"[B][C][FF0000] ERROR! Invalid format! Usage: /evo_fast uid1 [uid2] [uid3] [uid4] number(1-21)\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 else:
                                     try:
                                         number_int = int(number)
                                         if number_int not in EMOTE_MAP:
-                                            error_msg = f"[B][C][FF0000]❌ ERROR! Number must be between 1-21 only!\n"
+                                            error_msg = f"[B][C][FF0000] ERROR! Number must be between 1-21 only!\n"
                                             await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                         else:
                                             # Stop any existing evo_fast spam
@@ -10497,63 +9479,12 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                             
                                             # SUCCESS MESSAGE
                                             emote_id = EMOTE_MAP[number_int]
-                                            success_msg = f"[B][C][FFFF00]✅ SUCCESS! Fast evolution emote spam started!\nTargets: {len(uids)} players\nEmote: {number_int} (ID: {emote_id})\nSpam count: 25 times\nInterval: 0.1 seconds\n"
+                                            success_msg = f"[B][C][00FF00] SUCCESS! Fast evolution emote spam started!\nTargets: {len(uids)} players\nEmote: {number_int} (ID: {emote_id})\nSpam count: 25 times\nInterval: 0.1 seconds\n"
                                             await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                                             
                                     except ValueError:
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Invalid number format! Use 1-21 only.\n"
+                                        error_msg = f"[B][C][FF0000] ERROR! Invalid number format! Use 1-21 only.\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-
-                        # Add this to your command handlers in TcPChaT function:
-                        if inPuTMsG.strip().startswith('/bundle'):
-                            print('Processing bundle command')
-    
-                            parts = inPuTMsG.strip().split()
-                            
-                            if len(parts) < 2:
-                                # Show available bundles
-                                bundle_list = """[B][C][00FF00]🎁 AVAILABLE BUNDLES 🎁
-[FF6347]━[32CD32]━[7B68EE]━[FF4500]━[1E90FF]━[ADFF2F]━[FF69B4]━[8A2BE2]━[DC143C]━[FF8C00]━[BA55D3]━[7CFC00]━[FFC0CB]
-[FFFFFF]• Rampage-1
-[FFFFFF]• Cannibal-2
-[FFFFFF]• devil-3
-[FFFFFF]• scorpio-4
-[FFFFFF]• frostfire-5
-[FFFFFF]• paradox-6
-[FFFFFF]• Naruto-7
-[FFFFFF]• aurora-8
-[FFFFFF]• midnight-9
-[FFFFFF]• itachi-10
-[FFFFFF]• dreamspace-11
-[FFFFFF]• Eclipse-12
-[FF6347]━[32CD32]━[7B68EE]━[FF4500]━[1E90FF]━[ADFF2F]━[FF69B4]━[8A2BE2]━[DC143C]━[FF8C00]━[BA55D3]━[7CFC00]━[FFC0CB]
-[00FF00]Usage: /bundle [look[num]
-[FFFFFF]Example: /bundle look13"""
-                                await safe_send_message(response.Data.chat_type, bundle_list, uid, chat_id, key, iv)
-                            else:
-                                bundle_name = parts[1].lower()
-        
-                                # All bundles use the same ID: 914000002
-                                bundle_id = BUNDLE.get(bundle_name)
-        
-                                initial_msg = f"[B][C][00FF00]🎁 Sending {bundle_name}\n"
-                                await safe_send_message(response.Data.chat_type, initial_msg, uid, chat_id, key, iv)
-        
-                                try:
-                                    # Create bundle packet
-                                    bundle_packet = await bundle_packet_async(bundle_id, key, iv, region)
-            
-                                    if bundle_packet and online_writer:
-                                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', bundle_packet)
-                                        success_msg = f"[B][C][00FF00]✅ Done: {bundle_name}"
-                                        await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
-                                    else:
-                                        error_msg = f"[B][C][FF0000]❌ Failed to create bundle packet!\n"
-                                        await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
-                
-                                except Exception as e:
-                                    error_msg = f"[B][C][FF0000]❌ Error sending bundle: {str(e)[:50]}\n"
-                                    await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         # NEW EVO_CUSTOM COMMAND
                         if inPuTMsG.strip().startswith('/evo_c '):
@@ -10561,7 +9492,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             
                             parts = inPuTMsG.strip().split()
                             if len(parts) < 3:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! Usage: /evo_c uid1 [uid2] [uid3] [uid4] number(1-21) time(1-100)\nExample: /evo_c 123456789 1 10\n"
+                                error_msg = f"[B][C][FF0000] ERROR! Usage: /evo_c uid1 [uid2] [uid3] [uid4] number(1-21) time(1-100)\nExample: /evo_c 123456789 1 10\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                             else:
                                 # Parse uids, number, and time
@@ -10593,7 +9524,7 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                             uids.remove(time_val)
                                 
                                 if not uids or not number or not time_val:
-                                    error_msg = f"[B][C][FF0000]❌ ERROR! Invalid format! Usage: /evo_c uid1 [uid2] [uid3] [uid4] number(1-21) time(1-100)\n"
+                                    error_msg = f"[B][C][FF0000] ERROR! Invalid format! Usage: /evo_c uid1 [uid2] [uid3] [uid4] number(1-21) time(1-100)\n"
                                     await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                 else:
                                     try:
@@ -10601,10 +9532,10 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                         time_int = int(time_val)
                                         
                                         if number_int not in EMOTE_MAP:
-                                            error_msg = f"[B][C][FF0000]❌ ERROR! Number must be between 1-21 only!\n"
+                                            error_msg = f"[B][C][FF0000] ERROR! Number must be between 1-21 only!\n"
                                             await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                         elif time_int < 1 or time_int > 100:
-                                            error_msg = f"[B][C][FF0000]❌ ERROR! Time must be between 1-100 only!\n"
+                                            error_msg = f"[B][C][FF0000] ERROR! Time must be between 1-100 only!\n"
                                             await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
                                         else:
                                             # Stop any existing evo_custom spam
@@ -10619,11 +9550,11 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                                             
                                             # SUCCESS MESSAGE
                                             emote_id = EMOTE_MAP[number_int]
-                                            success_msg = f"[B][C][FFFF00]✅ SUCCESS! Custom evolution emote spam started!\nTargets: {len(uids)} players\nEmote: {number_int} (ID: {emote_id})\nRepeat: {time_int} times\nInterval: 0.1 seconds\n"
+                                            success_msg = f"[B][C][00FF00] SUCCESS! Custom evolution emote spam started!\nTargets: {len(uids)} players\nEmote: {number_int} (ID: {emote_id})\nRepeat: {time_int} times\nInterval: 0.1 seconds\n"
                                             await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                                             
                                     except ValueError:
-                                        error_msg = f"[B][C][FF0000]❌ ERROR! Invalid number/time format! Use numbers only.\n"
+                                        error_msg = f"[B][C][FF0000] ERROR! Invalid number/time format! Use numbers only.\n"
                                         await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
 
@@ -10632,10 +9563,10 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             if evo_fast_spam_task and not evo_fast_spam_task.done():
                                 evo_fast_spam_running = False
                                 evo_fast_spam_task.cancel()
-                                success_msg = f"[B][C][FFFF00]✅ SUCCESS! Evolution fast spam stopped successfully!\n"
+                                success_msg = f"[B][C][00FF00] SUCCESS! Evolution fast spam stopped successfully!\n"
                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                             else:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! No active evolution fast spam to stop!\n"
+                                error_msg = f"[B][C][FF0000] ERROR! No active evolution fast spam to stop!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
                         # Stop evo_custom spam command
@@ -10643,195 +9574,118 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
                             if evo_custom_spam_task and not evo_custom_spam_task.done():
                                 evo_custom_spam_running = False
                                 evo_custom_spam_task.cancel()
-                                success_msg = f"[B][C][FFFF00]✅ SUCCESS! Evolution custom spam stopped successfully!\n"
+                                success_msg = f"[B][C][00FF00] SUCCESS! Evolution custom spam stopped successfully!\n"
                                 await safe_send_message(response.Data.chat_type, success_msg, uid, chat_id, key, iv)
                             else:
-                                error_msg = f"[B][C][FF0000]❌ ERROR! No active evolution custom spam to stop!\n"
+                                error_msg = f"[B][C][FF0000] ERROR! No active evolution custom spam to stop!\n"
                                 await safe_send_message(response.Data.chat_type, error_msg, uid, chat_id, key, iv)
 
-# ==================== IMPORTS ====================
-
-# ==================== /dhadha COMMAND ====================
-                        if inPuTMsG.strip() == "/dhadha":
-                            dha_messages = [
-                                "গেমে ঢোকার আগে সবাই আমাকে খোঁজে, কিন্তু এনিমি সামনে আসলে সবাই আমাকে গালি দেয়! আমি কে? ",
-                                "কখনো আমি লাল, কখনো আমি নীল, আমার ভেতরে গেলেই তোমার শরীর হবে ঢিল! আমি কে? ",
-                                "দেখতে আমি ছোট, কিন্তু আমার পেটে অনেক লুট! আমাকে দেখলে সবাই দৌড়ে আসে। আমি কে? ",
-                                "সবাই আমাকে মারতে চায়, কিন্তু আমি মরে গেলে সবাই খুশি হয়। আমি কে?', 'a': 'লবির এনিমি বা বট! 🤖",
-                                "'আমার চোখ নেই কিন্তু আমি দেখি, আমার পা নেই কিন্তু আমি ঘুরি। আমার কাজ শুধু তোমার ভুল ধরা! আমি কে? "
-                            ]
-                            selected_message = random.choice(dha_messages)
-                            dhadha_message = (
-                                f"[C][B][00FFFF]╔══════════╗\n"
-                                f"║  ╭────────────╮\n"
-                                f"║  │[FF69B4] ম জ দি মা গ  ধাঁ ধা 🤔       │\n"
-                                f"║  ╰───────────╯\n"
-                                f"║\n"
-                                f"║ [FFFFFF]✨ {selected_message}\n"
-                                f"║ ────────────\n"
-                                f"║ ⚡ [FF00FF]  VIP BOT ⚡\n"
-                                f"╚════════════╝"
-                            )
-                            await safe_send_message(response.Data.chat_type, dhadha_message, uid, chat_id, key, iv)
                             
-                            
-# FIXED HELP MENU SYSTEM - Now detects commands properly
-                        # IMPROVED HELP MENU SYSTEM - AUTOMATIC MULTI-PART
-                        # IMPROVED HELP MENU SYSTEM - TREE STYLE FORMAT
-                        if inPuTMsG.strip().lower() in ("LAM", "/help", "hi", "x", "1"):
-                            print(f"Help command detected from UID: {uid} in chat type: {XX}")
-    
+#=============================  /HELP MENU COMMANDS ========================================
+                        if inPuTMsG.strip().lower() in ("help", "/help", "menu", "hello", "hi"):
 
-    
-                            basic = """[c][b][00FFFF]⚡ 〔 [FFD700]CONTROL CENTER [00FFFF]〕 ⚡
-[00FFFF]
-[FF0000]1 [FFFFFF]Join Room        ➤ [00FFFF]/room [id] [pass]
-[00FF00]2 [FFFFFF]Player Info      ➤ [00FFFF]/info [uid]
-[FFFF00]3 [FFFFFF]TIKTOK INFO   ➤ [00FFFF]/tt [usrnm]
-[FFA500]4 [FFFFFF]Room Code        ➤ [00FFFF]/code
-[00FFFF]5 [FFFFFF]5 Like    ➤ [00FFFF]/like [uid]
-[FF00FF]6 [FFFFFF]Leave group       ➤ [00FFFF]/exit
-[FF4500]7 [FFFFFF]Join Group      ➤ [00FFFF]! [Teamcd]
-[FF0000]8 [FFFFFF]ban Check     ➤ [00FFFF]/check [uid]
-[00FF00]9 [FFFFFF]5 Player Group    ➤ [00FFFF]/5
-[FFFF00]10 [FFFFFF]Help Menu       ➤ [00FFFF]/help"""
-
-                            await safe_send_message(response.Data.chat_type, basic, uid, chat_id, key, iv)
-                            await asyncio.sleep(0.2)
-        
-
-                            emotes = """[c][b][FF00FF]🛡️ 〔 [00FFFF]SECURITY SYSTEM [FF00FF]〕 🛡️
-[FF00FF]
-[FF0000]11 [FFFFFF]Gali Any Name       ➤ [FF00FF]/gali
-[00FF00]12 [FFFFFF]INFO Player     ➤ [FF00FF]/info
-[FFFF00]13 [FFFFFF]BAN Check Player      ➤ [FF00FF]/check
-[FFA500]14 [FFFFFF]Admin CMND    ➤ [FF00FF]/admin
-[00FFFF]15 [FFFFFF]Lock Chat        ➤ [FF00FF]/mute
-[FF00FF]16 [FFFFFF]Unlock Chat      ➤ [FF00FF]/unmute
-[FF4500]17 [FFFFFF]badge Spam        ➤ [FF00FF]/spam [uid]
-[FF0000]18 [FFFFFF]ai with Chat       ➤ [FF00FF]/ai
-[00FF00]19 [FFFFFF]Whitelist        ➤ [FF00FF]/wladd
-[FFFF00]20 [FFFFFF]ADD BoT        ➤ [FF00FF]/add [uid]"""
-
-                            await safe_send_message(response.Data.chat_type, emotes, uid, chat_id, key, iv)
-                            await asyncio.sleep(0.2)            
-
-                            evo = """[c][b][00FF00]🎮 〔 [FFFF00]FUN & UTILITY [00FF00]〕 🎮
-[00FF00]
-[FF0000]21 [FFFFFF]ADD BIO        ➤ [00FF00]/bio [txt]
-[00FF00]22 [FFFFFF]Menu        ➤ [00FF00]/help
-[FFFF00]23 [FFFFFF]Cycle Emote    ➤ [00FF00]@evos
-[FFA500]24 [FFFFFF]ALL Emote            ➤ [00FF00]/e [name]
-[00FFFF]25 [FFFFFF]Evo Emote             ➤ [00FF00]/evo [nmbr]
-[FF00FF]26 [FFFFFF]Quick Emote           ➤ [00FF00]/fast [uid] [nmbr]
-[FFFF00]9 [FFFFFF]Random Emote Stop       ➤ [00FF00]@sevos
-"""
-                            await safe_send_message(response.Data.chat_type, evo, uid, chat_id, key, iv)
-                            await asyncio.sleep(0.2)            
-                                            
-
-                            spam_cmnd = """[c][b][00BFFF]⚔️ 〔 [FFFFFF]EXTRA FEATURES [00BFFF]〕 ⚔️
-[00BFFF]
-[FF0000]41 [FFFFFF]fast Spam       ➤ [00BFFF]/spm [uid] [count]
-[00FF00]42 [FFFFFF]Sticker BoT       ➤ [00BFFF]/sticker
-[FFFF00]43 [FFFFFF]Start Match      ➤ [00BFFF]/ss
-[FFA500]44 [FFFFFF]Quick EMOTE      ➤ [00BFFF]/fast
-[00FFFF]45 [FFFFFF]Team Spam        ➤ [00BFFF]/spm [tc] [count]
-[FF4500]46 [FFFFFF]TIKTOK INFO      ➤ [00BFFF]/tt (username)
-[FF0000]47 [FFFFFF] GALI Your FRND    ➤ [00BFFF]/gali [name]
-[00FF00]48 [FFFFFF] Kick        ➤ [00BFFF]/kick [uid]
-[FFFF00]49 [FFFFFF] Start Match       ➤ [00BFFF]/start"""
-
-                            await safe_send_message(response.Data.chat_type, spam_cmnd, uid, chat_id, key, iv)
+                            header = f"[C][B][FF1493]Hey User Welcome To [00FFAA]NAJMI-M24's BOT"
+                            await safe_send_message(response.Data.chat_type, header, uid, chat_id, key, iv)
                             await asyncio.sleep(0.2)
 
-                            badge_cmnd = """[c][b][00FF00]🎭 〔 [FFFF00]EMOTE [00FF00]〕 🎭
-[00FF00]
-[FF0000]51 [FFFFFF]3 Player Group  ➤ [00FFFF]/3
-[00FF00]52 [FFFFFF]5 Player Group  ➤ [00FFFF]/5
-[FFFF00]53 [FFFFFF]6 Player Group  ➤ [00FFFF]/6
-[FFA500]54 [FFFFFF]Invite Player   ➤ [00FFFF]/inv
-[00FFFF]55 [FFFFFF]Join Team       ➤ [00FFFF]! [code]
-[FF00FF]56 [FFFFFF]Exit Group      ➤ [00FFFF]/exit
-[FF4500]57 [FFFFFF]Start Match     ➤ [00FFFF]/start
-[FF0000]58 [FFFFFF]MX title    ➤ [00FFFF]noob
-[00FF00]59 [FFFFFF]V spam   ➤ [00FFFF]/spam [uid]
-[FFFF00]60 [FFFFFF]vip title   ➤ [00FFFF]/title"""
+                            menu1 = """[FFD700] TEAM & BASIC 
+[00FF00]01. /help [FFFFFF]--> Show Help Menu
+[32CD32]02. /3 [FFFFFF]--> 3 Player Team
+[228B22]03. /5 [FFFFFF]--> 5 Player Team
+[008000]04. /6 [FFFFFF]--> 6 Player Team
+[ADFF2F]05. /join [tc] [FFFFFF]--> Join Team
+[7FFF00]06. /exit [FFFFFF]--> Leave Team
 
-                            await safe_send_message(response.Data.chat_type, badge_cmnd, uid, chat_id, key, iv)
+[98FB98]08. /kick [uid] [FFFFFF]--> Kick Player
+[00AAFF]"""
+                            await safe_send_message(response.Data.chat_type, menu1, uid, chat_id, key, iv)
                             await asyncio.sleep(0.2)
 
-                            ad_cmnd = """[c][b][FF00FF]🚀 〔 [00FFFF]ADVANCED MODE [FF00FF]〕 🚀
-[FF00FF]
-[FF0000]61 [FFFFFF]Spam Invite   ➤ [FF00FF]/spm [uid]
-[00FF00]62 [FFFFFF]Stop Spam     ➤ [FF00FF]/sspm
-[FFFF00]63 [FFFFFF]Ghost Join    ➤ [FF00FF]/ghost [tc]
-[FFA500]64 [FFFFFF]Lag Attack    ➤ [FF00FF]/lag [tc]
-[00FFFF]65 [FFFFFF]Stop Lag      ➤ [FF00FF]/stop_lag
-[FF00FF]66 [FFFFFF]BOT EQUIP Bundle    ➤ [FF00FF]/bundle [name]
-[FF4500]67 [FFFFFF]Auto join   ➤ [FF00FF]! [tc]
-[00FF00]69 [FFFFFF]Spam Chat     ➤ [FF00FF]/mg [txt]
-[FFFF00]70 [FFFFFF] Chat With ai    ➤ [FF00FF]/ai [qusin]"""
-
-                            await safe_send_message(response.Data.chat_type, ad_cmnd, uid, chat_id, key, iv)
+                            menu2 = """[800080] SPAM & ATTACK 
+[FF4500]09. /inv [uid] [FFFFFF]--> Invite Player
+[FF6347]10. /lag [tc] [FFFFFF]--> Lag Team
+[FF0000]11. /attack [tc] [FFFFFF]--> Attack Team
+[DC143C]12. /spam [uid] [FFFFFF]--> Spam Join Req
+[B22222]13. /spm_inv [uid] [FFFFFF]--> Spam Invite
+[FF7F50]14. /ms [txt] [FFFFFF]--> Message Spam
+[CD5C5C]15. /mg [txt] [FFFFFF]--> Wave Msg Spam
+[E9967A]16. /dm [uid] [FFFFFF]--> Direct Message
+[00AAFF]"""
+                            await safe_send_message(response.Data.chat_type, menu2, uid, chat_id, key, iv)
                             await asyncio.sleep(0.2)
 
-                            info_cmnd = """[c][b][FF00FF]🚀 〔 [00FFFF]ADVANCED MODE [FF00FF]〕 🚀
-[FF00FF]
-[FF0000]81 [FFFFFF]Spam V1   ➤ [FF00FF]/V1 [uid]
-[00FF00]82 [FFFFFF]Spam V2     ➤ [FF00FF]/V2 [uid]
-[FFFF00]83 [FFFFFF]Spam V3    ➤ [FF00FF]/V3 [uid]
-[FFA500]84 [FFFFFF]Spam V4    ➤ [FF00FF]/V4 [uid]
-[00FFFF]85 [FFFFFF]Spam V5      ➤ [FF00FF]/V5 [uid]
-[FF00FF]86 [FFFFFF]ALL Spam    ➤ [FF00FF]/spam [uid]
-[FF4500]87 [FFFFFF]STOP Spam   ➤ [FF00FF]/sspm
-[00FF00]89 [FFFFFF]Spam Chat     ➤ [FF00FF]/mg [txt]
-[FFFF00]90 [FFFFFF]Spam Chat    ➤ [FF00FF]/msg [txt]"""
-
-
-                            await safe_send_message(response.Data.chat_type, info_cmnd, uid, chat_id, key, iv)
+                            menu3 = """[FF0000] EMOTE COMMANDS 
+[9370DB]17. /emote [FFFFFF]--> Show Emote List
+[8A2BE2]18. /e [emt] [FFFFFF]--> Emote To Self
+[9400D3]19. /e [uid] [FFFFFF]--> Emote To Player
+[9932CC]20. /e [id][id][et] [FFFFFF]--> Multi Emt
+[BA55D3]21. @evos [FFFFFF]--> Evo Cycle Self
+[DA70D6]22. @evos [uid] [FFFFFF]--> Evo Cycle Player
+[EE82EE]23. @sevos [FFFFFF]--> Stop Evo Cycle
+[D8BFD8]24. /d [tc][uid][et] [FFFFFF]--> Emt No Bot
+[00AAFF]"""
+                            await safe_send_message(response.Data.chat_type, menu3, uid, chat_id, key, iv)
                             await asyncio.sleep(0.2)
 
-
-                            about = """[C][B][FF00FF]═⚡ 
-[b][c][FF0000] APON GMAING 71 
-❀️ [B][C][FF00FF]╭[FF00FF]─[BC26AB]╮[FF00FF]╔═══════╗
-[C][B][FF00FF]│[FFFFFF]ꚠ[FF00FF]│[00E5FF]║[00FFFF] APON GMAING 71[FFFF00]║
-[C][B][FF00FF]╰[FF00FF]─[FF00FF]╯[FF00FF]╚═══════╝
-[00FFFF]━━━━━━━━━━━━[FF69B4]"""
-
-                            await safe_send_message(response.Data.chat_type, about, uid, chat_id, key, iv)
-                            await asyncio.sleep(0.2)
-                            
-
-                            whitelist_cmnd = """[C][B][FF00FF]═ ,,, ═[00E5FF][B]
-  ❀️গিল্ড স্বার্থের জন্য নয়—এটি পরিবার, আর পরিবার বড় করা সবার দায়িত্ব।"
-
-[FFFF00]❀️ গিল্ডে সবাই সমান – ভাই, ব্রাদার, বন্ধু ঝগড়া নয়, একসাথে মিলেমিশে থাকবো”
-
-[00E5FF]মিলেমিশে চলব, একসাথে জিতব !!
-
-[FF00FF] তোমরা সবাই ফলো করে দিও..!¡
- ❀️ YouTube  :[FFFFFF]@rxapon71
-
-[b][c][00bFFF] : APON GMAING 71 
-[00CED1]━━━━━━━━━━━━[1E90FF]"""
-
-                            await safe_send_message(response.Data.chat_type, whitelist_cmnd, uid, chat_id, key, iv)
+                            menu4 = """[00FFAA] EXTRA FEATURES 
+[1E90FF]25. /play [uid][id] [FFFFFF]--> Custom Emt
+[00BFFF]26. /bundle [FFFFFF]--> Bundle Menu
+[87CEEB]27. /bundle [name] [FFFFFF]--> Set Bundle
+[00CED1]28. /gali [name] [FFFFFF]--> Gali To Friend
+[40E0D0]29. /check [uid] [FFFFFF]--> Check Ban
+[48D1CC]30. /info [uid] [FFFFFF]--> Player Info
+[AFEEEE]31. /like [uid] [FFFFFF]--> Send Likes
+[5F9EA0]32. /ai [ques] [FFFFFF]--> Chat With AI
+[00AAFF]"""
+                            await safe_send_message(response.Data.chat_type, menu4, uid, chat_id, key, iv)
                             await asyncio.sleep(0.2)
 
-                            last ="""[c][b][00FFFF]👑 〔 [FF00FF]BOT OWNER [00FFFF]〕 👑
-[00FFFF]
-[FF00FF]👤 [FFFFFF]Owner  : [FF00FF] APON GMAING 71 
-[00FFFF]🌐 [FFFFFF]PAID TCP BOT NITE CHAILE INBOX NAME : WhatsApp 01966199195
-[00FFFF]@rxapon
-[FFFF00]💡 [FFFFFF]টিপস: [00FF00]! [FFFFFF]টিম কোড, [FF00FF]@evos [FFFFFF]ইমোট।
-[00FFFF]বন্ধ করতে [FFFF00]@sevos [FF0000]ব্যবহার করুন"""
+                            menu5 = """[FFD700] PROFILE & BADGE 
+[FFD700]33. /name [uid] [FFFFFF]--> Get Name
+[DAA520]34. /bio [uid] [FFFFFF]--> Get Bio
+[B8860B]35. /visit [FFFFFF]--> Profile Visit
+[F0E68C]36. /s1 [uid] [FFFFFF]--> Craftland Bdg
+[EEE8AA]37. /s2 [uid] [FFFFFF]--> V Badge Req
+[FFFACD]38. /s3 [uid] [FFFFFF]--> Moderator Bdg
+[FFFFE0]39. /s4 [uid] [FFFFFF]--> Old V Badge
+[FAFAD2]40. /s5 [uid] [FFFFFF]--> Pro Badge Req
+[00AAFF]"""
+                            await safe_send_message(response.Data.chat_type, menu5, uid, chat_id, key, iv)
+                            await asyncio.sleep(0.2)
 
-    
+                            menu6 = """[1E90FF] UTILITIES 
+[FF8C00]41. /spam_req [uid] [FFFFFF]--> Spam Req
+[FFA500]42. /admin [FFFFFF]--> Admin Info
+[FFDAB9]43. /store [FFFFFF]--> Parche Store
+[FFE4B5]44. /title [FFFFFF]--> Rare Title
+[FFEFD5]45. /emoji [FFFFFF]--> Single Emoji
+[FFF8DC]46. /emoji [cnt] [FFFFFF]--> Multi Emoji
+[FFE4C4]47. /ghost [tc] [FFFFFF]--> Ghost Join
+[F5DEB3]48. bb_lag [tc] [FFFFFF]--> Bundle Spam
+[00AAFF]"""
+                            await safe_send_message(response.Data.chat_type, menu6, uid, chat_id, key, iv)
+                            await asyncio.sleep(0.2)
 
+                            menu7 = """[FF1493] ADMIN ONLY 
+[FF00FF]49. /add [uid] [FFFFFF]--> Add Friend
+[C71585]50. /remove [uid] [FFFFFF]--> Remove Friend
+[DB7093]51. /add_bio [bio] [FFFFFF]--> Change Bio
+[FF1493]52. /off [FFFFFF]--> Off Bot
+[FF69B4]53. /on [FFFFFF]--> On Bot
+[FFB6C1]54. /status [FFFFFF]--> Bot Status
+[FA8072]55. /100 [FFFFFF]--> 100 Lvl Emt
+[E9967A]56. /100 [uid] [FFFFFF]--> 100 Lvl Player
+[00AAFF]"""
+                            await safe_send_message(response.Data.chat_type, menu7, uid, chat_id, key, iv)
+                            await asyncio.sleep(0.2)
 
-                            await safe_send_message(response.Data.chat_type, last, uid, chat_id, key, iv)
+                            menu8 = """[32CD32] AUTOMATIC 
+[FFFFFF]57. Auto Accept Team Invite
+[F0F0F0]58. Auto Reply 'noob'
+[E0E0E0]59. Auto Play Ring After Join
+[D0D0D0]60. Auto Ring For Inviter
+[00AAFF]"""
+                            await safe_send_message(response.Data.chat_type, menu8, uid, chat_id, key, iv)
                             await asyncio.sleep(0.2)
                         response = None
                             
@@ -10844,13 +9698,13 @@ async def TcPChaT(ip, port, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event
 
 async def MaiiiinE():
     # Load credentials from file
-    print("📁 Loading credentials from bot.txt...")
+    print(" Loading credentials from bot.txt...")
     credentials = load_credentials_from_file("bot.txt")
     
     if not credentials:
-        print("❌ Failed to load credentials!")
-        print("💡 Please create bot.txt with your UID and password")
-        print("📝 Format: uid=YOUR-UID,password=Your-pass")
+        print(" Failed to load credentials!")
+        print(" Please create bot.txt with your UID and password")
+        print(" Format: uid=4343325639,password=7B86ED0F5B8BC8088566880A59E1583AC273B7A575ED04ABE")
         return None
     
     try:
@@ -10861,22 +9715,22 @@ async def MaiiiinE():
             Uid = credentials[0]
             Pw = credentials[1]
         else:
-            print("❌ Invalid credentials format!")
+            print(" Invalid credentials format!")
             return None
     
-    print("✅ Credentials loaded successfully")
+    print(" Credentials loaded successfully")
     
     # Get access token from Free Fire
     open_id, access_token = await GeNeRaTeAccEss(Uid, Pw)
     if not open_id or not access_token: 
-        print("❌ Error - Invalid Account (Check UID/Password)") 
+        print(" Error - Invalid Account (Check UID/Password)") 
         return None
     
     # Encrypt and send login request
     PyL = await EncRypTMajoRLoGin(open_id, access_token)
     MajoRLoGinResPonsE = await MajorLogin(PyL)
     if not MajoRLoGinResPonsE: 
-        print("❌ Target Account => Banned / Not Registered!") 
+        print(" Target Account => Banned / Not Registered!") 
         return None
     
     # Decrypt login response
@@ -10885,10 +9739,10 @@ async def MaiiiinE():
     # Get JWT token from response
     token = MajoRLoGinauTh.token
     if not token:
-        print("❌ No authentication token received!")
+        print(" No authentication token received!")
         return None
     
-    # ✅ CRITICAL: SAVE TOKEN TO token.json FILE
+    #  CRITICAL: SAVE TOKEN TO token.json FILE
     try:
         import json
         import time
@@ -10909,11 +9763,11 @@ async def MaiiiinE():
         with open("token.json", "w") as f:
             json.dump(token_data, f, indent=2)
         
-        print("✅ Token saved to token.json")
-        print(f"📝 Token info: Region={region}, UID={Uid}")
+        print(" Token saved to token.json")
+        print(f" Token info: Region={region}, UID={Uid}")
         
     except Exception as e:
-        print(f"⚠️ Warning: Could not save token to file: {e}")
+        print(f" Warning: Could not save token to file: {e}")
         import traceback
         traceback.print_exc()
     
@@ -10921,13 +9775,15 @@ async def MaiiiinE():
     UrL = MajoRLoGinauTh.url
     
     # Clear screen and show status
-    os.system('clear')
+    # Clear screen only if not on Heroku
+    if not os.environ.get('PORT'):
+        os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 50)
-    print("🤖 ᅠ BOT - INITIALIZING")
+    print(" NAJMI-M24 BOT - INITIALIZING")
     print("=" * 50)
-    print("🔄 Starting TCP Connections...")
-    print("📡 Connecting to Free Fire servers...")
-    print("🌐 Server connection established")
+    print(" Starting TCP Connections...")
+    print(" Connecting to Free Fire servers...")
+    print(" Server connection established")
     
     region = getattr(MajoRLoGinauTh, 'region', 'IND')
     ToKen = token  # Use the saved token
@@ -10936,15 +9792,15 @@ async def MaiiiinE():
     iv = MajoRLoGinauTh.iv
     timestamp = MajoRLoGinauTh.timestamp
     
-    print(f"🔐 Authentication successful")
-    print(f"👤 Account UID: {TarGeT}")
-    print(f"🌍 Region: {region}")
-    print(f"🔑 Token: {ToKen[:30]}...")
+    print(f" Authentication successful")
+    print(f" Account UID: {TarGeT}")
+    print(f" Region: {region}")
+    print(f" Token: {ToKen[:30]}...")
     
     # Get login data for server IPs
     LoGinDaTa = await GetLoginData(UrL, PyL, ToKen)
     if not LoGinDaTa: 
-        print("❌ Error - Getting Ports From Login Data!") 
+        print(" Error - Getting Ports From Login Data!") 
         return None
     
     LoGinDaTaUncRypTinG = await DecRypTLoGinDaTa(LoGinDaTa)
@@ -10953,16 +9809,20 @@ async def MaiiiinE():
     OnLinePorTs = LoGinDaTaUncRypTinG.Online_IP_Port
     ChaTPorTs = LoGinDaTaUncRypTinG.AccountIP_Port
     
-    print(f"📡 Online Server: {OnLinePorTs}")
-    print(f"💬 Chat Server: {ChaTPorTs}")
+    print(f" Online Server: {OnLinePorTs}")
+    print(f" Chat Server: {ChaTPorTs}")
     
-    # Split IPs and ports
-    OnLineiP, OnLineporT = OnLinePorTs.split(":")
-    ChaTiP, ChaTporT = ChaTPorTs.split(":")
+    # Split IPs and ports safely
+    try:
+        OnLineiP, OnLineporT = OnLinePorTs.split(":", 1) if ":" in str(OnLinePorTs) else (str(OnLinePorTs), "10001")
+        ChaTiP, ChaTporT = ChaTPorTs.split(":", 1) if ":" in str(ChaTPorTs) else (str(ChaTPorTs), "9001")
+    except ValueError as e:
+        print(f" Error splitting IPs/Ports - Online: {OnLinePorTs}, Chat: {ChaTPorTs}")
+        return None
     
     # Get account name
     acc_name = LoGinDaTaUncRypTinG.AccountName
-    print(f"👋 Welcome, {acc_name}!")
+    print(f" Welcome, {acc_name}!")
     
     # Create authentication token for TCP connections
     AutHToKen = await xAuThSTarTuP(int(TarGeT), ToKen, int(timestamp), key, iv)
@@ -10971,89 +9831,118 @@ async def MaiiiinE():
     ready_event = asyncio.Event()
     
     # Start bot tasks
-    print("\n🚀 Starting bot services...")
+    print("\n Starting bot services...")
     
     task1 = asyncio.create_task(TcPChaT(ChaTiP, ChaTporT, AutHToKen, key, iv, LoGinDaTaUncRypTinG, ready_event, region))
     task2 = asyncio.create_task(TcPOnLine(OnLineiP, OnLineporT, key, iv, AutHToKen))  
  
     
     # Show loading animation
-    os.system('clear')
-    print("🤖 ᅠ BOT - STARTING")
+    # Clear screen only if not on Heroku
+    if not os.environ.get('PORT'):
+        os.system('cls' if os.name == 'nt' else 'clear')
+    print(" NAJMI-M24 BOT - STARTING")
     print("=" * 50)
     
     for i in range(1, 4):
         dots = "." * i
-        print(f"🔄 Loading{dots}")
+        print(f" Loading{dots}")
         time.sleep(0.3)
     
-    os.system('clear')
-    print("🤖 ᅠ BOT - CONNECTING")
+    # Clear screen only if not on Heroku
+    if not os.environ.get('PORT'):
+        os.system('cls' if os.name == 'nt' else 'clear')
+    print(" NAJMI-M24 BOT - CONNECTING")
     print("=" * 50)
-    print("┌────────────────────────────────────┐")
-    print("│ ██████████████████████████████████ │")
-    print("└────────────────────────────────────┘")
+    print("")
+    print("  ")
+    print("")
     
     # Wait for chat connection to be ready
-    print("\n⏳ Waiting for chat connection...")
+    print("\n Waiting for chat connection...")
     try:
         await asyncio.wait_for(ready_event.wait(), timeout=10)
-        print("✅ Chat connection established!")
+        print(" Chat connection established!")
     except asyncio.TimeoutError:
-        print("⚠️ Chat connection timeout, continuing...")
+        print(" Chat connection timeout, continuing...")
     
+    # IPC Server for Web UI commands
+    async def ipc_server():
+        server = await asyncio.start_server(
+            lambda r, w: handle_ipc(r, w, key, iv, region),
+            '127.0.0.1', 
+            0 # dynamically pick port
+        )
+        port = server.sockets[0].getsockname()[1]
+        
+        # Save port to a file the Web UI can find using the config Uid!
+        os.makedirs('.ipc', exist_ok=True)
+        with open(f".ipc/{Uid}.port", "w") as f:
+            f.write(str(port))
+            
+        print(f" IPC Listener started on port {port}")
+        
+        async with server:
+            await server.serve_forever()
+            
+    # Include IPC task & Lock Monitor task
+    task_ipc = asyncio.create_task(ipc_server())    
+    task_monitor = asyncio.create_task(lock_and_squad_monitor_loop(key, iv, region))
+
     # Final status display
-    os.system('clear')
+    # Clear screen only if not on Heroku
+    if not os.environ.get('PORT'):
+        os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 50)
-    print("🤖 ᅠ BOT - ONLINE")
+    print(" NAJMI-M24 BOT - ONLINE")
     print("=" * 50)
-    print(f"🔹 UID: {TarGeT}")
-    print(f"🔹 Name: {acc_name}")
-    print(f"🔹 Region: {region}")
-    print(f"🔹 Status: 🟢 READY")
-    print(f"🔹 Chat Server: {ChaTiP}:{ChaTporT}")
-    print(f"🔹 Online Server: {OnLineiP}:{OnLineporT}")
+    print(f" UID: {TarGeT}")
+    print(f" Name: {acc_name}")
+    print(f" Region: {region}")
+    print(f" Status:  READY")
+    print(f" Chat Server: {ChaTiP}:{ChaTporT}")
+    print(f" Online Server: {OnLineiP}:{OnLineporT}")
     print("=" * 50)
-    print("💡 Commands available in squad/guild chat")
-    print("💡 Type /help for command list")
+    print(" Commands available in squad/guild chat")
+    print(" Type /help for command list")
     print("=" * 50)
     
     # Test cache file write
-    print("\n📊 System Check:")
-    print(f"📁 Working directory: {os.getcwd()}")
-    print(f"📁 Cache file: {CACHE_FILE}")
+    print("\n System Check:")
+    print(f" Working directory: {os.getcwd()}")
+    print(f" Cache file: {CACHE_FILE}")
     
     try:
         test_data = {'test': 'ok', 'timestamp': time.time()}
         with open(CACHE_FILE, 'wb') as f:
             pickle.dump(test_data, f)
-        print("✅ Cache file write test: PASSED")
+        print(" Cache file write test: PASSED")
     except Exception as e:
-        print(f"⚠️ Cache file write test: {e}")
+        print(f" Cache file write test: {e}")
     
     # Check token.json exists
     if os.path.exists("token.json"):
-        print("✅ token.json file exists")
+        print(" token.json file exists")
         try:
             with open("token.json", "r") as f:
                 token_info = json.load(f)
             age = time.time() - token_info.get('saved_at', 0)
-            print(f"✅ Token age: {age:.1f} seconds")
+            print(f" Token age: {age:.1f} seconds")
         except:
-            print("⚠️ Could not read token.json")
+            print(" Could not read token.json")
     else:
-        print("❌ token.json not found!")
+        print(" token.json not found!")
     
-    print("\n🎯 Bot is now running...")
-    print("📡 Listening for commands and invitations")
+    print("\n Bot is now running...")
+    print(" Listening for commands and invitations")
     
     # Keep all tasks running
     try:
-        await asyncio.gather(task1, task2)
+        await asyncio.gather(task1, task2, task_ipc, task_monitor)
     except asyncio.CancelledError:
-        print("\n🛑 Bot tasks cancelled")
+        print("\n Bot tasks cancelled")
     except Exception as e:
-        print(f"\n❌ Error in bot tasks: {e}")
+        print(f"\n Error in bot tasks: {e}")
         import traceback
         traceback.print_exc()
     
