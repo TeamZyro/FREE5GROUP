@@ -147,20 +147,6 @@ async def lock_and_squad_monitor_loop(key, iv, region):
                         print(f" [AUTO UNLOCK EXIT ERROR] {ex}")
                     insquad = None
                     invalidate_lock_session()
-
-            # TCP Keepalive Heartbeat: Send ping every 9s to prevent Free Fire server idle disconnects
-            ping_counter = getattr(lock_and_squad_monitor_loop, 'counter', 0) + 1
-            setattr(lock_and_squad_monitor_loop, 'counter', ping_counter)
-            if ping_counter % 6 == 0:
-                if online_writer and not online_writer.is_closing():
-                    try:
-                        ping_pk = await GeneRaTePk("", "0500", key, iv)
-                        if ping_pk:
-                            online_writer.write(ping_pk)
-                            await online_writer.drain()
-                    except Exception:
-                        pass
-
         except Exception as e:
             print(f"⚠️ [LOCK MONITOR ERROR] {e}")
             
@@ -3657,12 +3643,6 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
     """
     global insquad, online_writer
     try:
-        # Check TCP socket readiness to ensure socket is not reconnecting or dead
-        for _ in range(25):
-            if online_writer and not online_writer.is_closing():
-                break
-            await asyncio.sleep(0.1)
-
         if not region:
             region = "IND"
 
