@@ -989,12 +989,14 @@ async def Emote_k(TarGeT , idT, K, V,region):
             }
         }
     }
-    if region.lower() == "ind":
-        packet = '0514'
-    elif region.lower() == "bd":
+    reg_clean = str(region or '').strip().lower()
+    if 'bd' in reg_clean:
         packet = "0519"
-    else:
+    elif reg_clean in ['us', 'sac', 'br', 'na']:
         packet = "0515"
+    else:
+        # Default to '0514' (IND/India header) for all standard bots
+        packet = '0514'
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
 
 #EMOTES BY PARAHEX X CODEX
