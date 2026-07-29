@@ -3643,6 +3643,9 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
     """
     global insquad
     try:
+        if not region:
+            region = "IND"
+
         if isinstance(uids_input, str):
             uids_list = [u.strip() for u in uids_input.replace(',', ' ').split() if u.strip()]
         elif isinstance(uids_input, (list, tuple)):
@@ -3719,11 +3722,11 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
                 target_num = int(target_uid) if str(target_uid).isdigit() else 0
                 emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, region)
                 if emote_packet:
-                    # Burst of 2 packets (80ms gap) to guarantee server delivery under multi-bot load
-                    for _ in range(2):
+                    # Burst of 3 packets (80ms gap) to guarantee server delivery under multi-bot shift load
+                    for _ in range(3):
                         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
                         await asyncio.sleep(0.08)
-                    print(f"⚡ [FAST EMOTE] Sent burst emote {resolved_emote_id} to UID {target_uid}")
+                    print(f"⚡ [FAST EMOTE] Sent 3-burst emote {resolved_emote_id} to UID {target_uid}")
             except Exception as e:
                 print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
 
