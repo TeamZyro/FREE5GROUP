@@ -1,1275 +1,1219 @@
-import json
-import sqlite3
-import requests
-import os
-import time
-import threading
-import logging
-import subprocess
-import signal
-import sys
-from flask import Flask, jsonify, request, render_template, Response, send_from_directory, send_file
+# By AbdeeLkarim BesTo
+
+import requests , json , binascii , time , urllib3 , base64 , datetime , re ,socket , threading , random , os , asyncio
+from protobuf_decoder.protobuf_decoder import Parser
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
-from google.protobuf import descriptor as _descriptor
-from google.protobuf import descriptor_pool as _descriptor_pool
-from google.protobuf import symbol_database as _symbol_database
-from google.protobuf.internal import builder as _builder
-import re
-import urllib.parse
+from Crypto.Util.Padding import pad , unpad
+from datetime import datetime
+from google.protobuf.timestamp_pb2 import Timestamp
 
-# Load Bio Config
-try:
-    from FFLONGBIO.config import SITE_CONFIG
-except ImportError:
-    SITE_CONFIG = {"site_name": "MV Creator PRO", "bio_char_limit": 300}
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+Key , Iv = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56]) , bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
 
-app = Flask(__name__)
-client_logs = []
-bot_statuses = {}  # Store bot status (Online, Offline, Connecting) here for the UI
-
-# To hold active bot clients
-active_clients = {}
-client_logs = []
-
-# HEROKU OPTIMIZATION: Limit total bots to stay within memory limits (e.g., 512MB/1GB)
-MAX_BOT_LIMIT = 5 
-BOT_ROTATION_INTERVAL = 3600 # 1 hour in seconds
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin12345")
-last_rotation_time = time.time()
-current_rotation_index = 0
-
-# History of exploit requests
-exploit_history = []
-
-class WebLogHandler(logging.Handler):
-    def emit(self, record):
-        try:
-            log_entry = self.format(record)
-            client_logs.append(log_entry)
-            if len(client_logs) > 500:
-                client_logs.pop(0)
-        except Exception:
-            self.handleError(record)
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-# Avoid duplicate logging if it already has handlers
-if not any(isinstance(h, WebLogHandler) for h in logger.handlers):
-    web_handler = WebLogHandler()
-    web_handler.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s'))
-    logger.addHandler(web_handler)
-
-# --- Bio Injector Logic ---
-_sym_db = _symbol_database.Default()
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\ndata.proto\"\xbb\x01\n\x04\x44\x61ta\x12\x0f\n\x07\x66ield_2\x18\x02 \x01(\x05\x12\x1e\n\x07\x66ield_5\x18\x05 \x01(\x0b\x32\r.EmptyMessage\x12\x1e\n\x07\x66ield_6\x18\x06 \x01(\x0b\x32\r.EmptyMessage\x12\x0f\n\x07\x66ield_8\x18\x08 \x01(\t\x12\x0f\n\x07\x66ield_9\x18\t \x01(\x05\x12\x1f\n\x08\x66ield_11\x18\x0b \x01(\x0b\x32\r.EmptyMessage\x12\x1f\n\x08\x66ield_12\x18\x0c \x01(\x0b\x32\r.EmptyMessage\"\x0e\n\x0c\x45mptyMessageb\x06proto3')
-_globals = globals()
-_builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
-_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'data1_pb2', _globals)
-
-Data = _sym_db.GetSymbol('Data')
-EmptyMessage = _sym_db.GetSymbol('EmptyMessage')
-
-BIO_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
-BIO_IV = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
-
-def get_region_url(region):
-    urls = {
-        "IND": "https://client.ind.freefiremobile.com",
-        "BR": "https://client.us.freefiremobile.com",
-        "US": "https://client.us.freefiremobile.com",
-        "SAC": "https://client.us.freefiremobile.com",
-        "NA": "https://client.us.freefiremobile.com",
-        "ME": "https://clientbp.common.ggbluefox.com",
-        "TH": "https://clientbp.common.ggbluefox.com"
-    }
-    return urls.get(region.upper(), "https://clientbp.ggblueshark.com")
-
-def get_account_from_eat(eat_token):
-    try:
-        if '?eat=' in eat_token:
-            eat_token = urllib.parse.parse_qs(urllib.parse.urlparse(eat_token).query).get('eat', [eat_token])[0]
-        elif '&eat=' in eat_token:
-            match = re.search(r'[?&]eat=([^&]+)', eat_token)
-            if match: eat_token = match.group(1)
-        
-        res = requests.get(f"https://eat-api.thory.buzz/api?eatjwt={eat_token}", timeout=15)
-        if res.status_code != 200: return None, None, f"API error: {res.status_code}"
-        d = res.json()
-        if d.get('status') != 'success': return None, None, d.get('message', 'Invalid token')
-        return d.get('token'), {"uid": d.get('uid'), "region": d.get('region', 'IND'), "nickname": d.get('nickname')}, None
-    except Exception as e: return None, None, str(e)
-
-def update_bio_with_jwt(jwt_token, bio_text, region):
-    try:
-        base_url = get_region_url(region)
-        data = Data()
-        data.field_2, data.field_8, data.field_9 = 17, bio_text.replace('+', ' '), 1
-        data.field_5.CopyFrom(EmptyMessage()); data.field_6.CopyFrom(EmptyMessage())
-        data.field_11.CopyFrom(EmptyMessage()); data.field_12.CopyFrom(EmptyMessage())
-        
-        cipher = AES.new(BIO_KEY, AES.MODE_CBC, BIO_IV)
-        encrypted = cipher.encrypt(pad(data.SerializeToString(), AES.block_size))
-        
-        host = "clientbp.ggblueshark.com"
-        if "ind" in base_url: host = "client.ind.freefiremobile.com"
-        elif "us" in base_url: host = "client.us.freefiremobile.com"
-        elif "common" in base_url: host = "clientbp.common.ggbluefox.com"
-
-        headers = {
-            "Authorization": f"Bearer {jwt_token}",
-            "ReleaseVersion": SITE_CONFIG.get('freefire_version', 'OB54'),
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-A305F Build/RP1A.200720.012)",
-            "Host": host,
-            "Connection": "Keep-Alive"
-        }
-        res = requests.post(f"{base_url}/UpdateSocialBasicInfo", headers=headers, data=encrypted, timeout=30)
-        return res.status_code == 200
-    except Exception as e: raise Exception(str(e))
-
-
-def init_db():
-    try:
-        conn = sqlite3.connect("app_config.db")
-        cursor = conn.cursor()
-        
-        # Create AppConfig table if not exists
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS AppConfig (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                version TEXT DEFAULT '1.1',
-                update_required BOOLEAN DEFAULT 0,
-                message TEXT DEFAULT 'Server is online',
-                telegram_url TEXT DEFAULT 'https://t.me/MissCodeX',
-                youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily',
-                apk_url TEXT DEFAULT '/uploads/MVCreatorPRO.apk'
-            )
-        """)
-        
-        # Check if table has rows, if not insert default row
-        cursor.execute("SELECT COUNT(*) FROM AppConfig")
-        if cursor.fetchone()[0] == 0:
-            cursor.execute("""
-                INSERT INTO AppConfig (version, update_required, message, telegram_url, youtube_url, apk_url)
-                VALUES ('1.1', 0, 'Server is online', 'https://t.me/MissCodeX', 'https://www.youtube.com/@MvFemily', '/uploads/MVCreatorPRO.apk')
-            """)
-            conn.commit()
-            
-        # Create Version table if not exists
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS Version (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                version TEXT DEFAULT '1.1',
-                update_required BOOLEAN DEFAULT 0,
-                message TEXT DEFAULT 'Server is online',
-                telegram_url TEXT DEFAULT 'https://t.me/MissCodeX',
-                youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily',
-                apk_url TEXT DEFAULT '/uploads/MVCreatorPRO.apk'
-            )
-        """)
-        
-        # Check if table has rows, if not insert default row
-        cursor.execute("SELECT COUNT(*) FROM Version")
-        if cursor.fetchone()[0] == 0:
-            cursor.execute("""
-                INSERT INTO Version (version, update_required, message, telegram_url, youtube_url, apk_url)
-                VALUES ('1.1', 0, 'Server is online', 'https://t.me/MissCodeX', 'https://www.youtube.com/@MvFemily', '/uploads/MVCreatorPRO.apk')
-            """)
-            conn.commit()
-            
-        # Ensure the columns telegram_url, youtube_url, and apk_url exist in both tables
-        for table_name in ["AppConfig", "Version"]:
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            columns = [col[1] for col in cursor.fetchall()]
-            if "telegram_url" not in columns:
-                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN telegram_url TEXT DEFAULT 'https://t.me/MissCodeX'")
-            if "youtube_url" not in columns:
-                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN youtube_url TEXT DEFAULT 'https://www.youtube.com/@MvFemily'")
-            if "apk_url" not in columns:
-                cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN apk_url TEXT DEFAULT '/uploads/MVCreatorPRO.apk'")
-            conn.commit()
-            
-        # Update existing records from old default URLs to new ones
-        for table_name in ["AppConfig", "Version"]:
-            cursor.execute(f"UPDATE {table_name} SET telegram_url = 'https://t.me/MissCodeX' WHERE telegram_url = 'https://t.me/blackapis' OR telegram_url IS NULL")
-            cursor.execute(f"UPDATE {table_name} SET youtube_url = 'https://www.youtube.com/@MvFemily' WHERE youtube_url = 'https://youtube.com/@harshmanjhi180' OR youtube_url IS NULL")
-            conn.commit()
-            
-        conn.close()
-    except Exception as e:
-        print(f"[DB] Error initializing database: {e}")
-
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/download/apk')
-def download_apk():
-    # Try to get the latest uploaded APK path from the database
-    apk_path = "MVCreatorPRO.apk"
-    try:
-        conn = sqlite3.connect("app_config.db")
-        cursor = conn.cursor()
-        
-        row = None
-        try:
-            cursor.execute("SELECT apk_url FROM AppConfig LIMIT 1")
-            row = cursor.fetchone()
-        except sqlite3.OperationalError:
-            pass
-            
-        if not row:
-            try:
-                cursor.execute("SELECT apk_url FROM Version LIMIT 1")
-                row = cursor.fetchone()
-            except sqlite3.OperationalError:
-                pass
-                
-        conn.close()
-        
-        if row and row[0]:
-            clean_path = row[0].lstrip('/')
-            if clean_path.startswith('uploads/'):
-                apk_path = clean_path
-    except Exception as e:
-        logging.error(f"[API] Error reading APK download path from DB: {e}")
-
-    if os.path.exists(apk_path):
-        try:
-            return send_file(os.path.abspath(apk_path), as_attachment=True)
-        except Exception as e:
-            return jsonify({"status": "error", "message": f"Error downloading APK: {e}"}), 500
-    else:
-        # Fallback to default in root directory
-        if os.path.exists("MVCreatorPRO.apk"):
-            try:
-                return send_file(os.path.abspath("MVCreatorPRO.apk"), as_attachment=True)
-            except Exception as e:
-                return jsonify({"status": "error", "message": f"Error downloading APK: {e}"}), 500
-                
-        return jsonify({
-            "status": "error", 
-            "message": f"APK file not found on the server ({apk_path}). Please upload update via admin panel."
-        }), 404
-
-@app.route('/api/version')
-def get_version():
-    version_val = "1.1"
-    update_required_val = False
-    message_val = "Server is online"
-    telegram_url_val = "https://t.me/MissCodeX"
-    youtube_url_val = "https://www.youtube.com/@MvFemily"
-    apk_url_val = "/uploads/MVCreatorPRO.apk"
+async def EnC_AEs(HeX):
+    cipher = AES.new(Key , AES.MODE_CBC , Iv)
+    return cipher.encrypt(pad(bytes.fromhex(HeX), AES.block_size)).hex()
     
-    try:
-        conn = sqlite3.connect("app_config.db")
-        cursor = conn.cursor()
-        
-        # Try fetching from AppConfig first, then fallback to Version
-        row = None
-        try:
-            cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url, apk_url FROM AppConfig LIMIT 1")
-            row = cursor.fetchone()
-        except sqlite3.OperationalError:
-            try:
-                cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url FROM AppConfig LIMIT 1")
-                row = cursor.fetchone()
-            except sqlite3.OperationalError:
-                pass
-            
-        if not row:
-            try:
-                cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url, apk_url FROM Version LIMIT 1")
-                row = cursor.fetchone()
-            except sqlite3.OperationalError:
-                try:
-                    cursor.execute("SELECT version, update_required, message, telegram_url, youtube_url FROM Version LIMIT 1")
-                    row = cursor.fetchone()
-                except sqlite3.OperationalError:
-                    pass
-                
-        conn.close()
-        
-        if row:
-            version_val = row[0]
-            update_required_val = bool(row[1])
-            message_val = row[2]
-            telegram_url_val = row[3]
-            youtube_url_val = row[4]
-            if len(row) > 5 and row[5]:
-                apk_url_val = row[5]
-    except Exception as e:
-        logging.error(f"[API] Error reading version from DB: {e}")
-        
-    scheme = "https" if request.is_secure or "herokuapp.com" in request.host else "http"
-    download_url = f"{scheme}://{request.host}{apk_url_val}"
+async def DEc_AEs(HeX):
+    cipher = AES.new(Key , AES.MODE_CBC , Iv)
+    return unpad(cipher.decrypt(bytes.fromhex(HeX)), AES.block_size).hex()
     
-    return jsonify({
-        "status": "success",
-        "version": version_val,
-        "update_required": update_required_val,
-        "message": message_val,
-        "telegram_url": telegram_url_val,
-        "youtube_url": youtube_url_val,
-        "download_url": download_url
-    })
-
-
-@app.route('/api/admin/verify_password', methods=['POST'])
-def verify_admin_password():
-    data = request.get_json(silent=True) or {}
-    password = data.get('password')
-    if password == ADMIN_PASSWORD:
-        return jsonify({"status": "success", "message": "Verification successful"})
-    return jsonify({"status": "error", "message": "Incorrect admin password. Access denied!"}), 401
-
-
-@app.route('/api/admin/upload_update', methods=['POST'])
-def upload_update():
-    # Extract other fields robustly
-    version = request.form.get('version') or request.args.get('version') or request.headers.get('version') or '1.1'
-    update_required_str = request.form.get('update_required') or request.args.get('update_required') or request.headers.get('update_required') or 'false'
-    message = request.form.get('message') or request.args.get('message') or request.headers.get('message') or ''
-    telegram_url = request.form.get('telegram_url') or request.args.get('telegram_url') or request.headers.get('telegram_url')
-    youtube_url = request.form.get('youtube_url') or request.args.get('youtube_url') or request.headers.get('youtube_url')
+async def EnC_PacKeT(HeX , K , V): 
+    return AES.new(K , AES.MODE_CBC , V).encrypt(pad(bytes.fromhex(HeX) ,16)).hex()
     
-    # Log the request structure for debugging
-    logging.info(f"[UPLOAD] Form fields: {list(request.form.keys())}")
-    logging.info(f"[UPLOAD] Query params: {list(request.args.keys())}")
-    logging.info(f"[UPLOAD] Headers: {list(request.headers.keys())}")
-    logging.info(f"[UPLOAD] Files: {list(request.files.keys())}")
-        
-    if 'file' not in request.files:
-        logging.warning("[UPLOAD] Upload failed: No APK file in request.")
-        return jsonify({"status": "error", "message": "No APK file uploaded"}), 400
-        
-    file = request.files['file']
-    if file.filename == '':
-        logging.warning("[UPLOAD] Upload failed: Empty filename.")
-        return jsonify({"status": "error", "message": "No selected file"}), 400
-        
-    os.makedirs('uploads', exist_ok=True)
-    filename = file.filename
-    file_path = os.path.join('uploads', filename)
-    file.save(file_path)
-    logging.info(f"[UPLOAD] Saved file to {file_path}")
-    
-    update_required = 1 if update_required_str.lower() == 'true' else 0
-    apk_url = f"/uploads/{filename}"
-    
-    try:
-        conn = sqlite3.connect("app_config.db")
-        cursor = conn.cursor()
-        
-        updates = [("version", version), ("update_required", update_required), ("message", message), ("apk_url", apk_url)]
-        if telegram_url:
-            updates.append(("telegram_url", telegram_url))
-        if youtube_url:
-            updates.append(("youtube_url", youtube_url))
-            
-        for table_name in ["AppConfig", "Version"]:
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-            if cursor.fetchone()[0] == 0:
-                cols = [u[0] for u in updates]
-                vals = [u[1] for u in updates]
-                placeholders = ", ".join(["?"] * len(vals))
-                col_names = ", ".join(cols)
-                cursor.execute(f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})", vals)
-            else:
-                set_clause = ", ".join([f"{u[0]} = ?" for u in updates])
-                vals = [u[1] for u in updates]
-                cursor.execute(f"UPDATE {table_name} SET {set_clause} WHERE id = (SELECT id FROM {table_name} LIMIT 1)", vals)
-                
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logging.error(f"[API] Error saving update to DB: {e}")
-        return jsonify({"status": "error", "message": f"Database save failed: {str(e)}"}), 500
-        
-    return jsonify({
-        "status": "success",
-        "message": f"Version {version} has been successfully published! Users will see the update popup instantly."
-    })
+async def DEc_PacKeT(HeX , K , V):
+    return unpad(AES.new(K , AES.MODE_CBC , V).decrypt(bytes.fromhex(HeX)) , 16).hex()  
 
+async def EnC_Uid(H , Tp):
+    e , H = [] , int(H)
+    while H:
+        e.append((H & 0x7F) | (0x80 if H > 0x7F else 0)) ; H >>= 7
+    return bytes(e).hex() if Tp == 'Uid' else None
 
-@app.route('/uploads/<path:filename>')
-def serve_uploads(filename):
-    return send_from_directory(os.path.join(os.getcwd(), 'uploads'), filename)
-
-
-@app.route('/api/verify-token', methods=['POST'])
-def verify_token():
-    try:
-        token = request.json.get('eat_token')
-        if not token: return jsonify({"success": False, "error": "Missing token"}), 400
-        jwt, acc, err = get_account_from_eat(token)
-        if err: return jsonify({"success": False, "error": err}), 400
-        return jsonify({"success": True, "account": acc, "jwt_token": jwt})
-    except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/update-bio', methods=['POST'])
-def update_bio():
-    try:
-        d = request.json
-        jwt, bio, reg = d.get('jwt_token'), d.get('bio'), d.get('region')
-        if not jwt or not bio: return jsonify({"success": False, "error": "Missing data"}), 400
-        if update_bio_with_jwt(jwt, bio, reg):
-            return jsonify({"success": True, "message": "Bio updated!"})
-        return jsonify({"success": False, "error": "Update failed"}), 400
-    except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route('/robots.txt')
-def robots():
-    return send_from_directory(os.getcwd(), 'robots.txt')
-
-@app.route('/googlec56e56af2571922d.html')
-def google_verify():
-    return send_from_directory(os.getcwd(), 'googlec56e56af2571922d.html')
-
-@app.route('/api/accounts', methods=['GET'])
-def get_accounts():
-    if not os.path.exists('bot.txt'):
-        return jsonify([])
-    with open('bot.txt', 'r') as f:
-        try:
-            data = json.load(f)
-            # If it's the old dict format, convert to list for consistency
-            if isinstance(data, dict):
-                data = [{"uid": k, "password": v} for k, v in data.items()]
-        except:
-            data = []
-    return jsonify(data)
-
-def log_reader(process, uid):
-    """Reads stdout from the spawned process and updates web logs and statuses"""
-    if uid not in bot_statuses:
-        bot_statuses[uid] = {"status": "Connecting...", "name": "Unknown", "last_update": time.time()}
-        
-    try:
-        # Read the stream line by line
-        for line in iter(process.stdout.readline, ''):
-            if not line: break
-            log_line = line.strip()
-            
-            # Update last_update timestamp to show bot is alive
-            bot_statuses[uid]["last_update"] = time.time()
-            
-            # Detect successful login/online status
-            if "NAJMI-M24 BOT - ONLINE" in log_line or "READY" in log_line or "Bot is now running" in log_line:
-                bot_statuses[uid]["status"] = "Online"
-                bot_statuses[uid]["last_update"] = time.time()
-            
-            if "Welcome," in log_line:
-                # Extract name: "👋 Welcome, PlayerName!"
-                parts = log_line.split("Welcome,")
-                if len(parts) > 1:
-                    name_part = parts[1].strip()
-                    # Remove exclamation marks or formatting
-                    name_part = name_part.replace("!", "").replace("[0m", "").strip()
-                    bot_statuses[uid]["name"] = name_part
-                    bot_statuses[uid]["status"] = "Online"
-                    
-            # elif "fatal error" in log_line or "Bad login" in log_line or ("Error" in log_line and "Invalid Account" in log_line):
-            #     # Auto-remove bad bots from bot.txt as requested
-            #     try:
-            #         if os.path.exists('bot.txt'):
-            #             with open('bot.txt', 'r') as f:
-            #                 data = json.load(f)
-            #             if uid in data:
-            #                 del data[uid]
-            #                 with open('bot.txt', 'w') as f:
-            #                     json.dump(data, f, indent=4)
-            #                 client_logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - [SYSTEM] - Removed invalid bot {uid} from bot.txt")
-            #     except Exception as e:
-            #         pass
-            elif "Error" in log_line or "Failed" in log_line:
-                # Some errors don't crash the bot, but we can log them
-                pass
-                
-            formatted_log = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - [{uid}] - {log_line}"
-            client_logs.append(formatted_log)
-            if len(client_logs) > 500:
-                client_logs.pop(0)
-    except Exception as e:
-        client_logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - [{uid}] - ERROR reading process output: {e}")
-    finally:
-        if uid in bot_statuses:
-            bot_statuses[uid]["status"] = "Offline"
-            bot_statuses[uid]["last_update"] = time.time()
-        process.stdout.close()
-
-@app.route('/api/bots_status', methods=['GET'])
-def bots_status():
-    if not os.path.exists('bot.txt'):
-        return jsonify({"summary": {"total": 0, "online": 0, "offline": 0}, "bots": []})
-    
-    with open('bot.txt', 'r') as f:
-        try:
-            stored_data = json.load(f)
-            if isinstance(stored_data, dict):
-                stored_bots = [{"uid": k, "password": v} for k, v in stored_data.items()]
-            else:
-                stored_bots = stored_data
-        except:
-            stored_bots = []
-            
-    logging.warning(f"[DEBUG] active_clients keys: {list(active_clients.keys())}")
-    for u, p in active_clients.items():
-        logging.warning(f"[DEBUG] bot {u} poll: {p.poll()} pid: {p.pid}")
-        
-    bot_list = []
-    online_count = 0
-    offline_count = 0
-    
-    for bot_obj in stored_bots:
-        uid = str(bot_obj.get('uid'))
-        if uid in active_clients:
-            proc = active_clients[uid]
-            if proc.poll() is None:
-                # Running
-                status_info = bot_statuses.get(uid, {"status": "Connecting...", "name": "Unknown"})
-                is_online = status_info.get("status") == "Online"
-                if is_online: online_count += 1
-                else: offline_count += 1
-                
-                bot_list.append({
-                    "uid": uid,
-                    "name": status_info.get("name", "Unknown"),
-                    "status": status_info.get("status", "Unknown"),
-                    "pid": proc.pid
-                })
-            else:
-                # Dead
-                offline_count += 1
-                bot_list.append({
-                    "uid": uid,
-                    "name": "Crashed",
-                    "status": "Offline",
-                    "pid": None
-                })
-        else:
-            offline_count += 1
-            bot_list.append({
-                "uid": uid,
-                "name": "Offline",
-                "status": "Offline",
-                "pid": None
-            })
-            
-    return jsonify({
-        "summary": {
-            "total": len(stored_bots),
-            "online": online_count,
-            "offline": offline_count
-        },
-        "bots": bot_list
-    })
-
-@app.route('/api/accounts', methods=['POST'])
-def add_account():
-    req = request.json
-    uid = req.get('uid')
-    pwd = req.get('password')
-    data = []
-    if os.path.exists('bot.txt'):
-        with open('bot.txt', 'r') as f:
-            try:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    data = [{"uid": k, "password": v} for k, v in data.items()]
-            except:
-                pass
-    
-    # Check if already exists
-    exists = False
-    for item in data:
-        if str(item['uid']) == str(uid):
-            item['password'] = pwd
-            exists = True
-            break
-    
-    if not exists:
-        data.append({"uid": uid, "password": pwd})
-        
-    with open('bot.txt', 'w') as f:
-        json.dump(data, f, indent=4)
-    return jsonify({"status": "success", "message": "Account added."})
-
-def logic_start_bots():
-    if not os.path.exists('bot.txt'):
-        return 0, "No accounts found."
-    with open('bot.txt', 'r') as f:
-        try:
-            stored_data = json.load(f)
-            if isinstance(stored_data, dict):
-                data_list = [{"uid": k, "password": v} for k, v in stored_data.items()]
-            else:
-                data_list = stored_data
-        except:
-            return 0, "Error loading bot.txt"
-    
-    started = 0
-    running_count = len([u for u, p in active_clients.items() if p.poll() is None])
-    started = 0
-    running_count = len([u for u, p in active_clients.items() if p.poll() is None])
-    
-    # ONLY start the bots for the current rotation
-    targets = []
-    for i in range(MAX_BOT_LIMIT):
-        idx = (current_rotation_index + i) % len(data_list)
-        targets.append(data_list[idx])
-        
-    for bot_obj in targets:
-        uid = str(bot_obj.get('uid'))
-        pwd = bot_obj.get('password')
-        
-        if uid not in active_clients or active_clients[uid].poll() is not None:
-            if running_count >= MAX_BOT_LIMIT:
-                # If we have excess bots (from a previous setting), kill the oldest one
-                running_uids = [u for u, p in active_clients.items() if p.poll() is None]
-                if running_uids:
-                    oldest_uid = running_uids[0]
-                    logging.info(f"[SYSTEM] Killing excess bot {oldest_uid} to respect limit.")
-                    try:
-                        active_clients[oldest_uid].terminate()
-                    except: pass
-                    running_count -= 1
-
-            try:
-                cmd = [sys.executable, "main.py", str(uid), str(pwd)]
-                env = os.environ.copy()
-                env["PYTHONUNBUFFERED"] = "1"
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, env=env
-                )
-                active_clients[uid] = proc
-                threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
-                started += 1
-                running_count += 1
-                time.sleep(2)
-            except Exception as e:
-                logging.error(f"Failed to start bot {uid}: {e}")
-                
-    return started, "Success"
-
-@app.route('/api/start_bots', methods=['POST'])
-def start_bots():
-    started, msg = logic_start_bots()
-    if msg == "No accounts found.":
-        return jsonify({"status": "error", "message": msg}), 400
-    return jsonify({"status": "success", "message": f"{started} bots started."})
-
-@app.route('/api/start_specific_bots', methods=['POST'])
-def start_specific_bots():
-    uids = request.json.get('uids', [])
-    if not uids:
-        return jsonify({"status": "error", "message": "No UIDs provided"}), 400
-        
-    if not os.path.exists('bot.txt'):
-        return jsonify({"status": "error", "message": "No accounts found."}), 400
-        
-    with open('bot.txt', 'r') as f:
-        try:
-            stored_data = json.load(f)
-            if isinstance(stored_data, dict):
-                data_dict = stored_data
-            else:
-                data_dict = {str(item.get('uid')): item.get('password') for item in stored_data}
-        except Exception as e:
-            return jsonify({"status": "error", "message": f"Error loading bot.txt: {e}"}), 400
-    
-    started = 0
-    running_count = len([u for u, p in active_clients.items() if p.poll() is None])
-
-    for uid in uids:
-        if running_count >= MAX_BOT_LIMIT:
-            oldest_uid = next(iter(active_clients))
-            active_clients[oldest_uid].terminate()
-            running_count -= 1
-            
-        uid = str(uid)
-        pwd = data_dict.get(uid)
-        if pwd:
-            if uid not in active_clients or active_clients[uid].poll() is not None:
-                try:
-                    cmd = [sys.executable, "main.py", str(uid), str(pwd)]
-                    env = os.environ.copy()
-                    env["PYTHONUNBUFFERED"] = "1"
-                    
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                        env=env
-                    )
-                    
-                    active_clients[uid] = proc
-                    log_thread = threading.Thread(target=log_reader, args=(proc, uid))
-                    log_thread.daemon = True
-                    log_thread.start()
-                    
-                    started += 1
-                    time.sleep(1)
-                except Exception as e:
-                    logging.error(f"Failed to start bot {uid}: {e}")
-                    
-    return jsonify({"status": "success", "message": f"{started} bots started."})
-ipc_lock = threading.Lock()
-
-def send_ipc_command(uid, command):
-    port_file = f".ipc/{uid}.port"
-    if not os.path.exists(port_file): 
-        logging.error(f"[IPC] Port file missing for {uid}")
-        return None
-    with ipc_lock:
-        try:
-            with open(port_file, "r") as f:
-                port = int(f.read().strip())
-            import socket
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(10.0)
-                logging.info(f"[IPC] Connecting to {uid} on port {port}...")
-                s.connect(('127.0.0.1', port))
-                logging.info(f"[IPC] Sending command: {command}")
-                s.sendall((command + "\n").encode())
-                resp = s.recv(1024).decode().strip()
-                logging.info(f"[IPC] Received response: '{resp}'")
-                return resp
-        except Exception as e:
-            logging.error(f"[IPC] Error sending {command} to {uid}: {e}")
-            return None
-
-@app.route('/api/player_stats/<uid>')
-def player_stats(uid):
-    # 1. Try to get general info from external API
-    general_info = {}
-    try:
-        api_url = f"https://info-api-mg24-pro.vercel.app/get?uid={uid}"
-        res = requests.get(api_url, timeout=5)
-        if res.status_code == 200:
-            general_info = res.json()
-    except Exception as e:
-        logging.error(f"External API error for {uid}: {e}")
-
-    # 2. Get real-time status from bot via IPC
-    real_time_status = {}
-    # Use the first active bot to check status
-    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
-    if active_uids:
-        bot_uid = active_uids[0]
-        resp = send_ipc_command(bot_uid, f"GET_STATS {uid}")
-        if resp and resp.startswith('{'):
-            try:
-                real_time_status = json.loads(resp)
-            except:
-                pass
-    
-    return jsonify({
-        "uid": uid,
-        "general": general_info,
-        "real_time": real_time_status
-    })
-
-def send_ipc_to_target_or_free_bot(command, target_bot_uid=None):
-    """
-    Routes IPC commands to a specific bot (if targeted by session_id) 
-    or iterates through active online bots to find an available (unlocked) bot.
-    """
-    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
-    if not active_uids:
-        return None, "ERROR: No active bots connected"
-
-    # 1. Target specific bot if target_bot_uid is provided (e.g. from LOCK_<bot_uid>_<hash>)
-    if target_bot_uid and str(target_bot_uid) in active_uids:
-        resp = send_ipc_command(str(target_bot_uid), command)
-        return str(target_bot_uid), resp
-
-    # 2. Otherwise iterate active_uids to find an available (unlocked) bot
-    last_err = None
-    for bot_uid in active_uids:
-        resp = send_ipc_command(bot_uid, command)
-        if resp:
-            if "SUCCESS" in resp or "OK" in resp:
-                return bot_uid, resp
-            elif "ERROR" in resp:
-                err_text = resp.split("ERROR: ")[-1].strip() if "ERROR: " in resp else resp
-                # Check for any locked / busy / failed error message
-                err_lower = err_text.lower()
-                if any(k in err_lower for k in ["locked", "busy", "failed", "cannot", "timeout", "error"]):
-                    last_err = err_text
-                    logging.info(f"[ROUTING] Bot {bot_uid} is unavailable ({err_text}). Trying next free bot...")
-                    continue
-                else:
-                    return bot_uid, resp
-        else:
-            logging.info(f"[ROUTING] Bot {bot_uid} did not respond via IPC. Trying next free bot...")
-
-    return None, f"ERROR: {last_err or 'All online bots are currently busy/locked in squads'}"
-
-@app.route('/api/group_exploit', methods=['POST'])
-def group_exploit():
-    uid = request.json.get('uid')
-    slot = request.json.get('slot', 5)
-    if not uid:
-        return jsonify({"status": "error", "message": "UID required"}), 400
-        
-    bot_uid, resp = send_ipc_to_target_or_free_bot(f"GROUP_EXPLOIT {uid} {slot}")
-    if resp and "SUCCESS" in resp:
-        exploit_history.insert(0, {
-            "uid": uid,
-            "slot": slot,
-            "time": time.strftime("%H:%M:%S"),
-            "status": "Success"
-        })
-        if len(exploit_history) > 20: exploit_history.pop()
-        return jsonify({"status": "success", "message": "Exploit sequence initiated.", "bot_uid": bot_uid})
-    else:
-        err_msg = resp.split("ERROR: ")[-1].strip() if resp and "ERROR: " in resp else (resp or "All online bots are busy")
-        return jsonify({"status": "error", "message": err_msg}), 400
-
-@app.route('/api/exploit_logs')
-def get_exploit_logs():
-    return jsonify(exploit_history)
-
-@app.route('/api/send_bot_command', methods=['POST'])
-def send_bot_command():
-    data = request.json or {}
-    cmd_type = data.get('type')
-    payload = data.get('payload', '')
-    
-    type_map = {
-        "invite": "INVITE",
-        "like": "LIKE",
-        "check_ban": "CHECK_BAN",
-        "kick": "KICK",
-        "room_msg": "ROOM_MSG",
-        "fast_emote": "FAST_EMOTE"
-    }
-    
-    ipc_cmd = type_map.get(cmd_type)
-    if not ipc_cmd:
-        return jsonify({"status": "error", "message": "Invalid command type"}), 400
-
-    bot_uid, resp = send_ipc_to_target_or_free_bot(f"{ipc_cmd} {payload}")
-    if resp and "SUCCESS" in resp:
-        return jsonify({"status": "success", "message": resp.split("SUCCESS: ")[-1], "bot_uid": bot_uid})
-    else:
-        err_msg = resp.split("ERROR: ")[-1].strip() if resp and "ERROR: " in resp else (resp or "Failed to execute command")
-        return jsonify({"status": "error", "message": err_msg}), 400
-
-@app.route('/api/fast_emote', methods=['POST'])
-def fast_emote():
-    data = request.json or {}
-    team_code = data.get('team_code')
-    session_id = data.get('session_id')
-    uids = data.get('uids')
-    emote_id = data.get('emote_id')
-    mode = data.get('mode')
-    if not mode:
-        mode = "lock" if session_id else "quit"
-    
-    target_identifier = session_id or team_code
-    if not target_identifier or not uids or not emote_id:
-        return jsonify({"status": "error", "message": "Missing team_code/session_id, uids, or emote_id"}), 400
-        
-    if isinstance(uids, list):
-        uids_str = ",".join([str(u) for u in uids])
-    else:
-        uids_str = str(uids)
-
-    # If session_id format is LOCK_<bot_uid>_<hash>, extract targeted bot_uid
-    target_bot_uid = None
-    if session_id and "_" in str(session_id):
-        parts = str(session_id).split("_")
-        if len(parts) >= 3:
-            target_bot_uid = parts[1]
-
-    bot_uid, resp = send_ipc_to_target_or_free_bot(
-        f"FAST_EMOTE {target_identifier} {uids_str} {emote_id} {mode}",
-        target_bot_uid=target_bot_uid
-    )
-
-    if resp and "SUCCESS" in resp:
-        res_str = resp.split("SUCCESS: ")[-1].strip()
-        try:
-            res_dict = json.loads(res_str)
-            res_dict["bot_uid"] = bot_uid
-            return jsonify(res_dict)
-        except Exception:
-            return jsonify({"status": "success", "message": res_str, "bot_uid": bot_uid})
-    else:
-        err_msg = resp.split("ERROR: ")[-1].strip() if resp and "ERROR: " in resp else (resp or "Failed to execute fast emote")
-        return jsonify({"status": "error", "message": err_msg}), 400
-
-@app.route('/api/create_squad', methods=['POST'])
-def create_squad():
-    squad_file = ".ipc/latest_squad.txt"
-    if os.path.exists(squad_file):
-        try:
-            os.remove(squad_file)
-        except:
-            pass
-
-    bot_uid, resp = send_ipc_to_target_or_free_bot("CREATE_SQUAD")
-    if resp and "OK" in resp:
-        for _ in range(30):
-            if os.path.exists(squad_file):
-                try:
-                    with open(squad_file, "r") as f:
-                        team_code = f.read().strip()
-                    return jsonify({"status": "success", "team_code": team_code, "bot_uid": bot_uid})
-                except Exception as e:
-                    print(f" Error reading squad file: {e}")
-            time.sleep(0.1)
-        return jsonify({"status": "error", "message": "Timed out waiting for team code"}), 500
-    else:
-        err_msg = resp.split("ERROR: ")[-1].strip() if resp and "ERROR: " in resp else (resp or "All online bots are busy")
-        return jsonify({"status": "error", "message": err_msg}), 500
-
-@app.route('/api/generate_group', methods=['POST'])
-def generate_group():
-    try:
-        req = request.json
-        count = req.get('count', 5)
-        name_prefix = req.get('name', 'BlackApis')
-        pwd_prefix = req.get('password_prefix', 'FF')
-        
-        accounts = []
-        api_url = f"https://gen-by-black-api.vercel.app/generate?name={name_prefix}&password_prefix={pwd_prefix}"
-        
-        for i in range(count):
-            try:
-                res = requests.get(api_url, timeout=30)
-                if res.status_code == 200:
-                    data = res.json()
-                    if data.get("success"):
-                        accounts.append({
-                            "uid": data.get("uid"),
-                            "password": data.get("password"),
-                            "name": data.get("name")
-                        })
-                time.sleep(0.5) # Avoid spamming the API too fast
-            except Exception as e:
-                logging.error(f"Error generating account {i}: {e}")
-        
-        return jsonify({"status": "success", "accounts": accounts})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/api/save_group', methods=['POST'])
-def save_group():
-    try:
-        accounts = request.json.get('accounts', [])
-        if not accounts:
-            return jsonify({"status": "error", "message": "No accounts provided"}), 400
-            
-        # Add to bot.txt
-        data = {}
-        if os.path.exists('bot.txt'):
-            with open('bot.txt', 'r') as f:
-                try:
-                    data = json.load(f)
-                except:
-                    pass
-        
-        for acc in accounts:
-            uid = str(acc.get('uid'))
-            pwd = acc.get('password')
-            if uid and pwd:
-                # Update if exists, else append
-                found = False
-                for existing in data:
-                    if str(existing.get('uid')) == uid:
-                        existing['password'] = pwd
-                        found = True
-                        break
-                if not found:
-                    data.append({"uid": uid, "password": pwd})
-                
-        with open('bot.txt', 'w') as f:
-            json.dump(data, f, indent=4)
-            
-        return jsonify({"status": "success", "message": f"{len(accounts)} accounts saved to bot.txt"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/api/logs')
-def stream_logs():
-    def generate():
-        last_idx = 0
-        while True:
-            if last_idx < len(client_logs):
-                # Using a snapshot copy to avoid concurrency issues during iteration
-                new_logs = client_logs[last_idx:]
-                for log in new_logs:
-                    # Sanitize log for SSE data format (no newlines in a single data block unless formatted)
-                    clean_log = log.replace('\n', ' ')
-                    yield f"data: {clean_log}\n\n"
-                last_idx += len(new_logs)
-            time.sleep(0.5)
-    return Response(generate(), mimetype='text/event-stream')
-
-def auto_start_bots():
-    """Wait for server to settle then trigger bot startup"""
-    time.sleep(2)
-    print("[SYSTEM] Auto-starting bots on boot...")
-    res = logic_start_bots()
-    print(f"[SYSTEM] Bot startup result: {res}")
-
-# Startup initialization for production (Gunicorn)
-if os.environ.get('PORT'):
-    # In production, ensure we only start bots once
-    print("[HEROKU] Production environment detected. Initializing bots...")
-    threading.Thread(target=auto_start_bots, daemon=True).start()
-
-def bot_monitor_loop():
-    """Background thread to rotate and monitor bots"""
-    global last_rotation_time, current_rotation_index
+async def EnC_Vr(N):
+    if N < 0: ''
+    H = []
     while True:
-        try:
-            # 1. Check if it's time to rotate
-            now = time.time()
-            is_rotation_time = (now - last_rotation_time) >= BOT_ROTATION_INTERVAL
-            
-            # 2. Load accounts
-            try:
-                with open('bot.txt', 'r') as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
-                        data_list = [{"uid": k, "password": v} for k, v in data.items()]
-                    else:
-                        data_list = data
-            except Exception as e:
-                logging.error(f"[MONITOR] Error reading bot.txt: {e}")
-                time.sleep(10)
-                continue
-
-            # 3. Handle Rotation Logic
-            if is_rotation_time or not active_clients:
-                if is_rotation_time:
-                    logging.info("[MONITOR] Rotation time reached. Stopping current bots...")
-                    # Kill everyone
-                    for uid in list(active_clients.keys()):
-                        proc = active_clients.get(uid)
-                        if proc and proc.poll() is None:
-                            try:
-                                if os.name == 'nt': subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
-                                else: proc.terminate()
-                            except: pass
-                    active_clients.clear()
-                    bot_statuses.clear()
-                    
-                    # Update index for next 2 bots
-                    current_rotation_index = (current_rotation_index + MAX_BOT_LIMIT) % len(data_list)
-                    last_rotation_time = now
-                
-                # Pick the 2 bots based on current index
-                targets = []
-                for i in range(MAX_BOT_LIMIT):
-                    idx = (current_rotation_index + i) % len(data_list)
-                    targets.append(data_list[idx])
-                
-                # Start them
-                for bot_obj in targets:
-                    uid = str(bot_obj.get('uid'))
-                    pwd = bot_obj.get('password')
-                    if uid not in active_clients or active_clients[uid].poll() is not None:
-                        logging.info(f"[MONITOR] Starting bot {uid} (Rotation)...")
-                        cmd = [sys.executable, "main.py", str(uid), str(pwd)]
-                        env = os.environ.copy()
-                        env["PYTHONUNBUFFERED"] = "1"
-                        proc = subprocess.Popen(
-                            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, env=env
-                        )
-                        active_clients[uid] = proc
-                        threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
-                        time.sleep(5) # Stagger
-            
-            # 4. Health Check & Auto-Restart (for the current rotation)
-            running_uids = [u for u, p in active_clients.items() if p.poll() is None]
-            
-            # If any of the 2 target bots are not running, start them
-            current_targets = []
-            for i in range(MAX_BOT_LIMIT):
-                idx = (current_rotation_index + i) % len(data_list)
-                current_targets.append(data_list[idx])
-            
-            for bot_obj in current_targets:
-                uid = str(bot_obj.get('uid'))
-                pwd = bot_obj.get('password')
-                
-                # Check if it's stalled
-                status_info = bot_statuses.get(uid, {})
-                if uid in active_clients and active_clients[uid].poll() is None:
-                    if status_info.get("status") != "Online" and (time.time() - status_info.get("last_update", 0) > 300):
-                        logging.warning(f"[MONITOR] Bot {uid} stalled. Killing...")
-                        proc = active_clients[uid]
-                        try:
-                            if os.name == 'nt': subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
-                            else: proc.terminate()
-                        except: pass
-                
-                # Restart if dead or just killed
-                if uid not in active_clients or active_clients[uid].poll() is not None:
-                    logging.info(f"[MONITOR] Restarting bot {uid} (Maintain Shift)...")
-                    cmd = [sys.executable, "main.py", str(uid), str(pwd)]
-                    env = os.environ.copy()
-                    env["PYTHONUNBUFFERED"] = "1"
-                    proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1, env=env
-                    )
-                    active_clients[uid] = proc
-                    threading.Thread(target=log_reader, args=(proc, uid), daemon=True).start()
-                    time.sleep(2)
-
-        except Exception as e:
-            logging.error(f"[MONITOR] Loop error: {e}")
-        time.sleep(30) # Check every 30 seconds
-
-@app.route('/api/get_all_logs')
-def get_all_logs():
-    return jsonify(client_logs)
-
-@app.route('/api/allstats', methods=['GET'])
-@app.route('/allstats', methods=['GET'])
-def get_all_stats():
-    """
-    Returns comprehensive system status, running processes, and active bot stats.
-    Supports multi-user concurrency monitoring and real-time bot state inspection.
-    """
-    import psutil
-    import datetime
+        BesTo = N & 0x7F ; N >>= 7
+        if N: BesTo |= 0x80
+        H.append(BesTo)
+        if not N: break
+    return bytes(H)
     
-    # 1. System Info
-    cpu_percent = psutil.cpu_percent(interval=0.1)
-    memory = psutil.virtual_memory()
-    disk = psutil.disk_usage('/') if os.name != 'nt' else psutil.disk_usage('C:\\')
+def DEc_Uid(H):
+    n = s = 0
+    for b in bytes.fromhex(H):
+        n |= (b & 0x7F) << s
+        if not b & 0x80: break
+        s += 7
+    return n
     
-    # 2. Active bots inspection
-    active_uids = [u for u in active_clients.keys() if active_clients[u].poll() is None]
-    bot_details = []
-    locked_bots_count = 0
-    free_bots_count = 0
+async def CrEaTe_VarianT(field_number, value):
+    field_header = (field_number << 3) | 0
+    return await EnC_Vr(field_header) + await EnC_Vr(value)
+
+async def CrEaTe_LenGTh(field_number, value):
+    field_header = (field_number << 3) | 2
+    encoded_value = value.encode() if isinstance(value, str) else value
+    return await EnC_Vr(field_header) + await EnC_Vr(len(encoded_value)) + encoded_value
+
+async def CrEaTe_ProTo(fields):
+    packet = bytearray()
+    for field, value in fields.items():
+        if isinstance(value, dict):
+            nested_packet = await CrEaTe_ProTo(value)  #  await
+            packet.extend(await CrEaTe_LenGTh(field, nested_packet))
+        elif isinstance(value, int):
+            packet.extend(await CrEaTe_VarianT(field, value))
+        elif isinstance(value, str) or isinstance(value, bytes):
+            packet.extend(await CrEaTe_LenGTh(field, value))
+    return packet
     
-    for uid, proc in list(active_clients.items()):
-        is_running = proc.poll() is None
-        proc_memory_mb = 0
-        proc_cpu_percent = 0
-        if is_running:
-            try:
-                p = psutil.Process(proc.pid)
-                proc_memory_mb = round(p.memory_info().rss / (1024 * 1024), 2)
-                proc_cpu_percent = p.cpu_percent(interval=0.05)
-            except Exception:
-                pass
+async def DecodE_HeX(H):
+    R = hex(H) 
+    F = str(R)[2:]
+    if len(F) == 1: F = "0" + F ; return F
+    else: return F
 
-        bot_info = {
-            "uid": uid,
-            "status": "ONLINE" if is_running else "OFFLINE",
-            "pid": proc.pid if is_running else None,
-            "memory_mb": proc_memory_mb,
-            "cpu_percent": proc_cpu_percent,
-            "is_locked": False,
-            "lock_session_id": None,
-            "squad_member_count": 0,
-            "insquad": False,
-            "real_time_status": None
-        }
+async def Fix_PackEt(parsed_results):
+    result_dict = {}
+    for result in parsed_results:
+        field_data = {}
+        field_data['wire_type'] = result.wire_type
+        if result.wire_type == "varint":
+            field_data['data'] = result.data
+        if result.wire_type == "string":
+            field_data['data'] = result.data
+        if result.wire_type == "bytes":
+            field_data['data'] = result.data
+        elif result.wire_type == 'length_delimited':
+            field_data["data"] = await Fix_PackEt(result.data.results)
+        result_dict[result.field] = field_data
+    return result_dict
 
-        # Query IPC GET_BOT_STATUS if online
-        if is_running:
-            raw_resp = send_ipc_command(uid, "GET_BOT_STATUS")
-            if raw_resp and "SUCCESS: " in raw_resp:
-                try:
-                    status_json_str = raw_resp.split("SUCCESS: ")[-1].strip()
-                    parsed_bot_status = json.loads(status_json_str)
-                    bot_info["real_time_status"] = parsed_bot_status
-                    bot_info["is_locked"] = parsed_bot_status.get("is_locked", False)
-                    bot_info["lock_session_id"] = parsed_bot_status.get("lock_session_id")
-                    bot_info["insquad"] = parsed_bot_status.get("insquad", False)
-                    bot_info["squad_member_count"] = parsed_bot_status.get("squad_member_count", 0)
-                    bot_info["lock_info"] = parsed_bot_status.get("lock_info")
-                except Exception as ex:
-                    logging.error(f"Error parsing bot status for {uid}: {ex}")
-
-        if is_running:
-            if bot_info["is_locked"]:
-                locked_bots_count += 1
-            else:
-                free_bots_count += 1
-
-        bot_details.append(bot_info)
-
-    # 3. Overall server processes breakdown
-    python_processes = []
+async def DeCode_PackEt(input_text):
     try:
-        for p in psutil.process_iter(['pid', 'name', 'cmdline', 'memory_info', 'cpu_percent']):
-            try:
-                cmd = " ".join(p.info['cmdline'] or [])
-                if 'python' in (p.info['name'] or '').lower() or 'main.py' in cmd or 'web.py' in cmd:
-                    python_processes.append({
-                        "pid": p.info['pid'],
-                        "name": p.info['name'],
-                        "cmdline": cmd,
-                        "memory_mb": round((p.info['memory_info'].rss if p.info['memory_info'] else 0) / (1024 * 1024), 2),
-                        "cpu_percent": p.info['cpu_percent']
-                    })
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
+        parsed_results = Parser().parse(input_text)
+        parsed_results_objects = parsed_results
+        parsed_results_dict = await Fix_PackEt(parsed_results_objects)
+        json_data = json.dumps(parsed_results_dict)
+        return json_data
     except Exception as e:
-        logging.error(f"Error reading process list: {e}")
+        print(f"error {e}")
+        return None
+                      
+def xMsGFixinG(n):
+    return ''.join(str(n)[i:i + 3] for i in range(0 , len(str(n)) , 3))
+    
+async def Ua():
+    versions = [
+        '4.0.18P6', '4.0.19P7', '4.0.20P1', '4.1.0P3', '4.1.5P2', '4.2.1P8',
+        '4.2.3P1', '5.0.1B2', '5.0.2P4', '5.1.0P1', '5.2.0B1', '5.2.5P3',
+        '5.3.0B1', '5.3.2P2', '5.4.0P1', '5.4.3B2', '5.5.0P1', '5.5.2P3'
+    ]
+    models = [
+        'SM-A125F', 'SM-A225F', 'SM-A325M', 'SM-A515F', 'SM-A725F', 'SM-M215F', 'SM-M325FV',
+        'Redmi 9A', 'Redmi 9C', 'POCO M3', 'POCO M4 Pro', 'RMX2185', 'RMX3085',
+        'moto g(9) play', 'CPH2239', 'V2027', 'OnePlus Nord', 'ASUS_Z01QD',
+    ]
+    android_versions = ['9', '10', '11', '12', '13', '14']
+    languages = ['en-US', 'es-MX', 'pt-BR', 'id-ID', 'ru-RU', 'hi-IN']
+    countries = ['USA', 'MEX', 'BRA', 'IDN', 'RUS', 'IND']
+    version = random.choice(versions)
+    model = random.choice(models)
+    android = random.choice(android_versions)
+    lang = random.choice(languages)
+    country = random.choice(countries)
+    return f"GarenaMSDK/{version}({model};Android {android};{lang};{country};)"
+    
+async def ArA_CoLor():
+    Tp = ["32CD32" , "00BFFF" , "00FA9A" , "90EE90" , "FF4500" , "FF6347" , "FF69B4" , "FF8C00" , "FF6347" , "FFD700" , "FFDAB9" , "F0F0F0" , "F0E68C" , "D3D3D3" , "A9A9A9" , "D2691E" , "CD853F" , "BC8F8F" , "6A5ACD" , "483D8B" , "4682B4", "9370DB" , "C71585" , "FF8C00" , "FFA07A"]
+    return random.choice(Tp)
+    
+async def xBunnEr():
+    bN = [902048021]
+    return random.choice(bN)
 
-    server_stats = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "status": "ONLINE",
-        "system": {
-            "cpu_percent": cpu_percent,
-            "memory": {
-                "total_mb": round(memory.total / (1024 * 1024), 2),
-                "available_mb": round(memory.available / (1024 * 1024), 2),
-                "used_mb": round(memory.used / (1024 * 1024), 2),
-                "percent": memory.percent
+async def send_room_chat_enhanced(Msg, room_id, key, iv, region):
+    """Send room chat message using leaked packet structure"""
+    fields = {
+        1: 1,
+        2: {
+            1: 9280892890,  # Sender UID (from leaked packet)
+            2: int(room_id),
+            3: 3,  # Chat type 3 = room chat
+            4: f"[{await ArA_CoLor()}]{Msg}",  # Message with color
+            5: int(datetime.now().timestamp()),  # Current timestamp
+            7: 2,
+            9: {
+                1: "RIJEXX",  # Your bot name
+                2: int(await xBunnEr()),  # Avatar from your system
+                4: 228,  # Rank/level from leaked packet
+                7: 1,    # Unknown
             },
-            "disk": {
-                "total_gb": round(disk.total / (1024 * 1024 * 1024), 2),
-                "free_gb": round(disk.free / (1024 * 1024 * 1024), 2),
-                "percent": disk.percent
+            10: "en",  # Changed from "ar" to "en"
+            13: {2: 1, 3: 1},
+        },
+    }
+    
+    # Generate packet using your existing system
+    packet = (await CrEaTe_ProTo(fields)).hex()
+    
+    # Use 1215 packet type for chat messages (like your existing system)
+    return await GeneRaTePk(packet, '1215', key, iv)
+
+async def xSEndMsg(Msg , Tp , Tp2 , id , K , V):
+    feilds = {1: id , 2: Tp2 , 3: Tp, 4: Msg, 5: 1735129800, 7: 2, 9: {1: "[FFFFFF]BLACK", 2: int(await xBunnEr()), 3: 901048020, 4: 330, 5: 1001000001, 8: "xBesTo - C4", 10: 1, 11: 1, 13: {1: 2}, 14: {1: 12484827014, 2: 8, 3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"}, 12: 0}, 10: "en", 13: {3: 1}}    
+    Pk = (await CrEaTe_ProTo(feilds)).hex()
+    Pk = "080112" + await EnC_Uid(len(Pk) // 2, Tp='Uid') + Pk
+    return await GeneRaTePk(Pk, '1201', K, V)
+    
+async def xSEndMsgsQ(Msg , id , K , V, region="BD"):
+    """Send message with region 1 title included"""
+    
+    # Get random avatar
+    avatar = await xBunnEr()
+    
+    fields = {
+        1: id, 
+        2: id, 
+        4: Msg, 
+        5: 1756580149, 
+        7: 2, 
+        8: 904990072, 
+        9: {
+            1: "[FFFFFF]BLACK",
+            2: avatar, 
+            3: 2,
+            4: 329, 
+            5: 1001000001, 
+            6: 66,
+            7: 66,
+            8: "xBe4!sTo - C4", 
+            9: 66,
+            10: 66, 
+            11: 66, 
+            12: 66,
+            13: {1: 68, 2:67}, 
+            14: {
+                1: 1158053040, 
+                2: 8, 
+                3: b"\x10\x15\x08\x0A\x0B\x15\x0C\x0F\x11\x04\x07\x02\x03\x0D\x0E\x12\x01\x05\x06"
+            }
+        }, 
+        10: "en", 
+        13: {66: 66, 66: 66},
+        # ADD REGION 1 TITLE HERE (from second packet field 14)
+        14: {
+            11: {
+                1: 3,          # Field 1
+                2: 7,                              # Field 2  
+                3: 170,         # Field 3
+                4: 999,                              # Field 4
+                5: 1, # Field 5
+                6: region,              
+                7: 2,
+                8: 2,
+                9: 2
+            }
+        }
+    }
+    
+    Pk = (await CrEaTe_ProTo(fields)).hex()
+    Pk = "080112" + await EnC_Uid(len(Pk) // 2, Tp='Uid') + Pk
+    return await GeneRaTePk(Pk, '1201', K, V)
+    
+async def xSEndMsgsQq(Msg , id , K , V, region="IND"):
+    """Send message with region 1 title included"""
+    
+    # Get random avatar
+    avatar = await xBunnEr()
+    
+    fields = {
+        1: id, 
+        2: id, 
+        4: Msg, 
+        5: 1756580149, 
+        7: 2, 
+        8: 904990072, 
+        9: {
+            1: "xBe4!sTo - C4", 
+            2: avatar, 
+            4: 330, 
+            5: 1001000001, 
+            8: "xBe4!sTo - C4", 
+            10: 1, 
+            11: 1, 
+            13: {1: 2}, 
+            14: {
+                1: 1158053040, 
+                2: 8, 
+                3: b"\x10\x15\x08\x0A\x0B\x15\x0C\x0F\x11\x04\x07\x02\x03\x0D\x0E\x12\x01\x05\x06"
+            }
+        }, 
+        10: "en", 
+        13: {2: 2, 3: 1},
+        # ADD REGION 1 TITLE HERE (from second packet field 14)
+        14: {
+            1: {
+                1: random.choice([1, 4]),          # Field 1
+                2: 1,                              # Field 2  
+                3: random.randint(1, 180),         # Field 3
+                4: 1,                              # Field 4
+                5: int(datetime.now().timestamp()), # Field 5
+                6: region                          # Field 6 (region)
+            }
+        }
+    }
+    
+    Pk = (await CrEaTe_ProTo(fields)).hex()
+    Pk = "080112" + await EnC_Uid(len(Pk) // 2, Tp='Uid') + Pk
+    return await GeneRaTePk(Pk, '1201', K, V)
+
+async def AutH_GlobAl(K, V):
+    fields = {
+    1: 3,
+    2: {
+        2: 5,
+        3: "en"
+    }
+    }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '1215' , K , V)
+
+async def LagSquad(K,V):
+    fields = {
+    1: 15,
+    2: {
+        1: 1124759936,
+        2: 1
+    }
+    }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)
+
+async def GeT_Status(PLayer_Uid , K , V):
+    PLayer_Uid = await EnC_Uid(PLayer_Uid , Tp = 'Uid')
+    if len(PLayer_Uid) == 8: Pk = f'080112080a04{PLayer_Uid}1005'
+    elif len(PLayer_Uid) == 10: Pk = f"080112090a05{PLayer_Uid}1005"
+    return await GeneRaTePk(Pk , '0f15' , K , V)
+           
+async def SPam_Room(Uid , Rm , Nm , K , V):
+    fields = {1: 78, 2: {1: int(Rm), 2: f"[{ArA_CoLor()}]{Nm}", 3: {2: 1, 3: 1}, 4: 330, 5: 1, 6: 201, 10: xBunnEr(), 11: int(Uid), 12: 1}}
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0e15' , K , V)
+async def GenJoinSquadsPacket(code,  K , V):
+    fields = {}
+    fields[1] = 4
+    fields[2] = {}
+    fields[2][4] = bytes.fromhex("01090a0b121920")
+    fields[2][5] = str(code)
+    fields[2][6] = 6
+    fields[2][8] = 1
+    fields[2][9] = {}
+    fields[2][9][2] = 800
+    fields[2][9][6] = 11
+    fields[2][9][8] = "1.128.2"
+    fields[2][9][9] = 5
+    fields[2][9][10] = 1
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)   
+async def GenJoinGlobaL(owner , code , K, V):
+    fields = {
+    1: 4,
+    2: {
+        1: owner,
+        6: 1,
+        8: 1,
+        13: "en",
+        15: code,
+        16: "OR",
+    }
+    }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)
+
+
+
+async def FS(key, iv, region="ind"):
+    """Start match packet - converted from TCP version"""
+    try:
+        # Your original fields from TCP bot
+        fields = {
+            1: 9,  # Start match packet type
+            2: {
+                1: 12480598706,  # Your UID or specific value
+            }
+        }
+        
+        # Create protobuf packet
+        packet = await CrEaTe_ProTo(fields)
+        packet_hex = packet.hex()
+        
+        # Encrypt the packet
+        encrypted_packet = await encrypt_packet(packet_hex, key, iv)
+        
+        # Calculate header length
+        header_length = len(encrypted_packet) // 2
+        header_length_final = dec_to_hex(header_length)
+        
+        # Determine packet type based on region
+        if region.lower() == "ind":
+            packet_type = '0514'
+        elif region.lower() == "bd":
+            packet_type = "0519"
+        else:
+            packet_type = "0515"
+        
+        # Build final packet based on header length
+        if len(header_length_final) == 2:
+            final_packet_hex = packet_type + "000000" + header_length_final + encrypted_packet
+        elif len(header_length_final) == 3:
+            final_packet_hex = packet_type + "00000" + header_length_final + encrypted_packet
+        elif len(header_length_final) == 4:
+            final_packet_hex = packet_type + "0000" + header_length_final + encrypted_packet
+        elif len(header_length_final) == 5:
+            final_packet_hex = packet_type + "000" + header_length_final + encrypted_packet
+        elif len(header_length_final) == 6:
+            final_packet_hex = packet_type + "00" + header_length_final + encrypted_packet
+        else:
+            final_packet_hex = packet_type + "000000" + header_length_final + encrypted_packet
+        
+        print(f" Start match packet created: {len(final_packet_hex)//2} bytes")
+        return bytes.fromhex(final_packet_hex)
+        
+    except Exception as e:
+        print(f" Error creating start packet: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+#EMOTES BY PARAHEX X CODEX
+async def Emote_k(TarGeT , idT, K, V,region):
+    fields = {
+        1: 21,
+        2: {
+            1: 804266360,
+            2: 909000001,
+            5: {
+                1: TarGeT,
+                3: idT,
+            }
+        }
+    }
+    if region.lower() == "ind":
+        packet = '0514'
+    elif region.lower() == "bd":
+        packet = "0519"
+    else:
+        packet = "0515"
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+
+#EMOTES BY PARAHEX X CODEX
+
+
+async def GeTSQDaTa(D):
+    uid = D['5']['data']['1']['data']
+    chat_code = D["5"]["data"]["17"]["data"]
+    squad_code = D["5"]["data"]["31"]["data"]
+
+
+    return uid, chat_code , squad_code
+
+  
+async def AuthClan(CLan_Uid, AuTh, K, V):
+    fields = {1: 3, 2: {1: int(CLan_Uid), 2: 1, 4: str(AuTh)}}
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '1201' , K , V)
+
+def join_room_chanel(room_id, key, iv):
+    fields = {
+        1: 3,
+        2: {
+            1: int(room_id),
+            2: 3,
+            3: "en",
+        },
+    }
+    packet = create_protobuf_packet(fields)
+    packet = packet.hex() + "7200"
+    header_lenth = len(encrypt_packet(packet, key, iv)) // 2
+    header_lenth = dec_to_hex(header_lenth)
+    if len(header_lenth) == 2:
+        # print(header_lenth)
+        # print('len of headr == 2')
+        final_packet = "1215000000" + header_lenth + encrypt_packet(packet, key, iv)
+        # print(final_packet)
+        return bytes.fromhex(final_packet)
+
+    if len(header_lenth) == 3:
+        #  print(header_lenth)
+        #  print('len of headr == 3')
+        final_packet = "121500000" + header_lenth + encrypt_packet(packet, key, iv)
+        # print("121500000"+header_lenth)
+        return bytes.fromhex(final_packet)
+    if len(header_lenth) == 4:
+        #  print('len of headr == 4')
+        final_packet = "12150000" + header_lenth + encrypt_packet(packet, key, iv)
+        return bytes.fromhex(final_packet)
+    if len(header_lenth) == 5:
+        final_packet = "12150000" + header_lenth + encrypt_packet(packet, key, iv)
+        return bytes.fromhex(final_packet)
+
+async def AutH_Chat(T , uid, code , K, V):
+    fields = {
+  1: T,
+  2: {
+    1: uid,
+    3: "en",
+    4: str(code)
+  }
+}
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '1215' , K , V)
+async def Msg_Sq(msg, owner, bot, K, V):
+    fields = {
+    1: 1,
+    2: 2,
+    2: {
+        1: bot,
+        2: owner,
+        4: msg,
+        5: 1757799182,
+        7: 2,
+        9: {
+            1: "Fun1w5a2",
+            2: await xBunnEr(),
+            3: 909000024,
+            4: 330,
+            5: 909000024,
+            7: 2,
+            10: 1,
+            11: 1,
+            12: 0,
+            13: {1: 2},
+            14: {
+                1: bot,
+                2: 8,
+                3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"
             }
         },
-        "bot_pool": {
-            "total_configured": len(active_clients),
-            "total_online": len(active_uids),
-            "total_locked": locked_bots_count,
-            "total_unlocked_available": free_bots_count,
+        10: "ar",
+        13: {3: 1},
+        14: ""
+    }
+}
+    proto_bytes = await CrEaTe_ProTo(fields)
+    return await GeneRaTePk(proto_bytes.hex(), '1215', K, V)
+
+
+async def ghost_pakcet(player_id , secret_code ,K , V):
+    fields = {
+        1: 61,
+        2: {
+            1: int(player_id),  
+            2: {
+                1: int(player_id),  
+                2: int(time.time()),  
+                3: "MR3SKR",
+                5: 12,  
+                6: 9999999,
+                7: 1,
+                8: {
+                    2: 1,
+                    3: 1,
+                },
+                9: 3,
+            },
+            3: secret_code,},}
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)
+async def GeneRaTePk(Pk , N , K , V):
+    PkEnc = await EnC_PacKeT(Pk , K , V)
+    _ = await DecodE_HeX(int(len(PkEnc) // 2))
+    if len(_) == 2: HeadEr = N + "000000"
+    elif len(_) == 3: HeadEr = N + "00000"
+    elif len(_) == 4: HeadEr = N + "0000"
+    elif len(_) == 5: HeadEr = N + "000"
+    else: print('ErroR => GeneRatinG ThE PacKeT !! ')
+    return bytes.fromhex(HeadEr + _ + PkEnc)
+async def OpEnSq(K , V,region):
+    fields = {1: 1, 2: {2: "\u0001", 3: 1, 4: 1, 5: "en", 9: 1, 11: 1, 13: 1, 14: {2: 5756, 6: 11, 8: "1.123.1", 9: 2, 10: 4}}}
+    if region.lower() == "ind":
+        packet = '0514'
+    elif region.lower() == "bd":
+        packet = "0519"
+    else:
+        packet = "0515"
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+
+async def cHSq(Nu , Uid , K , V,region):
+    fields = {1: 17, 2: {1: int(Uid), 2: 1, 3: int(Nu - 1), 4: 62, 5: "\u001a", 8: 5, 13: 329}}
+    if region.lower() == "ind":
+        packet = '0514'
+    elif region.lower() == "bd":
+        packet = "0519"
+    else:
+        packet = "0515"
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+
+
+
+
+async def SEnd_InV(Nu , Uid , K , V,region):
+    
+    fields = {1: 2 , 2: {1: int(Uid) , 2: region , 4: int(Nu)}}
+
+    if region.lower() == "ind":
+        packet = '0514'
+    elif region.lower() == "bd":
+        packet = "0519"
+    else:
+        packet = "0515"
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+
+
+async def ExiT(idT , K , V):
+    fields = {
+        1: 7,
+        2: {
+            1: idT,
+        }
+        }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V) 
+    
+async def ArohiRefuse(owner,uid, K,V):
+    fields = {
+    1: 5,
+    2: {
+        1: int(owner),
+        2: 1,
+        3: int(uid),
+        4: "[FF0000][B][C] ERROR , WELCOME TO [FFFFFF]REDZED [00FF00] AROHI BOT ! \n[FFFF00]NEW VERSION NEW FUNCTION !\n[FF0000]TELEGRAM : @classic_arohi\n\n"
+    }
+    }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)
+# Isko file ke sabse neeche (Bottom) paste karein
+
+# By AbdeeLkarim BesTo
+
+import requests , json , binascii , time , urllib3 , base64 , datetime , re ,socket , threading , random , os , asyncio
+from protobuf_decoder.protobuf_decoder import Parser
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad , unpad
+from datetime import datetime
+from google.protobuf.timestamp_pb2 import Timestamp
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+Key , Iv = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56]) , bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
+
+async def EnC_AEs(HeX):
+    cipher = AES.new(Key , AES.MODE_CBC , Iv)
+    return cipher.encrypt(pad(bytes.fromhex(HeX), AES.block_size)).hex()
+    
+async def DEc_AEs(HeX):
+    cipher = AES.new(Key , AES.MODE_CBC , Iv)
+    return unpad(cipher.decrypt(bytes.fromhex(HeX)), AES.block_size).hex()
+    
+async def EnC_PacKeT(HeX , K , V): 
+    return AES.new(K , AES.MODE_CBC , V).encrypt(pad(bytes.fromhex(HeX) ,16)).hex()
+    
+async def DEc_PacKeT(HeX , K , V):
+    return unpad(AES.new(K , AES.MODE_CBC , V).decrypt(bytes.fromhex(HeX)) , 16).hex()  
+
+async def EnC_Uid(H , Tp):
+    e , H = [] , int(H)
+    while H:
+        e.append((H & 0x7F) | (0x80 if H > 0x7F else 0)) ; H >>= 7
+    return bytes(e).hex() if Tp == 'Uid' else None
+
+async def EnC_Vr(N):
+    if N < 0: ''
+    H = []
+    while True:
+        BesTo = N & 0x7F ; N >>= 7
+        if N: BesTo |= 0x80
+        H.append(BesTo)
+        if not N: break
+    return bytes(H)
+    
+def DEc_Uid(H):
+    n = s = 0
+    for b in bytes.fromhex(H):
+        n |= (b & 0x7F) << s
+        if not b & 0x80: break
+        s += 7
+    return n
+    
+async def CrEaTe_VarianT(field_number, value):
+    field_header = (field_number << 3) | 0
+    return await EnC_Vr(field_header) + await EnC_Vr(value)
+
+async def CrEaTe_LenGTh(field_number, value):
+    field_header = (field_number << 3) | 2
+    encoded_value = value.encode() if isinstance(value, str) else value
+    return await EnC_Vr(field_header) + await EnC_Vr(len(encoded_value)) + encoded_value
+
+async def CrEaTe_ProTo(fields):
+    packet = bytearray()
+    for field, value in fields.items():
+        if isinstance(value, dict):
+            nested_packet = await CrEaTe_ProTo(value)  #  await
+            packet.extend(await CrEaTe_LenGTh(field, nested_packet))
+        elif isinstance(value, int):
+            packet.extend(await CrEaTe_VarianT(field, value))
+        elif isinstance(value, str) or isinstance(value, bytes):
+            packet.extend(await CrEaTe_LenGTh(field, value))
+    return packet
+    
+async def DecodE_HeX(H):
+    R = hex(H) 
+    F = str(R)[2:]
+    if len(F) == 1: F = "0" + F ; return F
+    else: return F
+
+async def Fix_PackEt(parsed_results):
+    result_dict = {}
+    for result in parsed_results:
+        field_data = {}
+        field_data['wire_type'] = result.wire_type
+        if result.wire_type == "varint":
+            field_data['data'] = result.data
+        if result.wire_type == "string":
+            field_data['data'] = result.data
+        if result.wire_type == "bytes":
+            field_data['data'] = result.data
+        elif result.wire_type == 'length_delimited':
+            field_data["data"] = await Fix_PackEt(result.data.results)
+        result_dict[result.field] = field_data
+    return result_dict
+
+async def DeCode_PackEt(input_text):
+    try:
+        parsed_results = Parser().parse(input_text)
+        parsed_results_objects = parsed_results
+        parsed_results_dict = await Fix_PackEt(parsed_results_objects)
+        json_data = json.dumps(parsed_results_dict)
+        return json_data
+    except Exception as e:
+        print(f"error {e}")
+        return None
+                      
+def xMsGFixinG(n):
+    return ''.join(str(n)[i:i + 3] for i in range(0 , len(str(n)) , 3))
+    
+async def Ua():
+    versions = [
+        '4.0.18P6', '4.0.19P7', '4.0.20P1', '4.1.0P3', '4.1.5P2', '4.2.1P8',
+        '4.2.3P1', '5.0.1B2', '5.0.2P4', '5.1.0P1', '5.2.0B1', '5.2.5P3',
+        '5.3.0B1', '5.3.2P2', '5.4.0P1', '5.4.3B2', '5.5.0P1', '5.5.2P3'
+    ]
+    models = [
+        'SM-A125F', 'SM-A225F', 'SM-A325M', 'SM-A515F', 'SM-A725F', 'SM-M215F', 'SM-M325FV',
+        'Redmi 9A', 'Redmi 9C', 'POCO M3', 'POCO M4 Pro', 'RMX2185', 'RMX3085',
+        'moto g(9) play', 'CPH2239', 'V2027', 'OnePlus Nord', 'ASUS_Z01QD',
+    ]
+    android_versions = ['9', '10', '11', '12', '13', '14']
+    languages = ['en-US', 'es-MX', 'pt-BR', 'id-ID', 'ru-RU', 'hi-IN']
+    countries = ['USA', 'MEX', 'BRA', 'IDN', 'RUS', 'IND']
+    version = random.choice(versions)
+    model = random.choice(models)
+    android = random.choice(android_versions)
+    lang = random.choice(languages)
+    country = random.choice(countries)
+    return f"GarenaMSDK/{version}({model};Android {android};{lang};{country};)"
+    
+async def ArA_CoLor():
+    Tp = ["32CD32" , "00BFFF" , "00FA9A" , "90EE90" , "FF4500" , "FF6347" , "FF69B4" , "FF8C00" , "FF6347" , "FFD700" , "FFDAB9" , "F0F0F0" , "F0E68C" , "D3D3D3" , "A9A9A9" , "D2691E" , "CD853F" , "BC8F8F" , "6A5ACD" , "483D8B" , "4682B4", "9370DB" , "C71585" , "FF8C00" , "FFA07A"]
+    return random.choice(Tp)
+    
+async def xBunnEr():
+    bN = [902048021]
+    return random.choice(bN)
+
+async def send_room_chat_enhanced(Msg, room_id, key, iv, region):
+    """Send room chat message using leaked packet structure"""
+    fields = {
+        1: 1,
+        2: {
+            1: 9280892890,  # Sender UID (from leaked packet)
+            2: int(room_id),
+            3: 3,  # Chat type 3 = room chat
+            4: f"[{await ArA_CoLor()}]{Msg}",  # Message with color
+            5: int(datetime.now().timestamp()),  # Current timestamp
+            7: 2,
+            9: {
+                1: "RIJEXX",  # Your bot name
+                2: int(await xBunnEr()),  # Avatar from your system
+                4: 228,  # Rank/level from leaked packet
+                7: 1,    # Unknown
+            },
+            10: "en",  # Changed from "ar" to "en"
+            13: {2: 1, 3: 1},
         },
-        "bots": bot_details,
-        "running_python_processes": python_processes,
-        "exploit_history_count": len(exploit_history),
-        "recent_exploits": exploit_history[:10]
     }
     
-    return jsonify(server_stats)
+    # Generate packet using your existing system
+    packet = (await CrEaTe_ProTo(fields)).hex()
+    
+    # Use 1215 packet type for chat messages (like your existing system)
+    return await GeneRaTePk(packet, '1215', key, iv)
 
-if __name__ == '__main__':
-    # Force templates dir exists
-    os.makedirs('templates', exist_ok=True)
+async def xSEndMsg(Msg , Tp , Tp2 , id , K , V):
+    feilds = {1: id , 2: Tp2 , 3: Tp, 4: Msg, 5: 1735129800, 7: 2, 9: {1: "[FFFFFF]BLACK", 2: int(await xBunnEr()), 3: 901048020, 4: 330, 5: 1001000001, 8: "xBesTo - C4", 10: 1, 11: 1, 13: {1: 2}, 14: {1: 12484827014, 2: 8, 3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"}, 12: 0}, 10: "en", 13: {3: 1}}    
+    Pk = (await CrEaTe_ProTo(feilds)).hex()
+    Pk = "080112" + await EnC_Uid(len(Pk) // 2, Tp='Uid') + Pk
+    return await GeneRaTePk(Pk, '1201', K, V)
     
-    # Initialize SQLite database
-    init_db()
+async def xSEndMsgsQ(Msg , id , K , V, region="BD"):
+    """Send message with region 1 title included"""
     
-    # Start bot monitor thread (handles both initial start and auto-restart)
-    threading.Thread(target=bot_monitor_loop, daemon=True).start()
+    # Get random avatar
+    avatar = await xBunnEr()
     
-    # Use dynamic port for Heroku or 5000 for local
-    port = int(os.environ.get('PORT', 80))
-    print(f"[SYSTEM] Web Server starting on port {port}...")
-    app.run(host='0.0.0.0', port=port, debug=True, use_reloader=False)
+    fields = {
+        1: id, 
+        2: id, 
+        4: Msg, 
+        5: 1756580149, 
+        7: 2, 
+        8: 904990072, 
+        9: {
+            1: "[FFFFFF]BLACK",
+            2: avatar, 
+            3: 2,
+            4: 329, 
+            5: 1001000001, 
+            6: 66,
+            7: 66,
+            8: "xBe4!sTo - C4", 
+            9: 66,
+            10: 66, 
+            11: 66, 
+            12: 66,
+            13: {1: 68, 2:67}, 
+            14: {
+                1: 1158053040, 
+                2: 8, 
+                3: b"\x10\x15\x08\x0A\x0B\x15\x0C\x0F\x11\x04\x07\x02\x03\x0D\x0E\x12\x01\x05\x06"
+            }
+        }, 
+        10: "en", 
+        13: {66: 66, 66: 66},
+        # ADD REGION 1 TITLE HERE (from second packet field 14)
+        14: {
+            11: {
+                1: 3,          # Field 1
+                2: 7,                              # Field 2  
+                3: 170,         # Field 3
+                4: 999,                              # Field 4
+                5: 1, # Field 5
+                6: region,              
+                7: 2,
+                8: 2,
+                9: 2
+            }
+        }
+    }
+    
+    Pk = (await CrEaTe_ProTo(fields)).hex()
+    Pk = "080112" + await EnC_Uid(len(Pk) // 2, Tp='Uid') + Pk
+    return await GeneRaTePk(Pk, '1201', K, V)
+    
+async def xSEndMsgsQq(Msg , id , K , V, region="IND"):
+    """Send message with region 1 title included"""
+    
+    # Get random avatar
+    avatar = await xBunnEr()
+    
+    fields = {
+        1: id, 
+        2: id, 
+        4: Msg, 
+        5: 1756580149, 
+        7: 2, 
+        8: 904990072, 
+        9: {
+            1: "xBe4!sTo - C4", 
+            2: avatar, 
+            4: 330, 
+            5: 1001000001, 
+            8: "xBe4!sTo - C4", 
+            10: 1, 
+            11: 1, 
+            13: {1: 2}, 
+            14: {
+                1: 1158053040, 
+                2: 8, 
+                3: b"\x10\x15\x08\x0A\x0B\x15\x0C\x0F\x11\x04\x07\x02\x03\x0D\x0E\x12\x01\x05\x06"
+            }
+        }, 
+        10: "en", 
+        13: {2: 2, 3: 1},
+        # ADD REGION 1 TITLE HERE (from second packet field 14)
+        14: {
+            1: {
+                1: random.choice([1, 4]),          # Field 1
+                2: 1,                              # Field 2  
+                3: random.randint(1, 180),         # Field 3
+                4: 1,                              # Field 4
+                5: int(datetime.now().timestamp()), # Field 5
+                6: region                          # Field 6 (region)
+            }
+        }
+    }
+    
+    Pk = (await CrEaTe_ProTo(fields)).hex()
+    Pk = "080112" + await EnC_Uid(len(Pk) // 2, Tp='Uid') + Pk
+    return await GeneRaTePk(Pk, '1201', K, V)
+
+async def AutH_GlobAl(K, V):
+    fields = {
+    1: 3,
+    2: {
+        2: 5,
+        3: "en"
+    }
+    }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '1215' , K , V)
+
+async def LagSquad(K,V):
+    fields = {
+    1: 15,
+    2: {
+        1: 1124759936,
+        2: 1
+    }
+    }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)
+
+async def GeT_Status(PLayer_Uid , K , V):
+    PLayer_Uid = await EnC_Uid(PLayer_Uid , Tp = 'Uid')
+    if len(PLayer_Uid) == 8: Pk = f'080112080a04{PLayer_Uid}1005'
+    elif len(PLayer_Uid) == 10: Pk = f"080112090a05{PLayer_Uid}1005"
+    return await GeneRaTePk(Pk , '0f15' , K , V)
+           
+async def SPam_Room(Uid , Rm , Nm , K , V):
+    fields = {1: 78, 2: {1: int(Rm), 2: f"[{ArA_CoLor()}]{Nm}", 3: {2: 1, 3: 1}, 4: 330, 5: 1, 6: 201, 10: xBunnEr(), 11: int(Uid), 12: 1}}
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0e15' , K , V)
+async def GenJoinSquadsPacket(code,  K , V):
+    fields = {}
+    fields[1] = 4
+    fields[2] = {}
+    fields[2][4] = bytes.fromhex("01090a0b121920")
+    fields[2][5] = str(code)
+    fields[2][6] = 6
+    fields[2][8] = 1
+    fields[2][9] = {}
+    fields[2][9][2] = 800
+    fields[2][9][6] = 11
+    fields[2][9][8] = "1.128.2"
+    fields[2][9][9] = 5
+    fields[2][9][10] = 1
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)   
+async def GenJoinGlobaL(owner , code , K, V):
+    fields = {
+    1: 4,
+    2: {
+        1: owner,
+        6: 1,
+        8: 1,
+        13: "en",
+        15: code,
+        16: "OR",
+    }
+    }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)
+
+
+
+async def FS(key, iv, region="ind"):
+    """Start match packet - converted from TCP version"""
+    try:
+        # Your original fields from TCP bot
+        fields = {
+            1: 9,  # Start match packet type
+            2: {
+                1: 12480598706,  # Your UID or specific value
+            }
+        }
+        
+        # Create protobuf packet
+        packet = await CrEaTe_ProTo(fields)
+        packet_hex = packet.hex()
+        
+        # Encrypt the packet
+        encrypted_packet = await encrypt_packet(packet_hex, key, iv)
+        
+        # Calculate header length
+        header_length = len(encrypted_packet) // 2
+        header_length_final = dec_to_hex(header_length)
+        
+        # Determine packet type based on region
+        if region.lower() == "ind":
+            packet_type = '0514'
+        elif region.lower() == "bd":
+            packet_type = "0519"
+        else:
+            packet_type = "0515"
+        
+        # Build final packet based on header length
+        if len(header_length_final) == 2:
+            final_packet_hex = packet_type + "000000" + header_length_final + encrypted_packet
+        elif len(header_length_final) == 3:
+            final_packet_hex = packet_type + "00000" + header_length_final + encrypted_packet
+        elif len(header_length_final) == 4:
+            final_packet_hex = packet_type + "0000" + header_length_final + encrypted_packet
+        elif len(header_length_final) == 5:
+            final_packet_hex = packet_type + "000" + header_length_final + encrypted_packet
+        elif len(header_length_final) == 6:
+            final_packet_hex = packet_type + "00" + header_length_final + encrypted_packet
+        else:
+            final_packet_hex = packet_type + "000000" + header_length_final + encrypted_packet
+        
+        print(f" Start match packet created: {len(final_packet_hex)//2} bytes")
+        return bytes.fromhex(final_packet_hex)
+        
+    except Exception as e:
+        print(f" Error creating start packet: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+#EMOTES BY PARAHEX X CODEX
+async def Emote_k(TarGeT , idT, K, V,region):
+    fields = {
+        1: 21,
+        2: {
+            1: 804266360,
+            2: 909000001,
+            5: {
+                1: TarGeT,
+                3: idT,
+            }
+        }
+    }
+    if region.lower() == "ind":
+        packet = '0514'
+    elif region.lower() == "bd":
+        packet = "0519"
+    else:
+        packet = "0515"
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+
+#EMOTES BY PARAHEX X CODEX
+
+
+async def GeTSQDaTa(D):
+    uid = D['5']['data']['1']['data']
+    chat_code = D["5"]["data"]["17"]["data"]
+    squad_code = D["5"]["data"]["31"]["data"]
+
+
+    return uid, chat_code , squad_code
+
+  
+async def AuthClan(CLan_Uid, AuTh, K, V):
+    fields = {1: 3, 2: {1: int(CLan_Uid), 2: 1, 4: str(AuTh)}}
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '1201' , K , V)
+
+def join_room_chanel(room_id, key, iv):
+    fields = {
+        1: 3,
+        2: {
+            1: int(room_id),
+            2: 3,
+            3: "en",
+        },
+    }
+    packet = create_protobuf_packet(fields)
+    packet = packet.hex() + "7200"
+    header_lenth = len(encrypt_packet(packet, key, iv)) // 2
+    header_lenth = dec_to_hex(header_lenth)
+    if len(header_lenth) == 2:
+        # print(header_lenth)
+        # print('len of headr == 2')
+        final_packet = "1215000000" + header_lenth + encrypt_packet(packet, key, iv)
+        # print(final_packet)
+        return bytes.fromhex(final_packet)
+
+    if len(header_lenth) == 3:
+        #  print(header_lenth)
+        #  print('len of headr == 3')
+        final_packet = "121500000" + header_lenth + encrypt_packet(packet, key, iv)
+        # print("121500000"+header_lenth)
+        return bytes.fromhex(final_packet)
+    if len(header_lenth) == 4:
+        #  print('len of headr == 4')
+        final_packet = "12150000" + header_lenth + encrypt_packet(packet, key, iv)
+        return bytes.fromhex(final_packet)
+    if len(header_lenth) == 5:
+        final_packet = "12150000" + header_lenth + encrypt_packet(packet, key, iv)
+        return bytes.fromhex(final_packet)
+
+async def AutH_Chat(T , uid, code , K, V):
+    fields = {
+  1: T,
+  2: {
+    1: uid,
+    3: "en",
+    4: str(code)
+  }
+}
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '1215' , K , V)
+async def Msg_Sq(msg, owner, bot, K, V):
+    fields = {
+    1: 1,
+    2: 2,
+    2: {
+        1: bot,
+        2: owner,
+        4: msg,
+        5: 1757799182,
+        7: 2,
+        9: {
+            1: "Fun1w5a2",
+            2: await xBunnEr(),
+            3: 909000024,
+            4: 330,
+            5: 909000024,
+            7: 2,
+            10: 1,
+            11: 1,
+            12: 0,
+            13: {1: 2},
+            14: {
+                1: bot,
+                2: 8,
+                3: "\u0010\u0015\b\n\u000b\u0013\f\u000f\u0011\u0004\u0007\u0002\u0003\r\u000e\u0012\u0001\u0005\u0006"
+            }
+        },
+        10: "ar",
+        13: {3: 1},
+        14: ""
+    }
+}
+    proto_bytes = await CrEaTe_ProTo(fields)
+    return await GeneRaTePk(proto_bytes.hex(), '1215', K, V)
+
+
+async def ghost_pakcet(player_id , secret_code ,K , V):
+    fields = {
+        1: 61,
+        2: {
+            1: int(player_id),  
+            2: {
+                1: int(player_id),  
+                2: int(time.time()),  
+                3: "MR3SKR",
+                5: 12,  
+                6: 9999999,
+                7: 1,
+                8: {
+                    2: 1,
+                    3: 1,
+                },
+                9: 3,
+            },
+            3: secret_code,},}
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)
+async def GeneRaTePk(Pk , N , K , V):
+    PkEnc = await EnC_PacKeT(Pk , K , V)
+    _ = await DecodE_HeX(int(len(PkEnc) // 2))
+    if len(_) == 2: HeadEr = N + "000000"
+    elif len(_) == 3: HeadEr = N + "00000"
+    elif len(_) == 4: HeadEr = N + "0000"
+    elif len(_) == 5: HeadEr = N + "000"
+    else: print('ErroR => GeneRatinG ThE PacKeT !! ')
+    return bytes.fromhex(HeadEr + _ + PkEnc)
+async def OpEnSq(K , V,region):
+    fields = {1: 1, 2: {2: "\u0001", 3: 1, 4: 1, 5: "en", 9: 1, 11: 1, 13: 1, 14: {2: 5756, 6: 11, 8: "1.128.2", 9: 2, 10: 4}}}
+    if region.lower() == "ind":
+        packet = '0514'
+    elif region.lower() == "bd":
+        packet = "0519"
+    else:
+        packet = "0515"
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+
+async def cHSq(Nu , Uid , K , V,region):
+    fields = {1: 17, 2: {1: int(Uid), 2: 1, 3: int(Nu - 1), 4: 62, 5: "\u001a", 8: 5, 13: 329}}
+    if region.lower() == "ind":
+        packet = '0514'
+    elif region.lower() == "bd":
+        packet = "0519"
+    else:
+        packet = "0515"
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+
+
+
+
+async def SEnd_InV(Nu , Uid , K , V,region):
+    
+    fields = {1: 2 , 2: {1: int(Uid) , 2: region , 4: int(Nu)}}
+
+    if region.lower() == "ind":
+        packet = '0514'
+    elif region.lower() == "bd":
+        packet = "0519"
+    else:
+        packet = "0515"
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , packet , K , V)
+
+
+async def ExiT(idT , K , V):
+    fields = {
+        1: 7,
+        2: {
+            1: idT,
+        }
+        }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V) 
+    
+async def ArohiRefuse(owner,uid, K,V):
+    fields = {
+    1: 5,
+    2: {
+        1: int(owner),
+        2: 1,
+        3: int(uid),
+        4: "[FF0000][B][C] ERROR , WELCOME TO [FFFFFF]REDZED [00FF00] AROHI BOT ! \n[FFFF00]NEW VERSION NEW FUNCTION !\n[FF0000]TELEGRAM : @classic_arohi\n\n"
+    }
+    }
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex() , '0515' , K , V)
+# Isko file ke sabse neeche (Bottom) paste karein
+
+async def bundle_packet_async(bundle_id, K, V, region):
+    """Create bundle packet optimized"""
+    fields = {
+        1: 88,
+        2: {
+            1: {
+                # Yahan dhyan dein: 'int(bundle_id)' hona chahiye, koi number nahi!
+                1: int(bundle_id), 
+                2: 1
+            },
+            2: 2
+        }
+    }
+    
+    # Determine packet type based on region
+    if region.lower() == "ind":
+        packet_type = '0514'
+    elif region.lower() == "bd":
+        packet_type = "0519"
+    else:
+        packet_type = "0515"
+    
+    # Packet generate aur return
+    return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), packet_type, K, V)
+
+
+
+
+
+
+    
+
+
+
+
+
+
+
+    
