@@ -3715,20 +3715,26 @@ async def fast_squad_emote_attack(team_code_or_session, uids_input, emote_input,
             else:
                 insquad = True
 
-        # Send emote to target UIDs (or squad broadcast 0 if uids_list empty)
+        # Force IND region for Free Fire India Server
+        region = "IND"
+
+        # Perform emote 3 times (3 distinct triggers with animation delay for 3x emote show)
         target_targets = uids_list if uids_list else ["0"]
         for target_uid in target_targets:
             try:
                 target_num = int(target_uid) if str(target_uid).isdigit() else 0
-                emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, region)
+                emote_packet = await Emote_k(target_num, int(resolved_emote_id), key, iv, "IND")
                 if emote_packet:
-                    # Burst of 3 packets (80ms gap) to guarantee server delivery under multi-bot shift load
-                    for _ in range(3):
+                    for cycle in range(3):
+                        # Send 2-packet burst per cycle to guarantee 100% server delivery
                         await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
-                        await asyncio.sleep(0.08)
-                    print(f"⚡ [FAST EMOTE] Sent 3-burst emote {resolved_emote_id} to UID {target_uid}")
+                        await asyncio.sleep(0.06)
+                        await SEndPacKeT(whisper_writer, online_writer, 'OnLine', emote_packet)
+                        print(f"⚡ [FAST EMOTE 3X] Emote trigger {cycle+1}/3 ({resolved_emote_id}) sent to UID {target_uid}")
+                        if cycle < 2:
+                            await asyncio.sleep(0.25)  # Short delay between the 3 emote animations
             except Exception as e:
-                print(f"⚡ [FAST EMOTE] Error sending emote to {target_uid}: {e}")
+                print(f"⚡ [FAST EMOTE 3X] Error sending emote to {target_uid}: {e}")
 
         if str(mode).lower() == "quit":
             # Wait 0.45s so emote animation renders for everyone in the squad before leaving
