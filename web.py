@@ -34,8 +34,8 @@ active_clients = {}
 client_logs = []
 
 # HEROKU OPTIMIZATION: Limit total bots to stay within memory limits (e.g., 512MB/1GB)
-MAX_BOT_LIMIT = 5 
-BOT_ROTATION_INTERVAL = 3600 # 1 hour in seconds
+MAX_BOT_LIMIT = 10
+BOT_ROTATION_INTERVAL = 2300 # 1 hour in seconds
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin12345")
 last_rotation_time = time.time()
 current_rotation_index = 0
